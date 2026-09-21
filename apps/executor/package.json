@@ -1,0 +1,22 @@
+{
+  "name": "@dac/executor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Windows 执行器：公共内核、Codex/OpenCode 适配器与结果归一化（B 端负责）",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts",
+    "./adapters": "./src/adapters/index.ts",
+    "./result": "./src/result/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@dac/protocol": "1.0.0"
+  }
+}

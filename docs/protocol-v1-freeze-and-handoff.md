@@ -421,14 +421,22 @@ A 端改参数时必须跑它。
 | 项目 | 值 |
 | --- | --- |
 | 协议版本 | v1（frozen） |
-| 冻结提交 | `a577d6688b323afbdbc647b3a1288c0316f7fb1e` |
-| 协议子树哈希 | `f9644c44628d5fe8445bcbbb54ad336d7fbe0abc` |
+| 冻结点提交（anchor） | `a577d6688b323afbdbc647b3a1288c0316f7fb1e` |
+| 该提交下协议子树哈希 | `f9644c44628d5fe8445bcbbb54ad336d7fbe0abc` |
+| 协议文件快照 | `packages/protocol/`（除 `src/version.ts` 外自冻结点起逐字节未变） |
 | 验证命令 | `npm run check` |
-| 基线状态 | 79 tests 全绿 |
+| 基线状态 | **80 tests 全绿**，EXIT=0 |
 
 > 第 P0 节要求"双方核对共同 SHA"。
-> A 端克隆后请执行 `git rev-parse HEAD` 与本表的冻结提交核对；
-> 若不一致，说明中间有新提交，需确认是否属协议变更。
+> A 端克隆后请执行以下命令与本表核对：
+>
+> ```
+> git rev-parse a577d66:packages/protocol
+> # 期望：f9644c44628d5fe8445bcbbb54ad336d7fbe0abc
+> ```
+>
+> **不要**用 `git rev-parse HEAD:packages/protocol` 来核对——HEAD 已包含冻结记录
+> （记录写在 `version.ts` 里），该值必然不同。原因见 §1.2。
 >
 > **注意**：远程仓库当前**尚未推送**（GitHub 返回 401）。
 > 在 B 端完成本机认证并推送前，A 端无法克隆。

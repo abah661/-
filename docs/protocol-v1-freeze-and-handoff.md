@@ -132,10 +132,13 @@ B 端本机（Windows）已实测：
 
 ```
 npm run check
-→ typecheck: 通过
+→ typecheck: 通过（EXIT=0）
 → 协议校验: 5/5 PASS（含 3 个反向夹具正确拒绝）
-→ 测试: 69 passed
+→ 测试: 80 passed / 5 files（EXIT=0）
 ```
+
+其中冻结守卫 11 个用例，**已做反向验证**：篡改 `packages/protocol/src/status.ts`
+后立即失败并报出具体文件，`git checkout` 还原后恢复全绿。
 
 中文路径处理已在 Syncthing 配置中实测通过（`state=idle`, `errors=0`），
 证明 Windows 中文路径不会破坏文件与配置处理。

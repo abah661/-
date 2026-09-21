@@ -1,0 +1,22 @@
+{
+  "_comment": "非法样例：登录过期却被当作代码失败进入返修。必须被拒绝（验收 V10）。",
+  "protocol_version": "1",
+  "task_id": "TASK-0003",
+  "attempt_id": "TASK-0003-A1",
+  "executor_id": "EXE-B-DESKTOP",
+  "lease_epoch": 2,
+  "agent_kind": "opencode",
+  "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "rules_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "contract_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "acceptance_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
+  "status": "repair_pending",
+  "evidence_id": null,
+  "changed_files": [],
+  "evidence": null,
+  "error_code": null,
+  "commit_shas": [],
+  "note": "agent 无法登录，直接标记为返修。",
+  "reported_at": "2026-09-21T03:20:00.000Z"
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@dac/validate-protocol",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "协议一致性校验与任务图检查：无环依赖、字段完整、样例正反向校验",
+  "bin": {
+    "validate-protocol": "./src/cli.ts"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@dac/protocol": "*",
+    "zod": "4.1.13"
+  }
+}

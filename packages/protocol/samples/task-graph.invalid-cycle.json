@@ -1,0 +1,43 @@
+{
+  "_comment": "非法样例：任务图存在环（TASK-0001 依赖 TASK-0002，TASK-0002 依赖 TASK-0001）。必须被拒绝（验收 V03）。",
+  "protocol_version": "1",
+  "project_id": "sample-target",
+  "requirement_ref": "REQ-0002@TASK-0000 环依赖示例",
+  "binding": {
+    "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "rules_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "contract_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "acceptance_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567"
+  },
+  "created_at": "2026-09-21T02:40:00.000Z",
+  "tasks": [
+    {
+      "task_id": "TASK-0001",
+      "kind": "implement",
+      "title": "甲模块",
+      "acceptance_criteria": ["甲模块单测通过"],
+      "depends_on": ["TASK-0002"],
+      "write_scope": { "allow": ["src/a/**"], "deny": [] },
+      "contracts": [],
+      "requires": ["code"],
+      "expected_interfaces": [],
+      "status": "draft",
+      "assigned_executor": null,
+      "attempts_used": 0
+    },
+    {
+      "task_id": "TASK-0002",
+      "kind": "implement",
+      "title": "乙模块",
+      "acceptance_criteria": ["乙模块单测通过"],
+      "depends_on": ["TASK-0001"],
+      "write_scope": { "allow": ["src/b/**"], "deny": [] },
+      "contracts": [],
+      "requires": ["code"],
+      "expected_interfaces": [],
+      "status": "draft",
+      "assigned_executor": null,
+      "attempts_used": 0
+    }
+  ]
+}

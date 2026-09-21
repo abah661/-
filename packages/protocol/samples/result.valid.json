@@ -1,0 +1,28 @@
+{
+  "protocol_version": "1",
+  "task_id": "TASK-0002",
+  "attempt_id": "TASK-0002-A1",
+  "executor_id": "EXE-B-DESKTOP",
+  "lease_epoch": 1,
+  "agent_kind": "opencode",
+  "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head_sha": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f80",
+  "rules_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "contract_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "acceptance_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
+  "status": "ready_for_integration",
+  "evidence_id": "EV-0001",
+  "changed_files": ["src/provider/user.ts", "tests/provider/user.test.ts"],
+  "evidence": {
+    "evidence_id": "EV-0001",
+    "command": ["npm", "run", "test", "--workspace", "provider"],
+    "exit_code": 0,
+    "summary": { "passed": 4, "failed": 0, "skipped": 0 },
+    "log_artifact": "artifacts/EV-0001.log",
+    "output_sha256": "3f786850e387550fdab836ed7e6dc881de23001b2a9b6f5dd9b0b0a0d9d3f5e7"
+  },
+  "error_code": null,
+  "commit_shas": ["b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f80"],
+  "note": "实现完成，单测全绿。注意：完整功能仍需由组合测试验收。",
+  "reported_at": "2026-09-21T03:12:30.000Z"
+}

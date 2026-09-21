@@ -1,0 +1,22 @@
+{
+  "_comment": "非法样例：agent 只声称完成、退出码为 0，但没有附测试证据。必须被拒绝（验收 V06）。",
+  "protocol_version": "1",
+  "task_id": "TASK-0002",
+  "attempt_id": "TASK-0002-A1",
+  "executor_id": "EXE-B-DESKTOP",
+  "lease_epoch": 1,
+  "agent_kind": "opencode",
+  "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head_sha": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f80",
+  "rules_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "contract_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "acceptance_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
+  "status": "ready_for_integration",
+  "evidence_id": null,
+  "changed_files": ["src/provider/user.ts"],
+  "evidence": null,
+  "error_code": null,
+  "commit_shas": ["b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f80"],
+  "note": "agent 自报已完成，退出码 0。",
+  "reported_at": "2026-09-21T03:12:30.000Z"
+}

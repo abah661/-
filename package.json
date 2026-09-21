@@ -1,0 +1,33 @@
+{
+  "name": "dual-agent-coordinator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "双人 Agent 自动并行开发系统：协调服务、协议与执行器",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0 <23"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "tools/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "tsc -b --pretty",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "validate:protocol": "tsx tools/validate-protocol/src/cli.ts",
+    "validate:protocol:samples": "tsx tools/validate-protocol/src/cli.ts --samples",
+    "check": "npm run typecheck && npm run validate:protocol && npm run test"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.6",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  },
+  "dependencies": {
+    "zod": "4.1.13"
+  }
+}

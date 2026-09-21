@@ -1,0 +1,40 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 本机运行状态（第 5 节：非敏感本机状态，忽略提交）
+.local/
+
+# 日志与测试产物
+*.log
+coverage/
+test-results/
+
+# 环境与凭据：任何情况下都不得提交
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# agent 本地会话与登录文件（第 4.1 节：不得上传云端）
+.codex/
+opencode.json
+auth.json
+
+# Syncthing 共享资料目录（第 10.1 节：位于 Git 仓库之外；
+# 此处兜底防止误放进仓库后被提交）
+shared-inbox/from-a/
+shared-inbox/from-b/

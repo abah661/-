@@ -1,0 +1,130 @@
+{
+  "protocol_version": "1",
+  "project_id": "sample-target",
+  "requirement_ref": "REQ-0001@TASK-0000 数据提供模块 + 展示模块的最小功能（第 P5 节验收用例）",
+  "binding": {
+    "base_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "rules_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "contract_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "acceptance_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567"
+  },
+  "created_at": "2026-09-21T02:40:00.000Z",
+  "tasks": [
+    {
+      "task_id": "TASK-0001",
+      "kind": "plan",
+      "title": "冻结 user-profile 契约并生成任务图",
+      "acceptance_criteria": [
+        "契约文件存在且字段为 id:string 必填、name:string 必填",
+        "契约通过 tools/validate-protocol 校验",
+        "任务图无环且每个任务都有写入范围"
+      ],
+      "depends_on": [],
+      "write_scope": {
+        "allow": ["packages/contracts/**", "docs/contracts/**"],
+        "deny": [".github/**"]
+      },
+      "contracts": [
+        {
+          "contract_id": "api.user-profile",
+          "version": "v1",
+          "path": "packages/contracts/api.user-profile.json",
+          "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "role": "both"
+        }
+      ],
+      "requires": ["plan"],
+      "expected_interfaces": ["api.user-profile@v1"],
+      "status": "draft",
+      "assigned_executor": null,
+      "attempts_used": 0
+    },
+    {
+      "task_id": "TASK-0002",
+      "kind": "implement",
+      "title": "实现数据提供模块：返回 { id: string, name: string }",
+      "acceptance_criteria": [
+        "provider 单测通过",
+        "返回对象包含字符串 id 与字符串 name",
+        "不修改展示模块目录"
+      ],
+      "depends_on": ["TASK-0001"],
+      "write_scope": {
+        "allow": ["src/provider/**", "tests/provider/**"],
+        "deny": ["src/display/**", ".github/**"]
+      },
+      "contracts": [
+        {
+          "contract_id": "api.user-profile",
+          "version": "v1",
+          "path": "packages/contracts/api.user-profile.json",
+          "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "role": "provider"
+        }
+      ],
+      "requires": ["code", "test"],
+      "expected_interfaces": ["provider.getUser(id): UserProfile"],
+      "status": "draft",
+      "assigned_executor": null,
+      "attempts_used": 0
+    },
+    {
+      "task_id": "TASK-0003",
+      "kind": "implement",
+      "title": "实现展示模块：按同一契约读取并渲染",
+      "acceptance_criteria": [
+        "display 单测通过",
+        "按 api.user-profile@v1 读取字段 id 与 name",
+        "不修改数据提供模块目录"
+      ],
+      "depends_on": ["TASK-0001"],
+      "write_scope": {
+        "allow": ["src/display/**", "tests/display/**"],
+        "deny": ["src/provider/**", ".github/**"]
+      },
+      "contracts": [
+        {
+          "contract_id": "api.user-profile",
+          "version": "v1",
+          "path": "packages/contracts/api.user-profile.json",
+          "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "role": "consumer"
+        }
+      ],
+      "requires": ["code", "test"],
+      "expected_interfaces": ["display.renderUser(profile): string"],
+      "status": "draft",
+      "assigned_executor": null,
+      "attempts_used": 0
+    },
+    {
+      "task_id": "TASK-0004",
+      "kind": "integrate",
+      "title": "组合验收：提供方与展示方按同一契约联通",
+      "acceptance_criteria": [
+        "组合测试在干净 runner 上通过",
+        "记录 run ID、输入 SHA、组合提交与树哈希",
+        "未通过时生成诊断任务而非直接归咎最后提交者"
+      ],
+      "depends_on": ["TASK-0002", "TASK-0003"],
+      "write_scope": {
+        "allow": ["tests/integration/**"],
+        "deny": [".github/**", "src/**"]
+      },
+      "contracts": [
+        {
+          "contract_id": "api.user-profile",
+          "version": "v1",
+          "path": "packages/contracts/api.user-profile.json",
+          "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "role": "both"
+        }
+      ],
+      "requires": ["test"],
+      "expected_interfaces": ["integration.providerDisplay"],
+      "status": "draft",
+      "assigned_executor": null,
+      "attempts_used": 0
+    }
+  ]
+}

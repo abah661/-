@@ -13,10 +13,10 @@
 | --- | --- | --- |
 | 只读检查、文档、允许目录中的代码与测试 | 按项目规则执行 | ✅ 无需额外批准 |
 | 任务分支 push | 明确仓库、分支前缀、有效期 | ⬜ 未授权 |
-| CI/CD 配置 | 审核具体文件和权限后批准 | ⬜ 未授权 |
-| Worker 部署 | 明确账号、环境、资源后批准 | ⬜ 未授权（A 端为资源所有者） |
-| 凭据创建 | 明确账号、环境、资源后批准 | ⬜ 未授权 |
-| 初始数据库 schema | 明确账号、环境、资源后批准 | ⬜ 未授权 |
+| CI/CD 配置 | 审核具体文件和权限后批准 | ✅ 已授权测试 CI：`.github/workflows/ci.yml`，只读仓库权限 |
+| Worker 部署 | 明确账号、环境、资源后批准 | 🟡 已授权测试 Worker `dual-agent-coordinator-test`，待 Cloudflare 登录 |
+| 凭据创建 | 明确账号、环境、资源后批准 | 🟡 已授权测试环境密钥注入，不记录凭据；待登录 |
+| 初始数据库 schema | 明确账号、环境、资源后批准 | ✅ 已授权 Durable Object SQLite migration `v1` |
 | 自动合并 | 单独明确目标分支、门槛、范围 | ⬜ 未授权 |
 | 系统安装 / 自启 | 按准确对象另行批准 | ⬜ 未授权（Syncthing 待批） |
 | 删除 / 迁移 | 按准确对象另行批准 | ⬜ 未授权 |
@@ -51,6 +51,8 @@
 | AUTH-0002 | 配置远程 origin 与仓库级代理 | `https://github.com/abah661/-.git` | 2026-09-21 | 无 | 用户提供仓库地址并要求连接 |
 | AUTH-0003 | 建立同步资料目录（不安装程序） | `C:\Users\lenovo\Desktop\双端连接-sync` | 2026-09-21 | 无 | 用户要求"启用 Syncthing" |
 | AUTH-0004 | **安装 Syncthing 程序** | `C:\Users\lenovo\AppData\Local\Programs\Syncthing` | 2026-09-21 | 无 | 用户明确"Syncthing 批准安装" |
+| AUTH-0005 | **测试环境 CI、Cloudflare Worker、Durable Object 初始迁移和部署准备** | 本仓库 `.github/workflows/ci.yml`、`apps/coordinator/wrangler.toml`、Worker `dual-agent-coordinator-test`；仅测试环境 | 2026-09-21 | 无 | 用户明确授权"测试环境的 CI、Cloudflare、数据库和部署" |
+| AUTH-0006 | **任务分支 push** | `https://github.com/abah661/-.git`，`task/TASK-A-COORDINATOR/**` | 2026-09-21 | 无 | 用户明确要求执行第 1 项 GitHub 推送 |
 
 > **AUTH-0002 边界**：仅覆盖**配置**远程地址与代理。
 > **不包含**任何 `git push`。推送需单独授权（见下）。
@@ -64,18 +66,16 @@
 
 ## 待用户确认的事项
 
-1. **推送授权** — 远程 `main` 分支的首次推送。
-   需明确：谁推主干、分支前缀、有效期。
-   技术上还需在本机完成一次 GitHub 认证（当前 push 返回 **401 Unauthorized**）。
-   操作步骤见 `docs/first-push.md`。
-2. **Syncthing 自启授权** — 程序已装并在运行，但**自启未配置**。
+1. **Syncthing 自启授权** — 程序已装并在运行，但**自启未配置**。
    注册 Windows 服务需管理员权限，属"系统安装、自启"范围。
-3. **Syncthing 与 A 端配对** — 需双方交换设备 ID（第 10.2 节步骤 3）。
-4. **目标示例仓库** — `<TARGET_REPO_URL>` 未确定，
+2. **Syncthing 与 A 端配对** — 需双方交换设备 ID（第 10.2 节步骤 3）。
+3. **目标示例仓库** — `<TARGET_REPO_URL>` 未确定，
    首次验收需要一个小小的目标示例仓库（与协调系统仓库分开）。
-5. **A 端本地项目路径** — B 端无法代为确定。
-6. **预算阈值双签** — `docs/budget-and-limits.md` 由 B 端拟定，
+4. **A 端本地项目路径** — 已填写，见 `docs/project-info.md`。
+5. **预算阈值双签** — `docs/budget-and-limits.md` 由 B 端拟定，
    需双方认可后生效。
+6. **Cloudflare 账号与项目** — 测试 Worker 名称已固定为
+   `dual-agent-coordinator-test`，但实际 Cloudflare 账号尚未登录；部署前需由 A 端在本机完成登录。
 
 ---
 

@@ -11,7 +11,7 @@
 | `<PROJECT_NAME_AND_GOAL>` | 双人 Agent 自动并行开发系统 | ✅ 已填 |
 | `<COORDINATOR_REPO_URL>` | `https://github.com/abah661/-.git` | ✅ 已填 |
 | `<TARGET_REPO_URL>` | 待填（首次验收用的小示例仓库） | ⬜ 缺 |
-| `<A_PROJECT_ROOT>` | 待 A 端填写 | ⬜ 缺 |
+| `<A_PROJECT_ROOT>` | `E:\双人agent并行开发\双人Agent自动并行开发系统-A端` | ✅ 已填 |
 | `<B_PROJECT_ROOT>` | `C:\Users\lenovo\Desktop\双端连接` | ✅ 已填 |
 | `<ENVIRONMENT_AND_OWNER>` | 资源所有者：**A 端**（负责计费与部署授权） | ✅ 已填 |
 | `<EXECUTOR_A_ID>` | 建议 `EXE-A-<主机名>` | 🟡 建议 |
@@ -56,13 +56,13 @@
 | 项目 | 状态 |
 | --- | --- |
 | remote origin | ✅ 已设置 `https://github.com/abah661/-.git` |
-| 远程仓库是否为空 | ✅ 是（尚无任何分支） |
+| 远程仓库是否为空 | ❌ 否（A 端任务分支已推送） |
 | 仓库级代理 | ✅ `http://127.0.0.1:7897` |
 | 读取（fetch/ls-remote） | ✅ 可用 |
-| 推送（push） | ⬜ **返回 401，需要凭据** |
+| 推送（push） | ✅ A 端任务分支已推送，远端 SHA 已核对 |
 
-**推送待办**：GitHub 写操作需要凭据。按规则 5 与第 11 节，
-凭据不得经我传递或记录。需由你（或 A 端）在本地完成一次认证：
+**推送说明**：A 端任务分支已完成一次认证并推送。凭据不得经我传递或记录。
+后续新分支推送仍由 A 端本机认证完成：
 
 ```bash
 # 方式一：使用 Git Credential Manager（本机已配置为 manager）
@@ -92,7 +92,8 @@ git push -u origin main
    验收后再注册真实业务仓库。**协调系统仓库已确定，但目标仓库需另建。**
 2. **A 端本地项目路径** — B 端无法代为确定。
 3. **Syncthing 安装授权** — 目录与规则已就绪，但安装需你批准（第 10.2 节步骤 1）。
-4. **推送凭据** — GitHub 写操作需要认证，需在本机完成。
+4. **Cloudflare 账号与项目** — 测试 Worker 配置已准备，但部署前需要 A 端在本机登录 Cloudflare。
+5. **数据库外部资源** — 当前不另建 D1；测试环境使用 Worker Durable Object SQLite 初始 migration `v1`。
 
 ---
 

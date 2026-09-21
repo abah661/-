@@ -1,0 +1,14 @@
+{
+  "name": "@dac/cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@dac/protocol": "*"
+  }
+}

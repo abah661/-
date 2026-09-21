@@ -5,8 +5,8 @@
 > 用户提交需求后，系统自动规划任务、确定接口契约、分配给两台电脑上的 agent、
 > 收集提交、测试组合结果，并在失败后自动派发返修任务。
 
-**当前状态：P0 + P1 已完成骨架。** 协议 v1 已定义并通过校验，但尚未冻结；
-协调器（Worker + Durable Object）、执行器与适配器尚未实现。
+**当前状态：P0 + P1 已完成。协议 v1 已冻结并通过完整性守卫。**
+协调器（Worker + Durable Object）、执行器与适配器尚未实现（P2 待双方开工）。
 
 ---
 
@@ -22,8 +22,11 @@
 | P5 | 验收自动并行与返修 | ⬜ 未开始 |
 | P6 | 可选同步与正式使用 | 🟡 Syncthing 已装，待配对 |
 
-> **协议 v1 冻结于提交 `a577d66`，树哈希 `d6457c8`。**
-> A 端实现交接见 `docs/protocol-v1-freeze-and-handoff.md`。
+> **协议 v1 已冻结**：冻结点提交 `a577d66`，该提交下协议子树哈希
+> `f9644c44628d5fe8445bcbbb54ad336d7fbe0abc`（注意是 **`packages/protocol/` 子树**哈希，
+> 不是仓库根树哈希）。冻结记录落盘于提交 `00a1acf`。
+> 完整性守卫见 `tests/protocol/freeze.test.ts`；A 端实现交接见
+> `docs/protocol-v1-freeze-and-handoff.md`。
 
 ---
 
@@ -56,7 +59,7 @@ npm ci
 ```bash
 npm run typecheck          # TypeScript 全量类型检查
 npm run validate:protocol  # 协议元数据自检 + 样例正反向校验
-npm test                   # 单元、协议、状态机、图分析测试（69 个）
+npm test                   # 单元、协议、状态机、图分析、冻结守卫测试（80 个）
 npm run check              # 以上三项串联，提交前必须全绿
 ```
 
@@ -154,14 +157,16 @@ draft → planning → ready → leased → running → validating
 
 ---
 
-## 下一步（P1 收尾）
+## 下一步
 
-**P1 已完成**：协议 v1 已冻结。后续工作：
+**P1 已完成**：协议 v1 已冻结，完整性守卫（11 个用例）全绿。P2 可开工：
 
 1. **A 端开工 P2** — Worker API、Durable Object、Codex 适配器、管理 CLI
-   → 交接单：`docs/protocol-v1-freeze-and-handoff.md`
+   → **交接单：`docs/protocol-v1-freeze-and-handoff.md`**（含路由/幂等作用域对照表、
+   DO 事务模式、适配器 I/O 契约、验收清单与建议实现顺序）
 2. **B 端开工 P2** — 执行器公共内核、OpenCode 适配器、结果归一化
-3. **双方核对共同基线** — A 端克隆后核对冻结提交 `a577d66`
+3. **双方核对共同基线** — A 端克隆后核对冻结点 `a577d66` 的协议子树哈希
+   `f9644c44…`（用 `git rev-parse a577d66:packages/protocol`）
 4. **推送远程** — 远程尚未推送，A 端当前无法克隆
    → 见 `docs/first-push.md`
 

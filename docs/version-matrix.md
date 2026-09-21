@@ -64,18 +64,26 @@
 > 本机 git 全局配置中已有 `user.name=abah` / `user.email=1587548960@qq.com`，
 > 未做改动。
 
-## Syncthing（启用，待安装）
+## Syncthing（已安装并运行）
 
 | 项目 | 值 |
 | --- | --- |
+| 版本 | **v2.1.5** "Hafnium Hornet" (go1.27.1 windows-amd64) |
+| 可执行文件 | `C:\Users\lenovo\AppData\Local\Programs\Syncthing\syncthing.exe` |
+| 配置目录 | `C:\Users\lenovo\AppData\Local\Syncthing\` |
+| 本机设备 ID | `IB4BOBV-WEUPNU4-FK62OF4-2B6VIUU-NZV4FUG-IMUB6RK-WKVPRWR-KYRCEQL` |
+| 设备名 | `braveniuniu` |
+| GUI | `http://127.0.0.1:8384`（仅本机监听） |
 | 同步根目录 | `C:\Users\lenovo\Desktop\双端连接-sync` |
 | 发布目录（Send Only） | `from-b` |
 | 接收目录（Receive Only） | `from-a` |
 | Folder ID | `dual-agent-from-a` / `dual-agent-from-b` |
-| 程序版本 | ⬜ 未安装（待批准） |
 
 > 同步根目录已验证为 Git 仓库的**同级独立目录**，
 > 不在仓库内，符合第 10.1 节与第 10.2 节步骤 5。
+>
+> 安装方式：winget 失败（portable 需符号链接），改用官方 zip 手动安装。
+> 详见 `双端连接-sync/README.md` 的安装记录。
 
 ## 更新规则
 

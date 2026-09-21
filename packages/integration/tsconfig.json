@@ -3,8 +3,9 @@
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "dist",
+    "lib": ["ES2023"],
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "references": [{ "path": "../../packages/protocol" }, { "path": "../../packages/integration" }]
+  "references": [{ "path": "../protocol" }]
 }

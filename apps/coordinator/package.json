@@ -10,6 +10,7 @@
     "typecheck": "tsc -b"
   },
   "dependencies": {
+    "@dac/integration": "*",
     "@dac/protocol": "*",
     "zod": "4.1.13"
   }

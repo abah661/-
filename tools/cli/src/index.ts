@@ -7,11 +7,14 @@ import {
   validateTimingConfig,
   DEFAULT_TIMING,
 } from "@dac/protocol";
+import { buildFixedIntegrationPlan, parsePendingIntegrationBatch, verifyIntegrationEvidence } from "@dac/integration";
 
 function usage(): void {
   console.error(`用法：
   npm exec --workspace @dac/cli -- dac validate-result <json>
   npm exec --workspace @dac/cli -- dac validate-graph <json>
+  npm exec --workspace @dac/cli -- dac plan-integration <batch-json>
+  npm exec --workspace @dac/cli -- dac verify-integration <batch-json> <evidence-json>
   npm exec --workspace @dac/cli -- dac validate-timing`);
 }
 
@@ -19,7 +22,7 @@ async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8")) as unknown;
 }
 
-const [command, file] = process.argv.slice(2);
+const [command, file, secondFile] = process.argv.slice(2);
 try {
   if (command === "validate-result" && file) {
     const parsed = ResultReportSchema.safeParse(await readJson(file));
@@ -50,6 +53,18 @@ try {
       process.exitCode = 1;
     } else {
       console.log("默认时序参数有效");
+    }
+  } else if (command === "plan-integration" && file) {
+    const batch = parsePendingIntegrationBatch(await readJson(file));
+    console.log(JSON.stringify({ batch, commands: buildFixedIntegrationPlan(batch, ".local/integration-worktree") }, null, 2));
+  } else if (command === "verify-integration" && file && secondFile) {
+    const batch = parsePendingIntegrationBatch(await readJson(file));
+    const verification = verifyIntegrationEvidence(batch, (await readJson(secondFile)) as Parameters<typeof verifyIntegrationEvidence>[1]);
+    if (!verification.valid) {
+      console.error(verification.problems.join("\n"));
+      process.exitCode = 1;
+    } else {
+      console.log(`整合验收通过：${batch.batch_id}`);
     }
   } else {
     usage();

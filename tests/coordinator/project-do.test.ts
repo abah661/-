@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ProjectDurableObject } from "../../apps/coordinator/src/project-do.js";
 import { createCoordinatorWorker, type CoordinatorEnv } from "../../apps/coordinator/src/worker.js";
 import type { DurableObjectStorageLike, StorageTransactionLike } from "../../apps/coordinator/src/storage.js";
@@ -144,6 +144,13 @@ describe("ProjectDurableObject", () => {
     expect(result.status).toBe(200);
     expect(await json(result)).toMatchObject({ accepted: true, status: "ready_for_integration" });
 
+    const replay = await projectDo.fetch(new Request("https://internal/internal/report_result", {
+      method: "POST",
+      body: JSON.stringify(report),
+    }));
+    expect(replay.status).toBe(200);
+    expect(replay.headers.get("x-idempotent-replay")).toBe("true");
+
     const status = await projectDo.fetch(new Request("https://internal/internal/status"));
     expect(status.status).toBe(200);
     expect((await json(status)).graph.tasks[0].status).toBe("ready_for_integration");
@@ -189,6 +196,63 @@ describe("ProjectDurableObject", () => {
     }));
     expect(result.status).toBe(409);
     expect(await json(result)).toMatchObject({ error: { code: "LEASE_EPOCH_STALE" } });
+  });
+
+  it("过期租约拒绝续约，并在下一次领取时恢复为新尝试", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-21T00:00:00.000Z"));
+    try {
+      const projectDo = makeDo();
+      await projectDo.fetch(new Request("https://internal/internal/register_executor", {
+        method: "POST",
+        body: JSON.stringify(registration),
+      }));
+      await projectDo.fetch(new Request("https://internal/internal/submit_requirement", {
+        method: "POST",
+        body: JSON.stringify(graph),
+      }));
+      const leaseResponse = await projectDo.fetch(new Request("https://internal/internal/lease_task", {
+        method: "POST",
+        body: JSON.stringify({
+          protocol_version: "1",
+          executor_id: registration.executor_id,
+          agent_kind: registration.agent_kind,
+          capabilities: registration.capabilities,
+          idempotency_key: "lease-expired-001",
+        }),
+      }));
+      const leased = await json(leaseResponse);
+      vi.advanceTimersByTime(181_000);
+
+      const renew = await projectDo.fetch(new Request("https://internal/internal/renew_lease", {
+        method: "POST",
+        body: JSON.stringify({
+          task_id: "TASK-0001",
+          attempt_id: leased.lease.attempt_id,
+          executor_id: registration.executor_id,
+          lease_epoch: leased.lease.lease_epoch,
+          idempotency_key: "renew-expired-001",
+        }),
+      }));
+      expect(renew.status).toBe(409);
+      expect(await json(renew)).toMatchObject({ error: { code: "LEASE_EXPIRED" } });
+
+      const reassignedResponse = await projectDo.fetch(new Request("https://internal/internal/lease_task", {
+        method: "POST",
+        body: JSON.stringify({
+          protocol_version: "1",
+          executor_id: registration.executor_id,
+          agent_kind: registration.agent_kind,
+          capabilities: registration.capabilities,
+          idempotency_key: "lease-expired-002",
+        }),
+      }));
+      expect(reassignedResponse.status).toBe(200);
+      const reassigned = await json(reassignedResponse);
+      expect(reassigned.lease.attempt_id).toBe("TASK-0001-A2");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

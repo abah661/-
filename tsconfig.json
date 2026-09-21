@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/protocol" },
+    { "path": "./packages/integration" },
     { "path": "./tools/validate-protocol" },
     { "path": "./apps/coordinator" },
     { "path": "./tools/cli" }

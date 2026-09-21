@@ -96,6 +96,24 @@ function assertBindingMatches(lease: Lease, report: ResultReport): void {
   }
 }
 
+function reapExpiredLeases(state: ProjectState): void {
+  const now = Date.now();
+  for (const [taskId, lease] of Object.entries(state.leases)) {
+    if (Date.parse(lease.expires_at) > now) continue;
+    const task = state.graph?.tasks.find((candidate) => candidate.task_id === taskId);
+    if (task?.status === "leased") {
+      assertTransition(task.status, "ready");
+      task.status = "ready";
+      task.assigned_executor = null;
+    }
+    delete state.leases[taskId];
+  }
+}
+
+function leaseExpired(lease: Lease): boolean {
+  return Date.parse(lease.expires_at) <= Date.now();
+}
+
 export class ProjectDurableObject {
   constructor(private readonly state: DurableObjectStateLike, private readonly projectId: string) {}
 
@@ -189,6 +207,7 @@ export class ProjectDurableObject {
     if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "领取请求无效", parsed.error.issues);
     const request = parsed.data as LeaseRequest;
     return this.withTransaction(async (_storage, state) => {
+      reapExpiredLeases(state);
       const key = requireIdempotencyScope(request, "lease_task");
       const replay = responseForIdempotency(state, key, request);
       if (replay) return replay;
@@ -237,6 +256,7 @@ export class ProjectDurableObject {
       if (!lease || lease.attempt_id !== request.attempt_id || lease.executor_id !== request.executor_id || lease.lease_epoch !== request.lease_epoch) {
         throw new ApiError(409, "LEASE_EPOCH_STALE", "续约不匹配当前租约");
       }
+      if (leaseExpired(lease)) throw new ApiError(409, "LEASE_EXPIRED", "租约已过期，不能续约");
       lease.expires_at = new Date(Date.now() + 180_000).toISOString();
       saveIdempotent(state, key, request, lease, 200);
       return jsonResponse(lease);
@@ -256,6 +276,7 @@ export class ProjectDurableObject {
       if (!lease || lease.attempt_id !== report.attempt_id || lease.executor_id !== report.executor_id || lease.lease_epoch !== report.lease_epoch) {
         throw new ApiError(409, "LEASE_EPOCH_STALE", "结果报告不匹配当前租约");
       }
+      if (leaseExpired(lease)) throw new ApiError(409, "LEASE_EXPIRED", "租约已过期，不能提交结果");
       assertBindingMatches(lease, report);
       // 结果报告由持有租约的执行器提交，因此报告本身可以确认已开工。
       // 协议要求 leased → running 只能由当前租约持有者推进；这里完成这一步，

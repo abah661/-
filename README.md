@@ -5,7 +5,7 @@
 > 用户提交需求后，系统自动规划任务、确定接口契约、分配给两台电脑上的 agent、
 > 收集提交、测试组合结果，并在失败后自动派发返修任务。
 
-**当前状态：P0/P1 基线已完成；P2 的 A 端组件已实现第一版。** 协议仓库当前远端元数据仍为
+**当前状态：P0/P1 基线已完成；P2 A 端组件与 P3 A 端离线集成第一版已实现。** 协议仓库当前远端元数据仍为
 `draft`，不能把项目书附件中声称的冻结记录当作远端已生效的事实；本分支不修改协议定义。
 协调器（Worker + Durable Object）和管理 CLI 已完成本地离线实现，B 端执行器与适配器不在本分支范围内。
 
@@ -18,7 +18,7 @@
 | P0 | 项目初始化、仓库规则、目录结构、可运行基线 | ✅ 已完成 |
 | P1 | 协议 v1 冻结、协议校验、依赖环检测、模拟双机测试 | 🟡 协议已定义，待双方核对后冻结 |
 | P2 | 双方开发组件（Worker/DO、执行器内核、双适配器） | 🟡 A 端 Worker/DO/CLI 已完成第一版，B 端执行器待其分支 |
-| P3 | 离线与本地集成 | ⬜ 未开始 |
+| P3 | 离线与本地集成 | 🟡 A 端固定整合/独立验收第一版已完成，真实双机待 B 端 |
 | P4 | 接通 Cloudflare 与 GitHub | ⬜ 未开始 |
 | P5 | 验收自动并行与返修 | ⬜ 未开始 |
 | P6 | 可选同步与正式使用 | ⬜ 未开始 |
@@ -54,7 +54,7 @@ npm ci
 ```bash
 npm run typecheck          # TypeScript 全量类型检查
 npm run validate:protocol  # 协议元数据自检 + 样例正反向校验
-npm test                   # 单元、协议、状态机、图分析、协调器测试（当前 72 个）
+npm test                   # 单元、协议、状态机、图分析、协调器、整合测试（当前 76 个）
 npm run check              # 以上三项串联，提交前必须全绿
 ```
 
@@ -77,6 +77,7 @@ packages/protocol/                协议 v1：schema、状态机、错误分类�
   src/defaults.ts                   时序与上限默认值（可调建议值）
   src/graph.ts                      拓扑排序、环检测、并行判定
   samples/                          正向与反向样例夹具
+packages/integration/              固定整合计划与独立证据验收          ← A 维护
 apps/coordinator/                  Worker API 与 Durable Object          ← A 维护
 apps/executor/                     Windows 执行器与两种适配器            ← B 维护（未实现）
 tools/cli/                         A 端管理 CLI（离线校验与报告检查）    ← A 维护
@@ -155,14 +156,14 @@ draft → planning → ready → leased → running → validating
 
 ## 下一步
 
-当前 A 端本地实现已具备继续做 P3 离线集成的条件，但仍有以下顺序约束：
+当前 A 端 P3 离线集成第一版已完成，但仍有以下顺序约束：
 
 1. B 端核对 Windows / OpenCode 可实现性，并提供成功、失败、恢复样例
 2. 按协议变更流程核实冻结记录；在远端元数据真正为 `frozen` 前，不宣称协议已冻结
-3. P3 增加固定提交整合、批次验收和返修路径的离线测试
+3. 等 B 端执行器和真实 agent 样例到位后，补真实双机与两种适配器验证
 4. 获得明确授权后，才进入 CI、Cloudflare、凭据、数据库或部署工作
 
-本次 A 端实现与实际验证记录见 `docs/reports/P2-A-coordinator.md`。
+本次 A 端实现与实际验证记录见 `docs/reports/P2-A-coordinator.md` 和 `docs/reports/P3-A-local-integration.md`。
 
 ---
 

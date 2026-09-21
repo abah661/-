@@ -1,0 +1,20 @@
+{
+  "batch_id": "BATCH-0001",
+  "project_id": "PROJECT-TEST",
+  "base_sha": "1111111111111111111111111111111111111111",
+  "candidate_heads": [
+    "5555555555555555555555555555555555555555",
+    "6666666666666666666666666666666666666666"
+  ],
+  "rules_sha": "2222222222222222222222222222222222222222",
+  "contract_sha": "3333333333333333333333333333333333333333",
+  "acceptance_sha": "4444444444444444444444444444444444444444",
+  "trusted_workflow": ".github/workflows/integration.yml@a577d6688b323afbdbc647b3a1288c0316f7fb1e",
+  "commands": [],
+  "exit_code": 0,
+  "tests": { "passed": 12, "failed": 0, "skipped": 0 },
+  "ci_run_id": "RUN-1001",
+  "merged_sha": "7777777777777777777777777777777777777777",
+  "tree_sha": "8888888888888888888888888888888888888888",
+  "dirty": false
+}

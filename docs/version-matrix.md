@@ -40,15 +40,42 @@
 | 字段 | 填写值 |
 | --- | --- |
 | `<PROJECT_NAME_AND_GOAL>` | 双人 Agent 自动并行开发系统 |
-| `<COORDINATOR_REPO_URL>` | 待填（仅本地 Git，尚未推送） |
-| `<TARGET_REPO_URL>` | 待填 |
+| `<COORDINATOR_REPO_URL>` | `https://github.com/abah661/-.git` |
+| `<TARGET_REPO_URL>` | 待填（需另建，与协调系统仓库分开） |
 | `<A_PROJECT_ROOT>` | 待 A 端填写 |
 | `<B_PROJECT_ROOT>` | `C:\Users\lenovo\Desktop\双端连接` |
-| `<ENVIRONMENT_AND_OWNER>` | 待填（需指定 Cloudflare 资源所有者） |
+| `<ENVIRONMENT_AND_OWNER>` | 资源所有者：**A 端** |
 | `<EXECUTOR_A_ID>` | 建议 `EXE-A-<主机名>` |
 | `<EXECUTOR_B_ID>` | 建议 `EXE-B-<主机名>` |
-| `<DAILY_BUDGET_AND_LIMITS>` | 待填 |
-| `<SYNCTHING_ENABLED>` | 待定 |
+| `<DAILY_BUDGET_AND_LIMITS>` | 见 `docs/budget-and-limits.md` |
+| `<SYNCTHING_ENABLED>` | **启用** |
+
+## 网络环境（B 端本机实测）
+
+| 项目 | 值 | 说明 |
+| --- | --- | --- |
+| HTTP/HTTPS 代理 | `http://127.0.0.1:7897` | git 可用的代理端口 |
+| 备用代理 | `http://127.0.0.1:59723` | 可用于 Web，但 git CONNECT 返回 502 |
+| git 代理配置 | 仓库级 `http.proxy` / `https.proxy` | 仅本仓库生效，不污染全局 |
+| 直连（无代理） | ❌ 不可用 | 连接 github.com:443 超时 |
+
+> 代理配置写在**仓库级**（`--local`）而非全局，
+> 避免影响你其他项目的 git 行为。
+> 本机 git 全局配置中已有 `user.name=abah` / `user.email=1587548960@qq.com`，
+> 未做改动。
+
+## Syncthing（启用，待安装）
+
+| 项目 | 值 |
+| --- | --- |
+| 同步根目录 | `C:\Users\lenovo\Desktop\双端连接-sync` |
+| 发布目录（Send Only） | `from-b` |
+| 接收目录（Receive Only） | `from-a` |
+| Folder ID | `dual-agent-from-a` / `dual-agent-from-b` |
+| 程序版本 | ⬜ 未安装（待批准） |
+
+> 同步根目录已验证为 Git 仓库的**同级独立目录**，
+> 不在仓库内，符合第 10.1 节与第 10.2 节步骤 5。
 
 ## 更新规则
 

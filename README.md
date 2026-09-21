@@ -15,12 +15,15 @@
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | P0 | 项目初始化、仓库规则、目录结构、可运行基线 | ✅ 已完成 |
-| P1 | 协议 v1 冻结、协议校验、依赖环检测、模拟双机测试 | 🟡 协议已定义，待双方核对后冻结 |
-| P2 | 双方开发组件（Worker/DO、执行器内核、双适配器） | ⬜ 未开始 |
+| P1 | 协议 v1 冻结、协议校验、依赖环检测、模拟双机测试 | ✅ **协议 v1 已冻结** |
+| P2 | 双方开发组件（Worker/DO、执行器内核、双适配器） | 🟡 可开工（协议已冻结） |
 | P3 | 离线与本地集成 | ⬜ 未开始 |
 | P4 | 接通 Cloudflare 与 GitHub | ⬜ 未开始 |
 | P5 | 验收自动并行与返修 | ⬜ 未开始 |
-| P6 | 可选同步与正式使用 | ⬜ 未开始 |
+| P6 | 可选同步与正式使用 | 🟡 Syncthing 已装，待配对 |
+
+> **协议 v1 冻结于提交 `a577d66`，树哈希 `d6457c8`。**
+> A 端实现交接见 `docs/protocol-v1-freeze-and-handoff.md`。
 
 ---
 
@@ -153,19 +156,24 @@ draft → planning → ready → leased → running → validating
 
 ## 下一步（P1 收尾）
 
-协议 v1 从"已定义"走向"已冻结"需要：
+**P1 已完成**：协议 v1 已冻结。后续工作：
 
-1. B 端（OpenCode）核对 Windows / OpenCode 可实现性
-2. B 端提供成功、失败、恢复三类样例
-3. 双方确认后把 `PROTOCOL_META.status` 改为 `frozen` 并记录提交号
-4. 协议冻结后，双方进入不同模块并行开发（P2）
+1. **A 端开工 P2** — Worker API、Durable Object、Codex 适配器、管理 CLI
+   → 交接单：`docs/protocol-v1-freeze-and-handoff.md`
+2. **B 端开工 P2** — 执行器公共内核、OpenCode 适配器、结果归一化
+3. **双方核对共同基线** — A 端克隆后核对冻结提交 `a577d66`
+4. **推送远程** — 远程尚未推送，A 端当前无法克隆
+   → 见 `docs/first-push.md`
 
 ---
 
 ## 相关文档
 
 - `AGENTS.md` — 工程规范、规则、授权表（**开工前必读**）
+- `docs/protocol-v1-freeze-and-handoff.md` — **协议冻结确认与 A 端实现交接**
 - `docs/authorization.md` — 授权记录格式与当前已批准范围
 - `docs/protocol-changes.md` — 协议变更提案流程
+- `docs/budget-and-limits.md` — 每日预算与停止条件
+- `docs/first-push.md` — 首次推送远程的操作指引
 - `docs/version-matrix.md` — 工具版本矩阵
 - `docs/project-info.md` — 项目基本信息表

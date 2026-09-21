@@ -125,8 +125,35 @@ export function validateProtocolMeta(): ValidationOutcome {
   if (PROTOCOL_META.version !== PROTOCOL_VERSION) {
     issues.push({ path: "PROTOCOL_META.version", message: "协议元数据版本与常量不一致" });
   }
-  if (PROTOCOL_META.status === "frozen" && !PROTOCOL_META.frozenAt) {
-    issues.push({ path: "PROTOCOL_META.frozenAt", message: "已冻结状态必须记录冻结提交号" });
+  if (PROTOCOL_META.status === "frozen") {
+    if (!PROTOCOL_META.frozenAt) {
+      issues.push({
+        path: "PROTOCOL_META.frozenAt",
+        message: "已冻结状态必须记录冻结提交号",
+      });
+    } else if (!/^[0-9a-f]{40}$/.test(PROTOCOL_META.frozenAt)) {
+      issues.push({
+        path: "PROTOCOL_META.frozenAt",
+        message: "冻结提交号必须是完整的 40 位 SHA",
+      });
+    }
+    if (!PROTOCOL_META.frozenTreeSha) {
+      issues.push({
+        path: "PROTOCOL_META.frozenTreeSha",
+        message: "已冻结状态必须记录树哈希，否则无法核对协议未被悄悄改动",
+      });
+    } else if (!/^[0-9a-f]{40}$/.test(PROTOCOL_META.frozenTreeSha)) {
+      issues.push({
+        path: "PROTOCOL_META.frozenTreeSha",
+        message: "树哈希必须是完整的 40 位 SHA",
+      });
+    }
+  }
+  if (PROTOCOL_META.status === "superseded" && PROTOCOL_META.changeProposals.length === 0) {
+    issues.push({
+      path: "PROTOCOL_META.changeProposals",
+      message: "被取代的协议必须记录导致取代的变更提案",
+    });
   }
   return { ok: issues.length === 0, issues };
 }

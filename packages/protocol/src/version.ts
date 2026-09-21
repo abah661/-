@@ -26,6 +26,13 @@ export interface ProtocolMeta {
    * 用 `git rev-parse "<frozenAt>:packages/protocol"` 获取，
    * 它只随协议包内容变化，不随其他目录的改动而变——
    * 这正是核对"协议未被悄悄改动"所需要的。
+   *
+   * 自引用说明：本文件（version.ts）自己也在被冻结的子树之内，
+   * 因此"写入冻结记录"这个动作本身就会改变子树哈希——冻结点之后的
+   * `HEAD:packages/protocol` **不会**等于此值，这是预期行为，不是错误。
+   * 所以此字段定义为"冻结点自身子树的事实快照"，供下面这条校验使用：
+   * `git rev-parse "<frozenAt>:packages/protocol" === frozenTreeSha`；
+   * 而"冻结后有没有人改协议"由 freeze.test.ts 逐文件比对（排除本文件）来保证。
    */
   frozenTreeSha: string | null;
   /** 已落地的变更提案 ID，例如 CP-0003。空数组表示仍是初始版本。 */
@@ -35,11 +42,14 @@ export interface ProtocolMeta {
 /**
  * 协议冻结信息。变更提案落地时同步更新，并记录批准依据。
  *
- * 注意：不要在此处使用 `as const`——它会把 status 收窄为字面量类型，
- * 导致下游的冻结状态校验变成编译期死代码。
+ * 注意：不要给整个 `PROTOCOL_META` 加 `as const`——它会把 `status` 收窄成
+ * 字面量类型，导致下游的冻结状态校验变成编译期死代码（tsc 会报 TS2367）。
+ * 用上面的 `interface ProtocolMeta` 显式标注即可。
  *
  * 冻结记录：
  * - v1 由双方确认冻结于 2026-09-21。
+ * - 冻结点提交 `frozenAt` 是一个**冻结前**的快照（当时 status 仍为 draft）；
+ *   冻结动作本身只改动了本文件，其余协议文件自冻结点起逐字节未变。
  * - B 端（OpenCode）已完成 Windows/OpenCode 可实现性核对，并确认样例可复现。
  * - 冻结后任何字段增删或语义变化必须走 `docs/protocol-changes.md` 的提案流程。
  */

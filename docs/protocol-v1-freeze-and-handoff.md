@@ -3,14 +3,21 @@
 - 日期：2026-09-21
 - 确认方：B 端（OpenCode）
 - 协议版本：**v1，状态 frozen**
-- 冻结提交：`a577d6688b323afbdbc647b3a1288c0316f7fb1e`
-- 协议子树哈希：`f9644c44628d5fe8445bcbbb54ad336d7fbe0abc`
+- 冻结点提交（anchor）：`a577d6688b323afbdbc647b3a1288c0316f7fb1e`
+- 该提交下协议子树哈希：`f9644c44628d5fe8445bcbbb54ad336d7fbe0abc`
+- 冻结记录落盘提交：`00a1acf`
 
 > **核对方式**：`git rev-parse a577d66:packages/protocol`
 > 注意这是 **`packages/protocol/` 子树**的树哈希，不是仓库根树哈希
 > （根树哈希是 `d6457c8`，两者用途完全不同——子树哈希只随协议包内容变化，
 > 因此才能用来核对"协议未被悄悄改动"）。
 > 这一区分已由 `tests/protocol/freeze.test.ts` 自动断言，防止再次混淆。
+>
+> **`a577d66` 是一个"冻结前"快照**：该提交里 `status` 仍是 `draft`。
+> 冻结动作本身只改动了 `src/version.ts` 一个文件，其余协议文件自 `a577d66`
+> 起逐字节未变——这一点由 `freeze.test.ts` 逐文件比对保证。
+> 之所以不把"冻结后提交"当作 anchor，是因为写入冻结记录会改变子树哈希，
+> 形成自引用（详见 §1.2）。
 
 ---
 
@@ -44,17 +51,18 @@ PASS  PROTOCOL_META
 - 必须记录树哈希，否则无法核对协议未被悄悄改动
 - `superseded` 状态必须记录导致取代的变更提案
 
-**冻结守卫已自动化**（`tests/protocol/freeze.test.ts`，10 个测试）：
+**冻结守卫已自动化**（`tests/protocol/freeze.test.ts`，11 个测试）：
 
 - 冻结提交在仓库中真实存在
-- `frozenTreeSha` 等于冻结提交下 `packages/protocol` 的子树哈希
+- `frozenTreeSha` 等于**冻结点**下 `packages/protocol` 的子树哈希
 - `frozenTreeSha` **不是**根树哈希（防止混淆）
-- HEAD 的协议子树哈希仍等于冻结值 → 协议未被改动
-- 工作区中协议包无未提交改动
+- 冻结后协议包内容逐文件未变（**排除 `src/version.ts`**，见 §1.2）
+- 冻结后协议包没有新增文件（同上）
+- 工作区中协议包无未提交改动（同上）
 
 **该守卫经过反向验证**：故意在 `status.ts` 追加一行注释后，
-测试立即失败；用 `git checkout` 恢复后重新通过。
-即它确实能拦住未经提案的协议改动，不是摆设。
+测试立即失败（`M packages/protocol/src/status.ts`）；用 `git checkout` 恢复后重新通过
+（11 passed, EXIT=0）。即它确实能拦住未经提案的协议改动，不是摆设。
 
 **冻结后规则**：任何字段增删或语义变化，必须走 `docs/protocol-changes.md` 的提案流程，
 **不能由一端私自修改**。
@@ -73,6 +81,33 @@ PASS  PROTOCOL_META
 
 A 端实现时若要新增冻结相关字段，请沿用同一模式：
 **记录可被机器核对的值，并写测试验证它**，而不是只写进文档。
+
+---
+
+## 1.2 冻结记录的"自引用"问题（A 端必读，否则会踩同一个坑）
+
+冻结记录写在 `packages/protocol/src/version.ts` 里，而这个文件**本身就在被冻结的子树之内**。
+于是"冻结点与 HEAD 的完整子树哈希必须相等"这条断言**必然失败**：
+写下冻结信息的那一刻，子树哈希就已经变了。
+
+```
+git rev-parse a577d66:packages/protocol   → f9644c44628d5fe8445bcbbb54ad336d7fbe0abc  (冻结点)
+git rev-parse HEAD:packages/protocol      → 5ed940d31beb5641d0b9d31ddf73f3700fe6da2e  (含冻结记录)
+```
+
+两者不等是**预期行为，不是错误**。正确做法是把校验拆成两件事：
+
+| 校验目标 | 方法 |
+| --- | --- |
+| 记录本身没写错 | `frozenTreeSha === git rev-parse "<frozenAt>:packages/protocol"` |
+| 冻结后没人偷改协议 | 逐文件比对 blob 哈希，**排除 `version.ts`** |
+
+B 端已按此实现，并额外补了一条"没有新增文件"的检查
+（逐文件比对只能发现"改"和"删"，发现不了"增"）。
+
+> **给 A 端的建议**：如果 A 端也要在仓库里记录类似的"冻结/版本锚点"，
+> 不要让锚点文件自己参与锚点哈希的计算，否则会陷入同一个自引用陷阱。
+> 若确实需要单一哈希，用 `git write-tree` 排除该文件后再算，或把锚点放到被冻结目录之外。
 
 ---
 

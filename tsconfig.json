@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/protocol" },
     { "path": "./packages/integration" },
+    { "path": "./packages/codex-adapter" },
     { "path": "./tools/validate-protocol" },
     { "path": "./apps/coordinator" },
     { "path": "./tools/cli" }

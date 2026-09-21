@@ -39,4 +39,4 @@ npm exec --workspace @dac/cli -- tsx src/index.ts verify-integration ../../packa
 
 当前是本地离线整合计划和证据验收，不是已经执行真实 merge、GitHub Actions 或自动合并。远端协议元数据仍为 `draft`；Node 当前为 `v24.14.1`，项目要求为 `>=22 <23`，npm 安装只产生 engine 警告。
 
-下一步是 Codex 非交互适配器及其启动/恢复/停止/错误映射测试；需要调用真实 Codex 登录时再停下请求用户登录，不索取或记录凭据。
+Codex 非交互适配器已在 P2 补上；真实调用已启动并产生 JSONL，但当前环境到 `api.openai.com` 的连接被拒绝/超时，因此真实模型联通性仍待网络恢复后重试。

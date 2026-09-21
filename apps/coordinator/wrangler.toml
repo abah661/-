@@ -14,3 +14,4 @@ new_sqlite_classes = ["ProjectDurableObject"]
 [vars]
 # COORDINATOR_API_TOKEN is intentionally not stored here.
 # Set it only as a Wrangler secret in the test environment.
+# COORDINATOR_EXECUTOR_TOKENS_JSON must also be injected as a Wrangler secret.

@@ -227,6 +227,7 @@ describe("ProjectDurableObject", () => {
       const renew = await projectDo.fetch(new Request("https://internal/internal/renew_lease", {
         method: "POST",
         body: JSON.stringify({
+          protocol_version: "1",
           task_id: "TASK-0001",
           attempt_id: leased.lease.attempt_id,
           executor_id: registration.executor_id,
@@ -254,6 +255,56 @@ describe("ProjectDurableObject", () => {
       vi.useRealTimers();
     }
   });
+
+  it("记录心跳并支持重启后的租约归属查询", async () => {
+    const projectDo = makeDo();
+    await projectDo.fetch(new Request("https://internal/internal/register_executor", {
+      method: "POST",
+      body: JSON.stringify(registration),
+    }));
+    await projectDo.fetch(new Request("https://internal/internal/submit_requirement", {
+      method: "POST",
+      body: JSON.stringify(graph),
+    }));
+    const leaseResponse = await projectDo.fetch(new Request("https://internal/internal/lease_task", {
+      method: "POST",
+      body: JSON.stringify({
+        protocol_version: "1",
+        executor_id: registration.executor_id,
+        agent_kind: registration.agent_kind,
+        capabilities: registration.capabilities,
+        idempotency_key: "lease-heartbeat-001",
+      }),
+    }));
+    const leased = await json(leaseResponse);
+
+    const heartbeat = await projectDo.fetch(new Request("https://internal/internal/executor_heartbeat", {
+      method: "POST",
+      body: JSON.stringify({
+        protocol_version: "1",
+        executor_id: registration.executor_id,
+        state: "running",
+        task_id: leased.lease.task_id,
+        attempt_id: leased.lease.attempt_id,
+        lease_epoch: leased.lease.lease_epoch,
+        sent_at: "2026-09-21T00:00:30.000Z",
+        idempotency_key: "heartbeat-001",
+      }),
+    }));
+    expect(heartbeat.status).toBe(200);
+    expect(await json(heartbeat)).toMatchObject({ accepted: true, executor_id: registration.executor_id });
+
+    const ownershipUrl = new URL("https://internal/internal/query_ownership");
+    ownershipUrl.search = new URLSearchParams({
+      task_id: leased.lease.task_id,
+      attempt_id: leased.lease.attempt_id,
+      executor_id: registration.executor_id,
+      lease_epoch: String(leased.lease.lease_epoch),
+    }).toString();
+    const ownership = await projectDo.fetch(new Request(ownershipUrl));
+    expect(ownership.status).toBe(200);
+    expect(await json(ownership)).toMatchObject({ ownership: "still_mine", lease_epoch: leased.lease.lease_epoch });
+  });
 });
 
 describe("Worker route", () => {
@@ -280,5 +331,24 @@ describe("Worker route", () => {
       env,
     );
     expect(authorized.status).toBe(200);
+  });
+
+  it("执行器 Bearer token 不能冒充其他 executor_id", async () => {
+    const worker = createCoordinatorWorker();
+    const storage = new MemoryStorage();
+    const env: CoordinatorEnv = {
+      COORDINATOR_EXECUTOR_TOKENS_JSON: JSON.stringify({ "EXE-A-TEST": "executor-token" }),
+      PROJECTS: {
+        idFromName: () => ({}),
+        get: () => ({ fetch: (request: Request) => new ProjectDurableObject({ storage }, "PROJECT-TEST").fetch(request) }),
+      },
+    };
+    const response = await worker.fetch(new Request("https://api/v1/projects/PROJECT-TEST/executors/register", {
+      method: "POST",
+      headers: { authorization: "Bearer executor-token", "content-type": "application/json" },
+      body: JSON.stringify({ ...registration, executor_id: "EXE-B-OTHER" }),
+    }), env);
+    expect(response.status).toBe(403);
+    expect(await json(response)).toMatchObject({ error: { code: "EXECUTOR_IDENTITY_MISMATCH" } });
   });
 });

@@ -17,11 +17,14 @@ import {
 } from "@dac/protocol";
 import {
   ContractProposalSchema,
+  ExecutorHeartbeatRequestSchema,
+  OwnershipQuerySchema,
   errorResponse,
   jsonResponse,
   parseJson,
   requireIdempotencyScope,
   type ContractProposal,
+  type ExecutorHeartbeatRequest,
   type LeaseRequest,
   type RenewLeaseRequest,
   LeaseRequestSchema,
@@ -149,6 +152,10 @@ export class ProjectDurableObject {
         return this.leaseTask(await parseJson(request));
       case "POST renew_lease":
         return this.renewLease(await parseJson(request));
+      case "POST executor_heartbeat":
+        return this.executorHeartbeat(await parseJson(request));
+      case "GET query_ownership":
+        return this.queryOwnership(new URL(request.url).searchParams);
       case "POST report_result":
         return this.reportResult(await parseJson(request));
       case "POST contract_proposal":
@@ -253,13 +260,89 @@ export class ProjectDurableObject {
       const replay = responseForIdempotency(state, key, request);
       if (replay) return replay;
       const lease = state.leases[request.task_id];
-      if (!lease || lease.attempt_id !== request.attempt_id || lease.executor_id !== request.executor_id || lease.lease_epoch !== request.lease_epoch) {
+      if (!lease || lease.attempt_id !== request.attempt_id || lease.lease_epoch !== request.lease_epoch) {
         throw new ApiError(409, "LEASE_EPOCH_STALE", "续约不匹配当前租约");
       }
       if (leaseExpired(lease)) throw new ApiError(409, "LEASE_EXPIRED", "租约已过期，不能续约");
+      if (lease.executor_id !== request.executor_id) {
+        throw new ApiError(409, "NOT_LEASE_HOLDER", "执行器不是当前租约持有者");
+      }
       lease.expires_at = new Date(Date.now() + 180_000).toISOString();
       saveIdempotent(state, key, request, lease, 200);
       return jsonResponse(lease);
+    });
+  }
+
+  private async executorHeartbeat(input: unknown): Promise<Response> {
+    const parsed = ExecutorHeartbeatRequestSchema.safeParse(input);
+    if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "执行器心跳无效", parsed.error.issues);
+    const heartbeat = parsed.data as ExecutorHeartbeatRequest;
+    return this.withTransaction(async (_storage, state) => {
+      const key = requireIdempotencyScope(heartbeat, "executor_heartbeat");
+      const replay = responseForIdempotency(state, key, heartbeat);
+      if (replay) return replay;
+      if (!state.executors[heartbeat.executor_id]) {
+        throw new ApiError(403, "EXECUTOR_NOT_REGISTERED", "执行器尚未注册");
+      }
+      if (heartbeat.task_id && heartbeat.attempt_id && heartbeat.lease_epoch !== null) {
+        const lease = state.leases[heartbeat.task_id];
+        if (!lease || lease.attempt_id !== heartbeat.attempt_id || lease.lease_epoch !== heartbeat.lease_epoch) {
+          throw new ApiError(409, "LEASE_EPOCH_STALE", "心跳不匹配当前租约");
+        }
+        if (leaseExpired(lease)) throw new ApiError(409, "LEASE_EXPIRED", "心跳对应租约已过期");
+        if (lease.executor_id !== heartbeat.executor_id) {
+          throw new ApiError(409, "NOT_LEASE_HOLDER", "执行器不是当前租约持有者");
+        }
+      }
+      const receivedAt = new Date().toISOString();
+      state.heartbeats[heartbeat.executor_id] = { ...heartbeat, received_at: receivedAt };
+      const body = { accepted: true, executor_id: heartbeat.executor_id, received_at: receivedAt };
+      saveIdempotent(state, key, heartbeat, body, 200);
+      return jsonResponse(body);
+    });
+  }
+
+  private async queryOwnership(searchParams: URLSearchParams): Promise<Response> {
+    const parsed = OwnershipQuerySchema.safeParse(Object.fromEntries(searchParams.entries()));
+    if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "租约归属查询无效", parsed.error.issues);
+    const query = parsed.data;
+    return this.withTransaction(async (_storage, state) => {
+      findTask(state, query.task_id);
+      const current = state.leases[query.task_id];
+      if (current && leaseExpired(current)) {
+        reapExpiredLeases(state);
+        return jsonResponse({
+          ownership: "reassigned",
+          reason: "lease_expired",
+          task_id: query.task_id,
+          to_executor: null,
+          attempt_id: null,
+          lease_epoch: null,
+        });
+      }
+      if (
+        current &&
+        current.attempt_id === query.attempt_id &&
+        current.executor_id === query.executor_id &&
+        current.lease_epoch === query.lease_epoch
+      ) {
+        return jsonResponse({
+          ownership: "still_mine",
+          task_id: current.task_id,
+          attempt_id: current.attempt_id,
+          executor_id: current.executor_id,
+          lease_epoch: current.lease_epoch,
+          expires_at: current.expires_at,
+        });
+      }
+      return jsonResponse({
+        ownership: "reassigned",
+        reason: current ? "lease_reassigned" : "no_active_lease",
+        task_id: query.task_id,
+        to_executor: current?.executor_id ?? null,
+        attempt_id: current?.attempt_id ?? null,
+        lease_epoch: current?.lease_epoch ?? null,
+      });
     });
   }
 
@@ -273,10 +356,13 @@ export class ProjectDurableObject {
       if (replay) return replay;
       const lease = state.leases[report.task_id];
       const task = findTask(state, report.task_id);
-      if (!lease || lease.attempt_id !== report.attempt_id || lease.executor_id !== report.executor_id || lease.lease_epoch !== report.lease_epoch) {
+      if (!lease || lease.attempt_id !== report.attempt_id || lease.lease_epoch !== report.lease_epoch) {
         throw new ApiError(409, "LEASE_EPOCH_STALE", "结果报告不匹配当前租约");
       }
       if (leaseExpired(lease)) throw new ApiError(409, "LEASE_EXPIRED", "租约已过期，不能提交结果");
+      if (lease.executor_id !== report.executor_id) {
+        throw new ApiError(409, "NOT_LEASE_HOLDER", "执行器不是当前租约持有者");
+      }
       assertBindingMatches(lease, report);
       // 结果报告由持有租约的执行器提交，因此报告本身可以确认已开工。
       // 协议要求 leased → running 只能由当前租约持有者推进；这里完成这一步，
@@ -352,6 +438,7 @@ export class ProjectDurableObject {
       protocol: PROTOCOL_META,
       graph: state.graph,
       executors: Object.values(state.executors).map(({ executor_id, host_label, agent_kind, capabilities }) => ({ executor_id, host_label, agent_kind, capabilities })),
+      heartbeats: state.heartbeats,
       leases: state.leases,
       batches: state.batches,
       event_count: state.events.length,

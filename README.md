@@ -54,7 +54,7 @@ npm ci
 ```bash
 npm run typecheck          # TypeScript 全量类型检查
 npm run validate:protocol  # 协议元数据自检 + 样例正反向校验
-npm test                   # 单元、协议、状态机、图分析、协调器、整合、适配器测试（当前 79 个）
+npm test                   # 单元、协议、状态机、图分析、协调器、整合、适配器测试（当前 81 个）
 npm run check              # 以上三项串联，提交前必须全绿
 ```
 
@@ -175,3 +175,4 @@ draft → planning → ready → leased → running → validating
 - `docs/protocol-changes.md` — 协议变更提案流程
 - `docs/version-matrix.md` — 工具版本矩阵
 - `docs/project-info.md` — 项目基本信息表
+- `docs/B-to-A-interface-answers-v1.md` — B 端常驻执行器 HTTP 接口的 A 端正式答复

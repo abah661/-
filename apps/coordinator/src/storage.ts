@@ -6,6 +6,7 @@ import type {
   ResultReport,
   TaskGraph,
 } from "@dac/protocol";
+import type { ExecutorHeartbeatRequest } from "./api.js";
 
 export interface StorageTransactionLike {
   get<T>(key: string): Promise<T | undefined>;
@@ -26,6 +27,7 @@ export interface ProjectState {
   project_id: string;
   graph: TaskGraph | null;
   executors: Record<string, ExecutorRegistration>;
+  heartbeats: Record<string, ExecutorHeartbeatRequest & { received_at: string }>;
   leases: Record<string, Lease>;
   reports: Record<string, ResultReport>;
   batches: Record<string, IntegrationBatch>;
@@ -38,6 +40,7 @@ export function emptyProjectState(projectId: string): ProjectState {
     project_id: projectId,
     graph: null,
     executors: {},
+    heartbeats: {},
     leases: {},
     reports: {},
     batches: {},
@@ -53,6 +56,7 @@ export async function loadProjectState(storage: StorageTransactionLike, projectI
     ...emptyProjectState(projectId),
     ...state,
     executors: state.executors ?? {},
+    heartbeats: state.heartbeats ?? {},
     leases: state.leases ?? {},
     reports: state.reports ?? {},
     batches: state.batches ?? {},

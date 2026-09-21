@@ -1,0 +1,26 @@
+# 统一换行与文本处理，避免两台 Windows 机器之间出现无意义的整文件 diff。
+# 第 4.1 节要求双方使用同一主版本工具链；换行一致是其中一部分。
+
+* text=auto eol=lf
+
+# 明确按文本处理
+*.ts    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Windows 上需要 CRLF 的脚本
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# 二进制文件不做换行转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.zip   binary
+
+# 锁文件在 diff 中折叠，减少噪音
+package-lock.json -diff

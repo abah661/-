@@ -12,10 +12,10 @@
 | 操作 | 授权要求 | 当前状态 |
 | --- | --- | --- |
 | 只读检查、文档、允许目录中的代码与测试 | 按项目规则执行 | ✅ 无需额外批准 |
-| 任务分支 push | 明确仓库、分支前缀、有效期 | ⬜ 未授权 |
+| 任务分支 push | 明确仓库、分支前缀、有效期 | ✅ 已授权并已执行 |
 | CI/CD 配置 | 审核具体文件和权限后批准 | ✅ 已授权测试 CI：`.github/workflows/ci.yml`，只读仓库权限 |
-| Worker 部署 | 明确账号、环境、资源后批准 | 🟡 已授权测试 Worker `dual-agent-coordinator-test`，待 Cloudflare 登录 |
-| 凭据创建 | 明确账号、环境、资源后批准 | 🟡 已授权测试环境密钥注入，不记录凭据；待登录 |
+| Worker 部署 | 明确账号、环境、资源后批准 | 🟡 已授权测试 Worker `dual-agent-coordinator-test`；登录成功，部署被 Cloudflare `10034` 阻塞 |
+| 凭据创建 | 明确账号、环境、资源后批准 | ✅ Wrangler OAuth 已完成；仅由系统凭据管理器保存，不记录凭据内容 |
 | 初始数据库 schema | 明确账号、环境、资源后批准 | ✅ 已授权 Durable Object SQLite migration `v1` |
 | 自动合并 | 单独明确目标分支、门槛、范围 | ⬜ 未授权 |
 | 系统安装 / 自启 | 按准确对象另行批准 | ⬜ 未授权（Syncthing 待批） |
@@ -74,8 +74,8 @@
 4. **A 端本地项目路径** — 已填写，见 `docs/project-info.md`。
 5. **预算阈值双签** — `docs/budget-and-limits.md` 由 B 端拟定，
    需双方认可后生效。
-6. **Cloudflare 账号与项目** — 测试 Worker 名称已固定为
-   `dual-agent-coordinator-test`，但实际 Cloudflare 账号尚未登录；部署前需由 A 端在本机完成登录。
+6. **Cloudflare 账号邮箱验证状态** — Wrangler OAuth 登录已完成，测试 Worker 名称为
+   `dual-agent-coordinator-test`；Cloudflare API 仍返回邮箱未验证错误 `10034`，因此部署尚未成功。
 
 ---
 

@@ -19,7 +19,7 @@
 | P1 | 协议 v1 冻结、协议校验、依赖环检测、模拟双机测试 | 🟡 协议已定义，待双方核对后冻结 |
 | P2 | 双方开发组件（Worker/DO、执行器内核、双适配器） | 🟡 A 端 Worker/DO/CLI/Codex 适配器已完成第一版，B 端执行器待其分支 |
 | P3 | 离线与本地集成 | 🟡 A 端固定整合/独立验收第一版已完成，真实双机待 B 端 |
-| P4 | 接通 Cloudflare 与 GitHub | ⬜ 未开始 |
+| P4 | 接通 Cloudflare 与 GitHub | 🟡 GitHub 推送与 CI 已接通；Cloudflare 登录和本地打包通过，云端部署被账号邮箱验证状态 `10034` 阻塞 |
 | P5 | 验收自动并行与返修 | ⬜ 未开始 |
 | P6 | 可选同步与正式使用 | ⬜ 未开始 |
 
@@ -162,9 +162,9 @@ draft → planning → ready → leased → running → validating
 1. B 端核对 Windows / OpenCode 可实现性，并提供成功、失败、恢复样例
 2. 按协议变更流程核实冻结记录；在远端元数据真正为 `frozen` 前，不宣称协议已冻结
 3. 等 B 端执行器和真实 agent 样例到位后，补真实双机与两种适配器验证
-4. 获得明确授权后，才进入 CI、Cloudflare、凭据、数据库或部署工作
+4. Cloudflare 账号后台解除邮箱验证状态 `10034` 后，重试测试 Worker 部署
 
-本次 A 端实现与实际验证记录见 `docs/reports/P2-A-coordinator.md`、`docs/reports/P2-A-codex-adapter.md` 和 `docs/reports/P3-A-local-integration.md`。
+本次 A 端实现与实际验证记录见 `docs/reports/P2-A-coordinator.md`、`docs/reports/P2-A-codex-adapter.md`、`docs/reports/P3-A-local-integration.md` 和 `docs/reports/P4-A-cloud-ci.md`。
 
 ---
 

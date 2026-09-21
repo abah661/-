@@ -57,9 +57,9 @@
 | --- | --- |
 | remote origin | ✅ 已设置 `https://github.com/abah661/-.git` |
 | 远程仓库是否为空 | ❌ 否（A 端任务分支已推送） |
-| 仓库级代理 | ✅ `http://127.0.0.1:7897` |
+| 仓库级代理 | ⬜ 当前未配置；本机 `127.0.0.1:7897` 未监听 |
 | 读取（fetch/ls-remote） | ✅ 可用 |
-| 推送（push） | ✅ A 端任务分支已推送，远端 SHA 已核对 |
+| 推送（push） | ✅ A 端任务分支已推送，远端 SHA `67e72dafef9b1777eef3f3037191351fb3c2efa3` 已核对 |
 
 **推送说明**：A 端任务分支已完成一次认证并推送。凭据不得经我传递或记录。
 后续新分支推送仍由 A 端本机认证完成：
@@ -92,7 +92,7 @@ git push -u origin main
    验收后再注册真实业务仓库。**协调系统仓库已确定，但目标仓库需另建。**
 2. **A 端本地项目路径** — B 端无法代为确定。
 3. **Syncthing 安装授权** — 目录与规则已就绪，但安装需你批准（第 10.2 节步骤 1）。
-4. **Cloudflare 账号与项目** — 测试 Worker 配置已准备，但部署前需要 A 端在本机登录 Cloudflare。
+4. **Cloudflare 账号状态** — Wrangler 登录与测试 Worker 配置已完成；部署被 Cloudflare 邮箱验证错误 `10034` 阻塞。
 5. **数据库外部资源** — 当前不另建 D1；测试环境使用 Worker Durable Object SQLite 初始 migration `v1`。
 
 ---

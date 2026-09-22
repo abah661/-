@@ -31,7 +31,7 @@
 | --- | --- |
 | 协调系统仓库 | `https://github.com/abah661/-.git` |
 | 当前权威分支 | `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` |
-| B4 起始基线 | `d493bd263febefcc4faca21da617520ce03fefa8` |
+| B4 最低代码基线 | `d493bd263febefcc4faca21da617520ce03fefa8`（必须是当前 HEAD 的祖先） |
 | B4 工作分支 | `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4` |
 | 测试 Worker | `https://dual-agent-coordinator-test.dual-agent-coordinator.workers.dev` |
 | B 执行器身份 | `EXE-B-OPENCODE` |
@@ -85,22 +85,19 @@ opencode --version
 git clone --branch task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1 --single-branch https://github.com/abah661/-.git dual-agent-coordinator-b
 Set-Location dual-agent-coordinator-b
 git rev-parse HEAD
+git merge-base --is-ancestor d493bd263febefcc4faca21da617520ce03fefa8 HEAD
 ```
 
-`git rev-parse HEAD` 必须精确得到：
-
-```text
-d493bd263febefcc4faca21da617520ce03fefa8
-```
-
-若不是该值，停止写代码并报告实际 SHA，不要自行选择“差不多”的版本。
+`git merge-base --is-ancestor` 必须返回退出码 `0`，表示当前交接分支包含已经通过
+P4 验收的代码基线。`HEAD` 允许包含该基线之后的文档提交，因此不要求与上述 SHA
+逐字相同。若退出码不是 `0`，停止写代码并报告实际 SHA，不要自行选择“差不多”的版本。
 
 然后执行：
 
 ```powershell
 Get-Content -Raw AGENTS.md
 git status --short
-git switch -c task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4 d493bd263febefcc4faca21da617520ce03fefa8
+git switch -c task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4
 npm ci
 npm run check
 ```
@@ -272,4 +269,3 @@ P3 只有在两台真实电脑都留下服务端状态和本地日志证据后�
 - OpenCode 实际模型标识和配额是否可用。
 
 不得索取或记录用户的 GitHub、Cloudflare、邮箱或模型服务登录密码。
-

@@ -13,7 +13,10 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { isInside } from "../../apps/executor/src/core/worktree.js";
+import {
+  isInside,
+  parseWorktreeListPorcelainZ,
+} from "../../apps/executor/src/core/worktree.js";
 import { isInsideRoot } from "../../apps/executor/src/core/materials.js";
 import { isSensitivePath, redact } from "../../apps/executor/src/core/context.js";
 
@@ -112,6 +115,24 @@ describe("MAX_PATH（260）长度边界", () => {
 });
 
 describe("中文路径边界（本机实际场景）", () => {
+  it("NUL 格式 worktree 列表保留中文和空格，不受 quotePath 影响", () => {
+    const output = [
+      "worktree C:/仓库/双端 连接 测试仓库",
+      `HEAD ${"1".repeat(40)}`,
+      "branch refs/heads/main",
+      "",
+      "worktree C:/仓库/.local/worktrees/中文 尝试",
+      `HEAD ${"2".repeat(40)}`,
+      "branch refs/heads/task/TASK-0001/TASK-0001-A1",
+      "",
+    ].join("\0");
+
+    expect(parseWorktreeListPorcelainZ(output)).toEqual([
+      "C:/仓库/双端 连接 测试仓库",
+      "C:/仓库/.local/worktrees/中文 尝试",
+    ]);
+  });
+
   it("含中文的父与子可正确判定", () => {
     expect(isInside("C:\\双端连接", "C:\\双端连接\\apps\\executor")).toBe(true);
   });

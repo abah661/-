@@ -20,7 +20,7 @@ P3 的真实双机联调尚未完成。
 | P1 | 协议 v1 冻结、协议校验、依赖环检测、模拟双机测试 | ✅ **协议 v1 已冻结** |
 | P2 | 双方开发组件（Worker/DO、执行器内核、双适配器） | ✅ A/B 第一版均已实现并在本分支合流 |
 | P3 | 离线与本地集成 | 🟡 双方本地证据已具备，真实双机联调待执行 |
-| P4 | 接通 Cloudflare 与 GitHub | 🟡 GitHub 推送与 CI 已接通；Cloudflare 部署被账号邮箱状态 `10034` 阻塞 |
+| P4 | 接通 Cloudflare 与 GitHub | ✅ 双平台 CI、测试 Worker、Durable Object 与认证闭环均已通过 |
 | P5 | 验收自动并行与返修 | ⬜ 未开始 |
 | P6 | 可选同步与正式使用 | 🟡 Syncthing 已装，待配对 |
 
@@ -61,7 +61,7 @@ npm ci
 ```bash
 npm run typecheck          # TypeScript 全量类型检查
 npm run validate:protocol  # 协议元数据自检 + 样例正反向校验
-npm test                   # 协议、冻结守卫、协调器、执行器、整合与适配器测试（358 passed，1 skipped）
+npm test                   # 协议、冻结守卫、协调器、执行器、整合与适配器测试（359 passed，1 skipped）
 npm run check              # 以上三项串联，提交前必须全绿
 ```
 

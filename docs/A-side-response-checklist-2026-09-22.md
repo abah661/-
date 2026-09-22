@@ -60,4 +60,13 @@ A 原有短路径继续作为兼容别名。B 使用 `encodeURIComponent(project
 - B2 合流后的 Windows 专项复验为 40 passed、1 skipped；完整本地检查为 18 个测试文件、359 passed、1 skipped，二者退出码均为 `0`。
 - 第三次 CI `35691574191` 的 Linux 任务成功；Windows 任务证明 NUL 解析有效，但 GitHub runner 的 8.3 短路径与 Git 返回的长路径仍被字符串比较误判，因此整体仍失败。
 - B3 分支提交 `1256fed` 对均已存在的路径使用 Windows 文件系统真实路径规范化后严格比较；未删除断言、未放宽为仅检查目录存在、未修改生产 `isInside()` 语义。
-- B3 合流后的完整本地检查为 18 个测试文件、359 passed、1 skipped，退出码 `0`；远端双平台 CI 仍需推送后复验，未完成前不写成成功。
+- B3 合流后的完整本地检查为 18 个测试文件、359 passed、1 skipped，退出码 `0`；CI `35697451409` 的 Linux 与 Windows 均为 `success`。
+
+## 7. Cloudflare 测试环境
+
+- Worker `dual-agent-coordinator-test` 已部署，URL 为 `https://dual-agent-coordinator-test.dual-agent-coordinator.workers.dev`。
+- Durable Object `PROJECTS` 与 SQLite migration `v1` 已生效。
+- 两个认证 Secret 已注入；Token 不进入仓库、日志或文档，本地副本由 Windows DPAPI 加密。
+- 首次真实闭环发现 Durable Object 构造参数错误，提交 `a0d80d9` 修复后，CI `35701070953` 的 Linux 与 Windows 均为 `success`。
+- 重新部署版本 `f318a0e7-72fc-45c4-a2db-7cbcb143da20` 后，注册 A/B、提交任务图、领取、续租、心跳、归属查询、结果回报和最终状态查询全部成功。
+- P4 已完成；P3 的真实双机联调和 P5 的自动返修/故障验收仍未完成。

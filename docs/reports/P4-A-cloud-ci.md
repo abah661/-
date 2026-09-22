@@ -1,51 +1,79 @@
 # P4 A 端：GitHub CI 与 Cloudflare 测试环境记录
 
-记录日期：2026-09-21
+记录日期：2026-09-22
 
 ## 结论
 
-- GitHub 任务分支推送成功，远端 SHA 与本地一致。
-- GitHub Actions `CI` 已由该次推送触发并成功完成。
-- Cloudflare Wrangler OAuth 登录成功；Worker 本地打包与 Durable Object 绑定检查通过。
-- Cloudflare 测试 Worker **尚未部署成功**：Cloudflare API 返回邮箱未验证错误 `10034`。
+- GitHub A 任务分支推送成功，远端 SHA 与本地一致。
+- GitHub Actions 已在 Linux 与 Windows 双平台成功完成。
+- Cloudflare 测试 Worker、Durable Object SQLite v1 和认证 Secrets 已部署。
+- 真实云端闭环已通过：注册、任务图、领取、续租、心跳、归属、回报和状态查询均返回预期结果。
+- P4 已完成；这不等同于 P3 的真实双机联调或 P5 的自动返修验收完成。
 
 ## GitHub 实际证据
 
 | 项目 | 结果 |
 | --- | --- |
 | 分支 | `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` |
-| 本地与远端 SHA | `67e72dafef9b1777eef3f3037191351fb3c2efa3` |
-| CI 运行 | `35580811850` |
-| CI 结论 | `success` |
-| CI 地址 | `https://github.com/abah661/-/actions/runs/35580811850` |
+| 修复提交 | `a0d80d9d4aecbe07db8da20578d3b01f9cd7f984` |
+| CI 运行 | `35701070953` |
+| Linux | `success` |
+| Windows | `success` |
+| CI 地址 | `https://github.com/abah661/-/actions/runs/35701070953` |
 
 ## 本地验收证据
 
 `npm run check` 实际通过：
 
 - TypeScript 全量类型检查通过；
-- 5 个协议样例正反向校验通过；
-- 7 个测试文件、79 项测试全部通过。
+- 协议元数据与 5 个正反向样例通过；
+- 18 个测试文件，359 passed、1 skipped；
+- skipped 项是需要显式启用并消耗真实模型额度的 OpenCode 调用。
 
-`npx wrangler deploy --dry-run --config apps/coordinator/wrangler.toml` 退出码为 `0`，实际识别：
+## Cloudflare 部署证据
 
-- Worker 上传包：511.40 KiB，gzip 79.65 KiB；
-- `env.PROJECTS` → `ProjectDurableObject` Durable Object 绑定。
+| 项目 | 结果 |
+| --- | --- |
+| Worker | `dual-agent-coordinator-test` |
+| URL | `https://dual-agent-coordinator-test.dual-agent-coordinator.workers.dev` |
+| Version ID | `f318a0e7-72fc-45c4-a2db-7cbcb143da20` |
+| Durable Object | `PROJECTS` → `ProjectDurableObject` |
+| 数据格式 | SQLite migration `v1` |
+| 健康端点 | `/health`、`/v1/health` 均返回 `200` |
+| 未认证业务请求 | 返回 `401 AUTH_REQUIRED` |
 
-Wrangler 写调试日志时因沙箱权限出现 `EPERM`，但不影响 dry-run 打包结果。
+Cloudflare Secrets 已设置：
 
-## Cloudflare 云端状态
+- `COORDINATOR_API_TOKEN`；
+- `COORDINATOR_EXECUTOR_TOKENS_JSON`。
 
-执行 `npx wrangler deploy --config apps/coordinator/wrangler.toml` 时，上传包和绑定解析完成，随后 Cloudflare API 拒绝创建/更新 Worker：
+Token 未写入仓库、日志或文档。本地副本位于被 Git 忽略的
+`.local/cloudflare-test-credentials.xml`，由 Windows DPAPI 加密并限制为当前用户访问。
 
-```text
-You need to verify your email address to use Workers. [code: 10034]
-```
+## 真实云端闭环
 
-重新完成 Wrangler OAuth 后再次部署，结果仍为 `10034`。因此当前状态是外部账号阻塞，不是代码或配置验收成功；不得记录为已部署。
+测试项目：`SMOKE-20260922154833`。
+
+| 步骤 | HTTP / 结果 |
+| --- | --- |
+| 注册 A/Codex | `200` |
+| 注册 B/OpenCode | `200` |
+| 提交任务图 | `201` |
+| B 领取任务 | `200`，`TASK-9001-A1`，epoch `1` |
+| B 续租 | `200` |
+| B 心跳 | `200` |
+| 查询归属 | `200 still_mine` |
+| B 回报结果 | `200 accepted=true` |
+| 查询最终状态 | `200`，2 个执行器，任务为 `ready_for_integration` |
+
+首次认证闭环暴露了真实云端缺陷：Durable Object 构造函数错误地把第二参数 Env
+当成项目 ID，尝试将 `DurableObjectNamespace` 写入 storage，返回 `500`。提交
+`a0d80d9` 改为从 `state.id.name` 读取 `idFromName(project_id)` 的名称，并把单元测试
+改成真实 `(DurableObjectState, Env)` 构造方式。该修复通过本地全量测试、双平台 CI
+和重新部署后的真实闭环。
 
 ## 下一步
 
-1. 在 Cloudflare 账号后台确认邮箱状态真正显示为已验证，必要时由 Cloudflare 支持处理账号状态。
-2. 错误解除后重新执行测试 Worker 部署，并记录实际 Worker URL。
-3. B 端执行器交付后，继续 P3/P5 的真实双机组合验收；A 端不修改 `apps/executor/**`。
+1. 在另一台真实电脑安全配置 B 执行器 Token，完成 P3 双机联调。
+2. 执行断网、过期租约、旧 epoch 和自动返修的 P5 云端故障验收。
+3. 继续保持测试与生产资源、Token 和部署授权相互隔离。

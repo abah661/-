@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { ProjectDurableObject } from "../../apps/coordinator/src/project-do.js";
 import { createCoordinatorWorker, type CoordinatorEnv } from "../../apps/coordinator/src/worker.js";
-import type { DurableObjectStorageLike, StorageTransactionLike } from "../../apps/coordinator/src/storage.js";
+import type {
+  DurableObjectStateLike,
+  DurableObjectStorageLike,
+  StorageTransactionLike,
+} from "../../apps/coordinator/src/storage.js";
 
 class MemoryStorage implements DurableObjectStorageLike {
   private values = new Map<string, unknown>();
@@ -74,8 +78,20 @@ const registration = {
   registered_at: "2026-09-21T00:00:00.000Z",
 };
 
+function makeState(storage: DurableObjectStorageLike, projectId = "PROJECT-TEST"): DurableObjectStateLike {
+  return {
+    id: {
+      name: projectId,
+      toString: () => projectId,
+    },
+    storage,
+  };
+}
+
 function makeDo() {
-  return new ProjectDurableObject({ storage: new MemoryStorage() }, "PROJECT-TEST");
+  return new ProjectDurableObject(makeState(new MemoryStorage()), {
+    PROJECTS: { idFromName: () => ({}) },
+  });
 }
 
 async function json(response: Response): Promise<any> {
@@ -312,7 +328,7 @@ describe("Worker route", () => {
     const worker = createCoordinatorWorker();
     const storage = new MemoryStorage();
     const stub = {
-      fetch: (request: Request) => new ProjectDurableObject({ storage }, "PROJECT-TEST").fetch(request),
+      fetch: (request: Request) => new ProjectDurableObject(makeState(storage), env).fetch(request),
     };
     const env: CoordinatorEnv = {
       COORDINATOR_API_TOKEN: "test-token",
@@ -341,7 +357,7 @@ describe("Worker route", () => {
       COORDINATOR_EXECUTOR_TOKENS_JSON: JSON.stringify({ "EXE-A-TEST": "executor-token" }),
       PROJECTS: {
         idFromName: () => ({}),
-        get: () => ({ fetch: (request: Request) => new ProjectDurableObject({ storage }, "PROJECT-TEST").fetch(request) }),
+        get: () => ({ fetch: (request: Request) => new ProjectDurableObject(makeState(storage), env).fetch(request) }),
       },
     };
     const response = await worker.fetch(new Request("https://api/v1/projects/PROJECT-TEST/executors/register", {

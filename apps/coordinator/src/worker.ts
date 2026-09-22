@@ -1,7 +1,6 @@
 import { errorResponse, jsonResponse } from "./api.js";
 import { ProjectDurableObject } from "./project-do.js";
-
-export interface DurableObjectIdLike {}
+import type { DurableObjectIdLike } from "./storage.js";
 
 export interface DurableObjectStubLike {
   fetch(request: Request): Promise<Response>;

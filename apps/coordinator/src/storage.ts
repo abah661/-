@@ -18,7 +18,14 @@ export interface DurableObjectStorageLike extends StorageTransactionLike {
   transaction<T>(callback: (transaction: StorageTransactionLike) => Promise<T>): Promise<T>;
 }
 
+export interface DurableObjectIdLike {
+  /** `idFromName(project_id)` 创建的实例会保留原始名称。 */
+  readonly name?: string;
+  toString(): string;
+}
+
 export interface DurableObjectStateLike {
+  readonly id: DurableObjectIdLike;
   storage: DurableObjectStorageLike;
   blockConcurrencyWhile?<T>(callback: () => Promise<T>): Promise<T>;
 }

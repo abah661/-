@@ -118,7 +118,20 @@ function leaseExpired(lease: Lease): boolean {
 }
 
 export class ProjectDurableObject {
-  constructor(private readonly state: DurableObjectStateLike, private readonly projectId: string) {}
+  private readonly projectId: string;
+
+  /**
+   * Cloudflare 以 `(DurableObjectState, Env)` 构造实例。项目 ID 来自 Worker 的
+   * `idFromName(project_id)`，因此必须读取 `state.id.name`，不能把第二参数 Env
+   * 误当成项目 ID；Env 含 DurableObjectNamespace，无法写入 DO storage。
+   */
+  constructor(private readonly state: DurableObjectStateLike, _env: unknown) {
+    const projectId = state.id.name;
+    if (!projectId) {
+      throw new Error("ProjectDurableObject 必须由 PROJECTS.idFromName(project_id) 创建");
+    }
+    this.projectId = projectId;
+  }
 
   async fetch(request: Request): Promise<Response> {
     try {

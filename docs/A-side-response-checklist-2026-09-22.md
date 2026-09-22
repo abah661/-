@@ -55,5 +55,7 @@ A 原有短路径继续作为兼容别名。B 使用 `encodeURIComponent(project
 - 根 `tsconfig.json` 已引用 `apps/executor`，executor 已进入 `tsc -b`。
 - 首次合流 CI `35684998820` 已执行但失败，真实原因有两个：浅克隆缺少冻结提交；Windows 路径断言在 Linux 上按 POSIX 语义执行。
 - 修复方式：checkout 使用 `fetch-depth: 0`；Windows 路径断言只在 Windows 执行；CI 新增 `windows-latest`，不修改 B 的执行器内核。
-- 修复后的本机 Windows 完整结果为 18 个测试文件、358 passed、1 skipped，退出码 `0`；其中 Windows 专项复验为 39 passed、1 skipped。
-- 修复提交的远端 CI 仍需推送后复验，未完成前不写成成功。
+- 第二次 CI `35689026986` 的 Linux 任务成功；Windows 任务发现 `listWorktrees()` 在默认 `core.quotePath=true` 时不能处理中文路径，因此整体仍失败。
+- B2 分支提交 `c05b4ff` 改用 `git worktree list --porcelain -z` 并按 NUL 解析；A 已审查范围并合并，不依赖或修改用户全局 Git 配置。
+- B2 合流后的 Windows 专项复验为 40 passed、1 skipped；完整本地检查为 18 个测试文件、359 passed、1 skipped，二者退出码均为 `0`。
+- B2 合流提交的远端双平台 CI 仍需推送后复验，未完成前不写成成功。

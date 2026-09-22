@@ -195,12 +195,23 @@ export function removeWorktree(repo_root: string, path: string, force = false): 
   return git(repo_root, args).exit_code === 0;
 }
 
+/**
+ * 解析 `git worktree list --porcelain -z`。
+ *
+ * `-z` 让 Git 用 NUL 分隔字段，并关闭路径的 C 风格引用；因此中文、空格等路径
+ * 不会受 `core.quotePath` 或调用方全局 Git 配置影响。
+ */
+export function parseWorktreeListPorcelainZ(output: string): readonly string[] {
+  const prefix = "worktree ";
+  return output
+    .split("\0")
+    .filter((field) => field.startsWith(prefix))
+    .map((field) => field.slice(prefix.length));
+}
+
 /** 列出当前仓库登记的所有 worktree 路径。 */
 export function listWorktrees(repo_root: string): readonly string[] {
-  const result = git(repo_root, ["worktree", "list", "--porcelain"]);
+  const result = git(repo_root, ["worktree", "list", "--porcelain", "-z"]);
   if (result.exit_code !== 0) return [];
-  return result.stdout
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("worktree "))
-    .map((line) => line.slice("worktree ".length).trim());
+  return parseWorktreeListPorcelainZ(result.stdout);
 }

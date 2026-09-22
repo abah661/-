@@ -253,6 +253,8 @@ describe("真实 Git worktree（中文与空格路径）", () => {
     must(["config", "user.email", "b@example.invalid"]);
     must(["config", "user.name", "B Test"]);
     must(["config", "commit.gpgsign", "false"]);
+    // 明确开启默认引用行为，确保测试不受运行机器的全局 Git 配置影响。
+    must(["config", "core.quotePath", "true"]);
     writeFileSync(join(repoRoot, "README.md"), "# 测试仓库\n中文内容\n", "utf8");
     must(["add", "-A"]);
     must(["commit", "-q", "-m", "init"]);

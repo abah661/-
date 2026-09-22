@@ -17,7 +17,15 @@
  * 每个用例都自带超时与清理，失败不应留下残留进程或目录。
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -301,9 +309,14 @@ describe("真实 Git worktree（中文与空格路径）", () => {
       expect(content).toContain("中文内容");
       // 新 worktree 是干净的
       expect(inspectWorktree(prepared.path).dirty).toBe(false);
-      // 已登记在 worktree 列表里
-      expect(listWorktrees(repoRoot).some((p) => isInside(worktreeRoot, p) || p === prepared.path))
-        .toBe(true);
+      // 已登记为同一个 worktree。Windows runner 的 tmpdir 可能使用 8.3 短路径，
+      // 而 Git 返回对应长路径；交给文件系统规范化后再严格比较真实位置。
+      const preparedRealPath = realpathSync.native(prepared.path);
+      expect(
+        listWorktrees(repoRoot).some(
+          (registeredPath) => realpathSync.native(registeredPath) === preparedRealPath,
+        ),
+      ).toBe(true);
     } finally {
       expect(removeWorktree(repoRoot, prepared.path, true)).toBe(true);
     }

@@ -31,9 +31,11 @@ Thumbs.db
 desktop.ini
 
 # agent 本地会话与登录文件（第 4.1 节：不得上传云端）
+# 带 / 前缀只匹配仓库根目录，避免误伤 packages/**/auth.json 这类正常文件
 .codex/
 opencode.json
-auth.json
+/auth.json
+/auth.json.*
 
 # Syncthing 共享资料目录（第 10.1 节：位于 Git 仓库之外；
 # 此处兜底防止误放进仓库后被提交）

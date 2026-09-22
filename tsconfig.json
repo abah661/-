@@ -4,8 +4,9 @@
     { "path": "./packages/protocol" },
     { "path": "./packages/integration" },
     { "path": "./packages/codex-adapter" },
-    { "path": "./tools/validate-protocol" },
     { "path": "./apps/coordinator" },
+    { "path": "./apps/executor" },
+    { "path": "./tools/validate-protocol" },
     { "path": "./tools/cli" }
   ]
 }

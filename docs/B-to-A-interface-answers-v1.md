@@ -2,7 +2,7 @@
 
 日期：2026-09-21  
 适用范围：B 端常驻执行器 HTTP 客户端  
-状态：A 端参考实现与测试已完成；`CP-0001` 待 B 端确认，尚未视为双方冻结
+状态：A/B 已确认 `CP-0001`；两端实现已合流，协议包版本落地仍待完成
 
 ## 基线说明
 
@@ -13,10 +13,9 @@ git rev-parse a577d6688b323afbdbc647b3a1288c0316f7fb1e:packages/protocol
 f9644c44628d5fe8445bcbbb54ad336d7fbe0abc
 ```
 
-该值与 B 端交接文档一致。冻结记录提交 `00a1acf` 和 B 端实现提交 `5bc8048`
-当前尚未进入 A 端对象库，GitHub 连接恢复后仍需拉取并核对。本文涉及新增 heartbeat、
-ownership 与执行器身份映射，已登记为 `docs/proposals/CP-0001-executor-http-transport.md`；
-在 B 端确认前只作为 A 端参考实现，不修改 `packages/protocol/**`，也不宣称双方已冻结。
+该值与 B 端交接文档一致。A 端已获取并合并冻结记录提交 `00a1acf`、B 端实现提交
+`5bc8048` 及 `origin/main@ae659a9`。heartbeat、ownership 与执行器身份映射已登记在
+`docs/proposals/CP-0001-executor-http-transport.md`，A/B 双方均已确认。
 
 ## 统一规则
 

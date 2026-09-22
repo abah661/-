@@ -5,9 +5,10 @@
 > 用户提交需求后，系统自动规划任务、确定接口契约、分配给两台电脑上的 agent、
 > 收集提交、测试组合结果，并在失败后自动派发返修任务。
 
-**当前状态：P0/P1 基线已完成；P2 A 端组件（含 Codex 适配器）与 P3 A 端离线集成第一版已实现。** 协议仓库当前远端元数据仍为
-`draft`，不能把项目书附件中声称的冻结记录当作远端已生效的事实；本分支不修改协议定义。
-协调器（Worker + Durable Object）和管理 CLI 已完成本地离线实现，B 端执行器与适配器不在本分支范围内。
+**当前状态：P0/P1 已完成；协议 v1 已冻结并通过完整性守卫；P2 两端组件已完成第一版。**
+A 端已实现协调器、Codex 适配器、管理 CLI、固定提交整合与独立验收；B 端已实现
+Windows 执行器内核、OpenCode 适配器、HTTP 传输、资料校验和真实本机集成测试。
+P3 的真实双机联调尚未完成。
 
 ---
 
@@ -16,12 +17,18 @@
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | P0 | 项目初始化、仓库规则、目录结构、可运行基线 | ✅ 已完成 |
-| P1 | 协议 v1 冻结、协议校验、依赖环检测、模拟双机测试 | 🟡 协议已定义，待双方核对后冻结 |
-| P2 | 双方开发组件（Worker/DO、执行器内核、双适配器） | 🟡 A 端 Worker/DO/CLI/Codex 适配器已完成第一版，B 端执行器待其分支 |
-| P3 | 离线与本地集成 | 🟡 A 端固定整合/独立验收第一版已完成，真实双机待 B 端 |
-| P4 | 接通 Cloudflare 与 GitHub | 🟡 GitHub 推送与 CI 已接通；Cloudflare 登录和本地打包通过，云端部署被账号邮箱验证状态 `10034` 阻塞 |
+| P1 | 协议 v1 冻结、协议校验、依赖环检测、模拟双机测试 | ✅ **协议 v1 已冻结** |
+| P2 | 双方开发组件（Worker/DO、执行器内核、双适配器） | ✅ A/B 第一版均已实现并在本分支合流 |
+| P3 | 离线与本地集成 | 🟡 双方本地证据已具备，真实双机联调待执行 |
+| P4 | 接通 Cloudflare 与 GitHub | 🟡 GitHub 推送与 CI 已接通；Cloudflare 部署被账号邮箱状态 `10034` 阻塞 |
 | P5 | 验收自动并行与返修 | ⬜ 未开始 |
-| P6 | 可选同步与正式使用 | ⬜ 未开始 |
+| P6 | 可选同步与正式使用 | 🟡 Syncthing 已装，待配对 |
+
+> **协议 v1 已冻结**：冻结点提交 `a577d66`，该提交下协议子树哈希
+> `f9644c44628d5fe8445bcbbb54ad336d7fbe0abc`（注意是 **`packages/protocol/` 子树**哈希，
+> 不是仓库根树哈希）。冻结记录落盘于提交 `00a1acf`。
+> 完整性守卫见 `tests/protocol/freeze.test.ts`；A 端实现交接见
+> `docs/protocol-v1-freeze-and-handoff.md`。
 
 ---
 
@@ -54,7 +61,7 @@ npm ci
 ```bash
 npm run typecheck          # TypeScript 全量类型检查
 npm run validate:protocol  # 协议元数据自检 + 样例正反向校验
-npm test                   # 单元、协议、状态机、图分析、协调器、整合、适配器测试（当前 82 个）
+npm test                   # 协议、冻结守卫、协调器、执行器、整合与适配器测试（358 passed，1 skipped）
 npm run check              # 以上三项串联，提交前必须全绿
 ```
 
@@ -80,7 +87,7 @@ packages/protocol/                协议 v1：schema、状态机、错误分类�
 packages/integration/              固定整合计划与独立证据验收          ← A 维护
 packages/codex-adapter/            Codex exec 非交互适配器与错误归类    ← A 维护
 apps/coordinator/                  Worker API 与 Durable Object          ← A 维护
-apps/executor/                     Windows 执行器与两种适配器            ← B 维护（未实现）
+apps/executor/                     Windows 执行器与 OpenCode 适配器       ← B 维护
 tools/cli/                         A 端管理 CLI（离线校验与报告检查）    ← A 维护
 tools/validate-protocol/           协议校验 CLI
 tests/                             单元、协议、故障与端到端测试
@@ -157,22 +164,27 @@ draft → planning → ready → leased → running → validating
 
 ## 下一步
 
-当前 A 端 P3 离线集成第一版已完成，但仍有以下顺序约束：
+P2 两端代码已在本任务分支合流。下一步按以下顺序推进：
 
-1. B 端核对 Windows / OpenCode 可实现性，并提供成功、失败、恢复样例
-2. 按协议变更流程核实冻结记录；在远端元数据真正为 `frozen` 前，不宣称协议已冻结
-3. 等 B 端执行器和真实 agent 样例到位后，补真实双机与两种适配器验证
-4. Cloudflare 账号后台解除邮箱验证状态 `10034` 后，重试测试 Worker 部署
+1. 运行合流后的全量 typecheck、协议校验、测试和 Wrangler dry-run；
+2. 按已确认的 HTTP 契约接通领取、续租、心跳、恢复与结果上报；
+3. Cloudflare 账号后台解除邮箱状态 `10034` 后部署测试 Worker；
+4. 执行真实双机联调和 P5 自动返修验收，不用模拟结果替代。
 
-本次 A 端实现与实际验证记录见 `docs/reports/P2-A-coordinator.md`、`docs/reports/P2-A-codex-adapter.md`、`docs/reports/P3-A-local-integration.md` 和 `docs/reports/P4-A-cloud-ci.md`。
+A 端证据见 `docs/reports/P2-A-coordinator.md`、`docs/reports/P2-A-codex-adapter.md`、
+`docs/reports/P3-A-local-integration.md` 和 `docs/reports/P4-A-cloud-ci.md`；B 端证据见
+`docs/reports/P2-B-executor-core.md` 与 `docs/handoff/B-status-and-pending.md`。
 
 ---
 
 ## 相关文档
 
 - `AGENTS.md` — 工程规范、规则、授权表（**开工前必读**）
+- `docs/protocol-v1-freeze-and-handoff.md` — **协议冻结确认与 A 端实现交接**
 - `docs/authorization.md` — 授权记录格式与当前已批准范围
 - `docs/protocol-changes.md` — 协议变更提案流程
+- `docs/budget-and-limits.md` — 每日预算与停止条件
+- `docs/first-push.md` — 首次推送远程的操作指引
 - `docs/version-matrix.md` — 工具版本矩阵
 - `docs/project-info.md` — 项目基本信息表
 - `docs/B-to-A-interface-answers-v1.md` — B 端常驻执行器 HTTP 接口的 A 端正式答复

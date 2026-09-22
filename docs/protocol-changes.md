@@ -97,4 +97,33 @@
 
 | 编号 | 标题 | 状态 |
 | --- | --- | --- |
-| CP-0001 | 执行器 HTTP heartbeat、租约归属查询与身份绑定 | proposed |
+| CP-0001 | 执行器与协调器的 HTTP 传输契约 | **双方已确认，待落地**（目标 v1.1） |
+
+> `CP-0001` 详见 `docs/proposals/CP-0001-executor-http-transport.md`。
+> 它定义执行器与协调器之间的 HTTP 传输约定（端点、认证、幂等键、重试分类），
+> **不修改 `packages/protocol/` 任何已有字段**。
+> B 端已确认并完成实现；落地（提升 `PROTOCOL_VERSION` 至 v1.1、
+> 追加 `PROTOCOL_META.changeProposals`）由 A 端执行。
+
+---
+
+## 冻结记录
+
+| 版本 | 状态 | 冻结提交 | 协议子树哈希 | 日期 |
+| --- | --- | --- | --- | --- |
+| v1 | **frozen** | `a577d6688b323afbdbc647b3a1288c0316f7fb1e` | `f9644c44628d5fe8445bcbbb54ad336d7fbe0abc` | 2026-09-21 |
+
+> 子树哈希用 `git rev-parse "<提交>:packages/protocol"` 获取，**不是**根树哈希。
+> `tests/protocol/freeze.test.ts` 会自动核对，改协议而不更新它会直接测试失败。
+
+> **v1 已冻结。** 从此刻起，任何字段增删或语义变化都必须走本文件的提案流程。
+>
+> B 端已完成 Windows/OpenCode 可实现性核对，结论：**无阻塞项，无需变更提案**。
+> 详见 `docs/protocol-v1-freeze-and-handoff.md` 第 2 节。
+
+冻结后修改协议的正确姿势：
+
+1. 提 CP 提案（不直接改代码）
+2. 运行 `npm run validate:protocol` 列出受影响任务与批次
+3. 双方 PR review 签字
+4. 落地后提升 `PROTOCOL_VERSION` 并更新 `PROTOCOL_META.changeProposals`

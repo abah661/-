@@ -23,13 +23,12 @@
 
 A 任务分支已经公开推送，rebase 会改写历史并需要强制推送。A 端选择：
 
-1. GitHub 连接恢复后，将当前 `origin/main` **合并到 A 任务分支**，不 rebase、不强制推送；
-2. 由 A 在合并分支统一解决 `package.json/package-lock.json/tsconfig.json`；
-3. 执行 `npm ci`、`npm run check`、Wrangler dry-run；
-4. 通过后正常推送任务分支并让 CI 复验。
-
-截至本文生成时，终端到 GitHub 443 仍不可达，无法 fetch 和核对清单所述 `2b80674`；
-因此尚未执行合并，也未声称已取得 B 的 `00a1acf/2b80674`。
+1. 已获取 `origin/main` 最新提交 `ae659a9`，其中包含 `00a1acf`、`5bc8048`、`2b80674`；
+2. 已将 `origin/main` 合并到 A 任务分支，不 rebase、不强制推送；
+3. 已解决 README、CP-0001、协议变更表和根 `tsconfig.json` 四处冲突；
+4. 已由 A 统一重生成 `package-lock.json`，随后 `npm ci` 成功；
+5. `npm run check` 实际通过：18 个测试文件，358 passed、1 skipped；
+6. Wrangler dry-run 退出码 `0`。
 
 ## 4. 正式接口路径
 
@@ -53,5 +52,6 @@ A 原有短路径继续作为兼容别名。B 使用 `encodeURIComponent(project
 
 - 当前 CI 执行根目录 `npm ci` 与 `npm run check`。
 - Vitest 配置包含 `tests/**/*.test.ts`，所以合并后的 `tests/executor/**` 会执行。
-- 当前 A 分支的根 `tsconfig.json` 尚未引用 `apps/executor`，因此**目前不能声称 executor typecheck 已覆盖**。
-- 合并 B main 后由 A 添加/核对 `apps/executor` project reference，再以 CI 实际结果为准。
+- 根 `tsconfig.json` 已引用 `apps/executor`，executor 已进入 `tsc -b`。
+- Vitest 已实际执行 `tests/executor/**`；合流后的本地完整结果为 358 passed、1 skipped。
+- 远端 CI 仍需在本次 merge 提交推送后复验，未执行前不写成成功。

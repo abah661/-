@@ -29,24 +29,43 @@ export interface RunEvidenceInput {
  * 只认识主流测试框架的稳定输出格式，认不出时返回 null，
  * 由调用方决定按「无法判定」处理——**不要猜**，
  * 猜错的汇总数字会让 V06 的「测试必须全绿」变成假通过。
+ *
+ * 真实输出样本（vitest 3.x，由 tests/executor/windows-integration.test.ts
+ * 用真实运行采集，**不要凭记忆改这些正则**）：
+ * - 全绿：  `      Tests  16 passed (16)`
+ * - 有失败：`      Tests  1 failed | 1 passed (2)`      ← 分隔符是**竖线**
+ * - 有跳过：`      Tests  1 failed | 13 passed | 2 skipped (16)`
+ * - jest：  `Tests:       1 failed, 79 passed, 2 skipped, 80 total`
+ *
+ * 注意竖线格式曾漏掉，导致**真实失败**的运行被判为「无法判定」——
+ * 这正是最不能出错的分支，故此处按分段解析而非单条大正则。
  */
 export function parseTestSummary(output: string): TestEvidence["summary"] | null {
-  // vitest / jest 风格：Tests  80 passed (80)  或  Tests:  1 failed, 79 passed, 2 skipped
-  const patterns: RegExp[] = [
-    /Tests\s+(?:(\d+)\s+failed[,\s]*)?(?:(\d+)\s+passed)?[,\s]*(?:(\d+)\s+skipped)?\s*\(/i,
-    /Tests:\s*(?:(\d+)\s+failed[,\s]*)?(?:(\d+)\s+passed[,\s]*)?(?:(\d+)\s+skipped)?/i,
-    /(\d+)\s+passed[,\s]+(\d+)\s+failed/i,
-  ];
-  for (const pattern of patterns) {
-    const match = pattern.exec(output);
-    if (!match) continue;
-    const failed = Number(match[1] ?? 0);
-    const passed = Number(match[2] ?? 0);
-    const skipped = Number(match[3] ?? 0);
-    if (passed + failed + skipped === 0) continue;
-    return { passed, failed, skipped };
-  }
-  return null;
+  /**
+   * 在「Tests」行内逐段统计。
+   *
+   * 之所以不用单条可选组的大正则：vitest 用 `|` 分隔，
+   * 各段顺序不固定（失败段可缺省），可选组无法可靠区分
+   * `1 failed | 15 passed` 与 `15 passed | 1 failed`。
+   */
+  const testsLine = /^[ \t]*Tests[: ]\s*(.+)$/im.exec(output);
+  if (!testsLine) return null;
+
+  const body = testsLine[1]!;
+  const pick = (keyword: string): number => {
+    // 段间可能是 | 或 , 或空白；数字与关键词之间也可能有空格
+    const m = new RegExp(`(\\d+)\\s*${keyword}`, "i").exec(body);
+    return m ? Number(m[1]) : 0;
+  };
+
+  const passed = pick("passed");
+  const failed = pick("failed");
+  const skipped = pick("skipped");
+  const todo = pick("todo");
+
+  // 一段都没认出 = 格式不认识，交回调用方按「无法判定」处理
+  if (passed + failed + skipped + todo === 0) return null;
+  return { passed, failed, skipped };
 }
 
 function sha256(value: string): string {

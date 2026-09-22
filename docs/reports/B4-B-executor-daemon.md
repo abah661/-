@@ -5,6 +5,8 @@
 - B4 最低代码基线：`d493bd263febefcc4faca21da617520ce03fefa8`
   （`TASK-A-COORDINATOR: record successful P4 deployment`，已核验为 HEAD 祖先，`git merge-base --is-ancestor` 退出码 `0`）
 - 开工时 HEAD：`2f1d91416fc82e08c6dbd75ca688b1418ad759b6`（= 权威分支 `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` 顶端）
+- B4 实现提交（分支顶端）：`f9bebbb872aef28d3a730cc0e4a68b8fcd2d342c`（14 文件，+2534 / −103）
+- 推送：已推送该分支；`git ls-remote` 复核远端 = 本地，`main` 未改动
 - 工作区：`C:\Users\lenovo\Desktop\dual-agent-coordinator-b`（由主仓库 `C:\Users\lenovo\Desktop\双端连接` 检出的 worktree）
 
 ---
@@ -176,7 +178,7 @@ A 端回传后，B 端将直接解密到内存、以 DPAPI `SecureString` 形式
 
 ## 六、下一步
 
-1. 推送 `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4` 并报告 HEAD SHA（交接单 §8 第 1–2 步）。
+1. ✅ 已推送 `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4` 并报告 HEAD SHA（交接单 §8 第 1–2 步）。
 2. 等 A 端独立审查并整合 B4。
 3. A 端返回 `B-executor-token.p7m` 后，完成安全接收 + 健康检查 + 注册（§8 第 4–5 步）。
 4. A 端提供 `PROJECT_ID`/任务图/`<TARGET_REPO_URL>` 后进行 P3。

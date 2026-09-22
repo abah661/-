@@ -7,6 +7,10 @@
 - **B4 基线**：`d493bd263febefcc4faca21da617520ce03fefa8`（`TASK-A-COORDINATOR: record successful P4 deployment`）
   — 已核验为 HEAD 祖先：`git merge-base --is-ancestor` 退出码 `0`
 - **开工 HEAD**：`2f1d91416fc82e08c6dbd75ca688b1418ad759b6`（= 权威分支 A1 顶端）
+- **B4 实现提交（分支顶端）**：`f9bebbb872aef28d3a730cc0e4a68b8fcd2d342c`（14 文件，+2534/−103）
+- **推送状态**：✅ 已推送 `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4`。
+  `git ls-remote` 复核远端 SHA 与本地一致；**`main` 未被改动**（仍为 `ae659a9`）；
+  **未推送任何其他分支**。
 - **实际执行命令 / 退出码**：
 
   | 命令 | 退出码 |
@@ -42,7 +46,7 @@
   2. `PROJECT_ID` 未提供 → 无法进入 P3
   3. 独立目标业务仓库 `<TARGET_REPO_URL>` 未提供
   4. 最小任务图未提供
-- **下一步**：推送 B4 分支后，等 A 端独立审查整合；收到 `.p7m` 即完成安全接收 +
+- **下一步**：B4 已推送完毕，等 A 端独立审查整合；收到 `.p7m` 即完成安全接收 +
   健康检查 + 注册，报 HTTP 状态（不报 Token）。
 
 ---

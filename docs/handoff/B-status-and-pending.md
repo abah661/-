@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | P0 初始化环境 | ✅ | ✅ |
 | P1 冻结协议 v1 | ✅ 冻结锚点 `a577d66` | ✅ 可实现性核对完成，无阻塞 |
-| P2 双方开发组件 | ⚠️ 已写代码，**未推送**（见下） | ✅ 已完成（含传输层） |
+| P2 双方开发组件 | ⚠️ 已推送任务分支，**基线为冻结点前**（见 §4.5） | ✅ 已完成（含传输层），已推 main |
 | P3 离线与本地集成 | ⏸️ 未开始 | ⏸️ 依赖 A 端协调器可用 |
 | P4 接通 Cloudflare / GitHub | ⏸️ 未开始 | ⏸️ 依赖 A 端部署 |
 | P5 验收自动并行与返修 | ⏸️ 未开始 | ⏸️ 依赖 P4 |
@@ -30,6 +30,9 @@
 | `5bc8048` | 执行器公共内核、OpenCode 适配器、结果归一化 |
 | `ec27bda` | 按 A 端答复 v1 对齐传输契约（HTTP 客户端 + 4 个适配器 + 编排层） |
 | `23be27d` | B→A CP-0001 确认回执 |
+| `16b1869` | B 端状态与待办清单 |
+
+以上 6 个提交已推送至 `origin/main`，`git ls-remote origin main` 与本地 HEAD 完全一致。
 
 对应《项目书》第 P2 节 B 端五项：
 
@@ -166,14 +169,34 @@ B 端按以下路径实现，若与 A 端实际部署不一致请指出：
 - 每个条目是否含 `sha256` 与 `size`？
 - 校验失败时的期望行为（B 端倾向：拒绝将该包作为任务输入并报 `needs_input`）
 
-### 4.5 ⚠️ 协调器代码推送状态
+### 4.5 ⛔ 协调器分支基线分叉（已核实，硬阻塞联调）
 
-B 端在 `git ls-remote` 中看到 A 端分支
-`refs/heads/task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` = `67e72daf…`，
-但 B 端本地无法 fetch 该分支验证最新状态（网络问题，见 §六）。
+网络恢复后 B 端已完成核实，**结论比原先严重**。详见
+`docs/handoff/B-to-A-remote-integration-check.md`。摘要：
 
-**A 端请确认**：该分支的 4 个提交是否已合入 `main`？是否还有更新的提交未推送？
-B 端需要基于最新的 `apps/coordinator` 做联调。
+| 事实 | 值 |
+| --- | --- |
+| A 分支 | `refs/heads/task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` = `67e72da` |
+| 该分支独有提交 | 4 个（`fb9202f` / `88ff82d` / `2f1e4d5` / `67e72da`） |
+| 与 main 的共同祖先 | `a577d66`（= **冻结锚点**，status 当时仍为 `draft`） |
+| main 是它的祖先吗 | ❌ NO |
+| 它是 main 的祖先吗 | ❌ NO → **两侧已分叉** |
+| 它对 `packages/protocol` 的改动 | 空（未主动改，只是**沿用了冻结点前的旧快照**） |
+| 它上面的 `version.ts` | `status: "draft"`、`frozenAt: null`、**无 `frozenTreeSha`** |
+
+也就是说 A 的协调器代码**跑在协议冻结之前的世界里**。冻结动作（`00a1acf` 写入
+`frozenTreeSha`）与冻结守卫修复（`bbd57fd`）都只在 main 上。
+
+好消息是**没有文件级冲突**（A 动 `apps/coordinator` / `packages/codex-adapter` /
+`packages/integration` / `tools/cli`，B 动 `apps/executor` / `tests/executor` /
+`docs`），唯一重叠的 `version.ts` 是"A 整侧落后"而非双向修改。
+
+**A 端请决策**：
+
+1. 这 4 个提交是 **在 `a577d66` 上 rebase 到当前 main**，还是先 merge main 再合回？
+   （建议 rebase —— `version.ts` 与 `tools/validate-protocol` 会自然取到 main 的冻结版本。）
+2. `package-lock.json` 由谁重新生成？（建议 A 在 rebase 后于 main 侧统一 `npm install`。）
+3. A 的 `.github/workflows/ci.yml` 是否已包含 `apps/executor` 的 typecheck / test？
 
 ---
 

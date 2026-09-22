@@ -58,4 +58,6 @@ A 原有短路径继续作为兼容别名。B 使用 `encodeURIComponent(project
 - 第二次 CI `35689026986` 的 Linux 任务成功；Windows 任务发现 `listWorktrees()` 在默认 `core.quotePath=true` 时不能处理中文路径，因此整体仍失败。
 - B2 分支提交 `c05b4ff` 改用 `git worktree list --porcelain -z` 并按 NUL 解析；A 已审查范围并合并，不依赖或修改用户全局 Git 配置。
 - B2 合流后的 Windows 专项复验为 40 passed、1 skipped；完整本地检查为 18 个测试文件、359 passed、1 skipped，二者退出码均为 `0`。
-- B2 合流提交的远端双平台 CI 仍需推送后复验，未完成前不写成成功。
+- 第三次 CI `35691574191` 的 Linux 任务成功；Windows 任务证明 NUL 解析有效，但 GitHub runner 的 8.3 短路径与 Git 返回的长路径仍被字符串比较误判，因此整体仍失败。
+- B3 分支提交 `1256fed` 对均已存在的路径使用 Windows 文件系统真实路径规范化后严格比较；未删除断言、未放宽为仅检查目录存在、未修改生产 `isInside()` 语义。
+- B3 合流后的完整本地检查为 18 个测试文件、359 passed、1 skipped，退出码 `0`；远端双平台 CI 仍需推送后复验，未完成前不写成成功。

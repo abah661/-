@@ -50,8 +50,10 @@ A 原有短路径继续作为兼容别名。B 使用 `encodeURIComponent(project
 
 ## 6. CI 覆盖
 
-- 当前 CI 执行根目录 `npm ci` 与 `npm run check`。
+- 当前 CI 执行根目录 `npm ci` 与 `npm run check`，并使用 Linux、Windows 双平台矩阵。
 - Vitest 配置包含 `tests/**/*.test.ts`，所以合并后的 `tests/executor/**` 会执行。
 - 根 `tsconfig.json` 已引用 `apps/executor`，executor 已进入 `tsc -b`。
-- Vitest 已实际执行 `tests/executor/**`；合流后的本地完整结果为 358 passed、1 skipped。
-- 远端 CI 仍需在本次 merge 提交推送后复验，未执行前不写成成功。
+- 首次合流 CI `35684998820` 已执行但失败，真实原因有两个：浅克隆缺少冻结提交；Windows 路径断言在 Linux 上按 POSIX 语义执行。
+- 修复方式：checkout 使用 `fetch-depth: 0`；Windows 路径断言只在 Windows 执行；CI 新增 `windows-latest`，不修改 B 的执行器内核。
+- 修复后的本机 Windows 完整结果为 18 个测试文件、358 passed、1 skipped，退出码 `0`；其中 Windows 专项复验为 39 passed、1 skipped。
+- 修复提交的远端 CI 仍需推送后复验，未完成前不写成成功。

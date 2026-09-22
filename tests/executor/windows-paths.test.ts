@@ -17,7 +17,12 @@ import { isInside } from "../../apps/executor/src/core/worktree.js";
 import { isInsideRoot } from "../../apps/executor/src/core/materials.js";
 import { isSensitivePath, redact } from "../../apps/executor/src/core/context.js";
 
-describe("盘符大小写差异", () => {
+// 这些断言验证的是 Windows 路径语义；在 POSIX 上 node:path 会按 Linux
+// 规则解释反斜杠和盘符。CI 同时运行 Linux 与 Windows，因此只在 Windows
+// 执行本文件，避免把运行平台差异误报成执行器缺陷。
+const describeWindows = describe.runIf(process.platform === "win32");
+
+describeWindows("盘符大小写差异", () => {
   it("C: 与 c: 视为同一路径（Windows 大小写不敏感）", () => {
     // 注意：node:path 的 resolve 在 win32 上不统一盘符大小写，
     // 因此这里显式记录**当前行为**，避免日后误以为是 bug
@@ -36,7 +41,7 @@ describe("盘符大小写差异", () => {
   });
 });
 
-describe("尾随分隔符与重复分隔符", () => {
+describeWindows("尾随分隔符与重复分隔符", () => {
   it("父路径带尾随分隔符仍能判定", () => {
     expect(isInside("C:\\repo\\", "C:\\repo\\sub")).toBe(true);
     expect(isInside("C:\\repo\\\\", "C:\\repo\\sub")).toBe(true);
@@ -54,7 +59,7 @@ describe("尾随分隔符与重复分隔符", () => {
   });
 });
 
-describe("UNC 路径", () => {
+describeWindows("UNC 路径", () => {
   it("UNC 根与其中文件的关系可判定", () => {
     expect(isInside("\\\\server\\share\\repo", "\\\\server\\share\\repo\\sub")).toBe(true);
   });
@@ -73,7 +78,7 @@ describe("UNC 路径", () => {
   });
 });
 
-describe("MAX_PATH（260）长度边界", () => {
+describeWindows("MAX_PATH（260）长度边界", () => {
   /** 构造一个指定字符数的路径。 */
   function pathOfLength(n: number): string {
     const prefix = "C:\\base\\";
@@ -111,7 +116,7 @@ describe("MAX_PATH（260）长度边界", () => {
   });
 });
 
-describe("中文路径边界（本机实际场景）", () => {
+describeWindows("中文路径边界（本机实际场景）", () => {
   it("含中文的父与子可正确判定", () => {
     expect(isInside("C:\\双端连接", "C:\\双端连接\\apps\\executor")).toBe(true);
   });
@@ -129,7 +134,7 @@ describe("中文路径边界（本机实际场景）", () => {
   });
 });
 
-describe("保留名与特殊字符（敏感文件识别侧）", () => {
+describeWindows("保留名与特殊字符（敏感文件识别侧）", () => {
   it("含中文的敏感文件名仍能被识别", () => {
     expect(isSensitivePath("配置/.env")).toBe(true);
     expect(isSensitivePath("凭证/auth.json")).toBe(true);

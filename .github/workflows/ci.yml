@@ -14,11 +14,21 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 协议冻结测试需要读取 frozenAt 指向的历史提交。
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

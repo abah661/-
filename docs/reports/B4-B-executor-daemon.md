@@ -5,7 +5,7 @@
 - B4 最低代码基线：`d493bd263febefcc4faca21da617520ce03fefa8`
   （`TASK-A-COORDINATOR: record successful P4 deployment`，已核验为 HEAD 祖先，`git merge-base --is-ancestor` 退出码 `0`）
 - 开工时 HEAD：`2f1d91416fc82e08c6dbd75ca688b1418ad759b6`（= 权威分支 `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` 顶端）
-- B4 实现提交（分支顶端）：`f9bebbb872aef28d3a730cc0e4a68b8fcd2d342c`（14 文件，+2534 / −103）
+- B4 实现提交：`f9bebbb872aef28d3a730cc0e4a68b8fcd2d342c`（14 文件，+2534 / −103；其后仅有一个补记文档 SHA 的提交）
 - 推送：已推送该分支；`git ls-remote` 复核远端 = 本地，`main` 未改动
 - 工作区：`C:\Users\lenovo\Desktop\dual-agent-coordinator-b`（由主仓库 `C:\Users\lenovo\Desktop\双端连接` 检出的 worktree）
 

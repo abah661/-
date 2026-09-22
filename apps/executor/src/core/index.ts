@@ -12,3 +12,4 @@ export * from "./diff-check.js";
 export * from "./heartbeat.js";
 export * from "./evidence.js";
 export * from "./recovery.js";
+export * from "./attempt.js";

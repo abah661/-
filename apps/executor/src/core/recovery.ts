@@ -19,6 +19,8 @@ import type { Lease } from "@dac/protocol";
 export interface InFlightRecord {
   task_id: string;
   attempt_id: string;
+  /** 持有者身份。归属查询必须带它——A 端答复 §4 要求四项完整匹配 */
+  executor_id: string;
   lease_epoch: number;
   expired_at: string;
   worktree_path: string;
@@ -28,15 +30,42 @@ export interface InFlightRecord {
   local_commits: readonly string[];
 }
 
-/** 云端对「这个任务现在归谁」的回答。 */
+/**
+ * 云端对「这个任务现在归谁」的回答。
+ *
+ * 按 A 端答复 v1 §4 对齐（2026-09-22）：
+ * - `still_mine` 只在**完整租约匹配**时返回。
+ * - `reassigned` 附带 `reason` 与**当前**的 to_executor/attempt_id/lease_epoch；
+ *   没有当前租约时三项为 null。
+ * - `unreachable` 是 B 端本地网络状态，**不是服务端 JSON 值**——
+ *   由 HTTP 客户端在请求失败时构造。
+ */
 export type TaskOwnership =
   | { kind: "still_mine"; lease: Lease }
-  | { kind: "reassigned"; to_executor: string; attempt_id: string }
+  | {
+      kind: "reassigned";
+      reason: string;
+      /** 当前持有者；无当前租约时三项均为 null */
+      to_executor: string | null;
+      attempt_id: string | null;
+      lease_epoch: number | null;
+    }
   | { kind: "unknown_task" }
   | { kind: "unreachable"; error: string };
 
+/**
+ * 归属查询参数。必须带全四项——服务端用它判断「是否仍是完整匹配」，
+ * 只传 task_id 会拿到不准确的结论。
+ */
+export interface OwnershipQuery {
+  task_id: string;
+  attempt_id: string;
+  executor_id: string;
+  lease_epoch: number;
+}
+
 export interface RecoveryTransport {
-  queryOwnership(task_id: string, attempt_id: string): Promise<TaskOwnership>;
+  queryOwnership(query: OwnershipQuery): Promise<TaskOwnership>;
 }
 
 /** 恢复决策。**必须**先取得这个结论再动本地状态。 */
@@ -69,7 +98,12 @@ export async function decideRecovery(
   transport: RecoveryTransport,
 ): Promise<RecoveryDecision> {
   const { record } = input;
-  const ownership = await transport.queryOwnership(record.task_id, record.attempt_id);
+  const ownership = await transport.queryOwnership({
+    task_id: record.task_id,
+    attempt_id: record.attempt_id,
+    executor_id: record.executor_id,
+    lease_epoch: record.lease_epoch,
+  });
 
   switch (ownership.kind) {
     case "unreachable":
@@ -81,7 +115,8 @@ export async function decideRecovery(
 
     case "reassigned":
       // 已有别人接手，本地立即放手。**不推送、不上报、不清理他人 worktree**。
-      return { kind: "abandon_reassigned", to_executor: ownership.to_executor };
+      // 注意 to_executor 可能为 null（无当前租约），此时同样必须放手。
+      return { kind: "abandon_reassigned", to_executor: ownership.to_executor ?? "(unknown)" };
 
     case "still_mine": {
       // epoch 变更说明期间发生过重派后又回到我手上，本地缓存已失效。

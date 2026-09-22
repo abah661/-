@@ -12,7 +12,14 @@ import { describe, expect, it } from "vitest";
 import { LeaseGuard, isLeaseExpired, remainingLeaseMs } from "../../apps/executor/src/core/lease.js";
 import type { LeaseClock, LeaseTransport, RenewOutcome } from "../../apps/executor/src/core/lease.js";
 import { decideRecovery, checkLocalState } from "../../apps/executor/src/core/recovery.js";
-import type { InFlightRecord, RecoveryTransport } from "../../apps/executor/src/core/recovery.js";
+import type {
+  InFlightRecord,
+  OwnershipQuery,
+  RecoveryTransport,
+  TaskOwnership,
+} from "../../apps/executor/src/core/recovery.js";
+import { Heartbeat, validateHeartbeat } from "../../apps/executor/src/core/heartbeat.js";
+import type { HeartbeatRequest } from "../../apps/executor/src/core/heartbeat.js";
 import type { Lease } from "@dac/protocol";
 
 /* ------------------------------------------------------------------ *
@@ -197,6 +204,7 @@ function makeRecord(overrides: Partial<InFlightRecord> = {}): InFlightRecord {
   return {
     task_id: "TASK-0001",
     attempt_id: "TASK-0001-A1",
+    executor_id: "EXE-B-DESKTOP",
     lease_epoch: 1,
     expired_at: "2026-09-21T12:00:00.000Z",
     worktree_path: "C:/nonexistent/worktree",
@@ -206,9 +214,15 @@ function makeRecord(overrides: Partial<InFlightRecord> = {}): InFlightRecord {
   };
 }
 
+/**
+ * 记录最后一次归属查询参数，用于断言「四项必须齐全」。
+ * A 端答复 §4：只传 task_id 会拿到不准确的结论，故必须验证客户端确实带全。
+ */
 class FakeRecoveryTransport implements RecoveryTransport {
+  lastQuery: OwnershipQuery | null = null;
   constructor(private readonly answer: Awaited<ReturnType<RecoveryTransport["queryOwnership"]>>) {}
-  async queryOwnership(): Promise<Awaited<ReturnType<RecoveryTransport["queryOwnership"]>>> {
+  async queryOwnership(query: OwnershipQuery): Promise<TaskOwnership> {
+    this.lastQuery = query;
     return this.answer;
   }
 }
@@ -247,14 +261,46 @@ describe("decideRecovery", () => {
       { record: makeRecord() },
       new FakeRecoveryTransport({
         kind: "reassigned",
+        reason: "reassigned_to_other_executor",
         to_executor: "EXE-A-LENOVO",
         attempt_id: "TASK-0001-A2",
+        lease_epoch: 2,
       }),
     );
     expect(decision.kind).toBe("abandon_reassigned");
     if (decision.kind === "abandon_reassigned") {
       expect(decision.to_executor).toBe("EXE-A-LENOVO");
     }
+  });
+
+  it("被重派但云端当前无租约（三项为 null）→ 同样必须放手", async () => {
+    // A 端答复 §4：无当前租约时 to_executor/attempt_id/lease_epoch 均为 null。
+    // 这是边界：不能因为「拿不到新持有者」就当作仍归自己。
+    const decision = await decideRecovery(
+      { record: makeRecord() },
+      new FakeRecoveryTransport({
+        kind: "reassigned",
+        reason: "lease_released",
+        to_executor: null,
+        attempt_id: null,
+        lease_epoch: null,
+      }),
+    );
+    expect(decision.kind).toBe("abandon_reassigned");
+    if (decision.kind === "abandon_reassigned") {
+      expect(decision.to_executor).toBe("(unknown)");
+    }
+  });
+
+  it("归属查询必须带全四项（task/attempt/executor/epoch）", async () => {
+    const transport = new FakeRecoveryTransport({ kind: "unknown_task" });
+    await decideRecovery({ record: makeRecord() }, transport);
+    expect(transport.lastQuery).toEqual({
+      task_id: "TASK-0001",
+      attempt_id: "TASK-0001-A1",
+      executor_id: "EXE-B-DESKTOP",
+      lease_epoch: 1,
+    });
   });
 
   it("云端不可达 → halt_offline（断网停止新操作，不猜）", async () => {
@@ -280,5 +326,170 @@ describe("checkLocalState", () => {
     const result = checkLocalState(makeRecord({ worktree_path: "C:/definitely/not/here" }));
     expect(result.is_git_repo).toBe(false);
     expect(result.problems.length).toBeGreaterThan(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 心跳（CP-0001 §1；A 端答复 v1）
+ * ------------------------------------------------------------------ */
+
+class RecordingHeartbeatTransport {
+  sent: HeartbeatRequest[] = [];
+  failNext: Error | null = null;
+  async send(request: HeartbeatRequest): Promise<void> {
+    this.sent.push(request);
+    if (this.failNext) {
+      const err = this.failNext;
+      this.failNext = null;
+      throw err;
+    }
+  }
+}
+
+describe("Heartbeat 契约字段", () => {
+  it("初始为 idle，且租约三项为 null", () => {
+    const hb = new Heartbeat("EXE-B-DESKTOP", new RecordingHeartbeatTransport(), {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+      makeIdempotencyKey: () => "k1",
+    });
+    const req = hb.buildRequest();
+    expect(req.state).toBe("idle");
+    expect(req.task_id).toBeNull();
+    expect(req.attempt_id).toBeNull();
+    expect(req.lease_epoch).toBeNull();
+    expect(req.protocol_version).toBe("1");
+    expect(req.executor_id).toBe("EXE-B-DESKTOP");
+    expect(validateHeartbeat(req)).toBeNull();
+  });
+
+  it("markRunning 后带完整三元组，state=running", () => {
+    const hb = new Heartbeat("EXE-B-DESKTOP", new RecordingHeartbeatTransport(), {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+      makeIdempotencyKey: () => "k1",
+    });
+    hb.markRunning({ task_id: "TASK-0001", attempt_id: "TASK-0001-A1", lease_epoch: 3 });
+    const req = hb.buildRequest();
+    expect(req.state).toBe("running");
+    expect(req.task_id).toBe("TASK-0001");
+    expect(req.attempt_id).toBe("TASK-0001-A1");
+    expect(req.lease_epoch).toBe(3);
+    expect(validateHeartbeat(req)).toBeNull();
+  });
+
+  it("markStopping 保留租约（正在收尾，仍需表明归属）", () => {
+    const hb = new Heartbeat("EXE-B-DESKTOP", new RecordingHeartbeatTransport(), {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+    });
+    hb.markRunning({ task_id: "TASK-0001", attempt_id: "TASK-0001-A1", lease_epoch: 3 });
+    hb.markStopping();
+    const req = hb.buildRequest();
+    expect(req.state).toBe("stopping");
+    expect(req.lease_epoch).toBe(3);
+    expect(validateHeartbeat(req)).toBeNull();
+  });
+
+  it("markIdle 清空租约与本地 phase", () => {
+    const hb = new Heartbeat("EXE-B-DESKTOP", new RecordingHeartbeatTransport(), {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+    });
+    hb.markRunning({ task_id: "TASK-0001", attempt_id: "TASK-0001-A1", lease_epoch: 3 });
+    hb.setPhase("running_agent", "agent 已运行 1s");
+    hb.markIdle();
+    const req = hb.buildRequest();
+    expect(req.state).toBe("idle");
+    expect(req.lease_epoch).toBeNull();
+    expect(req.detail).toBeUndefined();
+    expect(validateHeartbeat(req)).toBeNull();
+  });
+
+  it("setLeaseEpoch 同步续租后的新 epoch（否则上报过期值会被服务端拒绝）", () => {
+    const hb = new Heartbeat("EXE-B-DESKTOP", new RecordingHeartbeatTransport(), {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+    });
+    hb.markRunning({ task_id: "TASK-0001", attempt_id: "TASK-0001-A1", lease_epoch: 3 });
+    hb.setLeaseEpoch(7);
+    expect(hb.buildRequest().lease_epoch).toBe(7);
+  });
+
+  it("phase 只是本地诊断信息，不改变 state", () => {
+    const hb = new Heartbeat("EXE-B-DESKTOP", new RecordingHeartbeatTransport(), {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+    });
+    hb.markRunning({ task_id: "TASK-0001", attempt_id: "TASK-0001-A1", lease_epoch: 1 });
+    hb.setPhase("running_tests", "vitest 178/178");
+    const req = hb.buildRequest();
+    expect(req.state).toBe("running");
+    expect(req.detail).toBe("vitest 178/178");
+  });
+
+  it("心跳发送失败**不抛错也不改状态**（不得影响任务）", async () => {
+    const transport = new RecordingHeartbeatTransport();
+    const errors: unknown[] = [];
+    const hb = new Heartbeat("EXE-B-DESKTOP", transport, {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+      onError: (e) => errors.push(e),
+    });
+    hb.markRunning({ task_id: "TASK-0001", attempt_id: "TASK-0001-A1", lease_epoch: 1 });
+    transport.failNext = new Error("ECONNRESET");
+    await expect(hb.beat()).resolves.toBeUndefined();
+    expect(errors).toHaveLength(1);
+    expect(hb.buildRequest().state).toBe("running");
+  });
+
+  it("每次幂等键不同（否则服务端会去重导致协调器误判失联）", async () => {
+    const transport = new RecordingHeartbeatTransport();
+    const hb = new Heartbeat("EXE-B-DESKTOP", transport, {
+      heartbeat_interval_ms: 1000,
+      clock: new ManualClock(),
+    });
+    hb.markRunning({ task_id: "TASK-0001", attempt_id: "TASK-0001-A1", lease_epoch: 1 });
+    await hb.beat();
+    await hb.beat();
+    await hb.beat();
+    const keys = transport.sent.map((r) => r.idempotency_key);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe("validateHeartbeat（服务端也会做同样校验，客户端提前自检）", () => {
+  const base: HeartbeatRequest = {
+    protocol_version: "1",
+    executor_id: "EXE-B-DESKTOP",
+    state: "running",
+    task_id: "TASK-0001",
+    attempt_id: "TASK-0001-A1",
+    lease_epoch: 1,
+    sent_at: "2026-09-21T12:00:00.000Z",
+    idempotency_key: "k1",
+  };
+
+  it("running 缺三元组 → 报错", () => {
+    expect(validateHeartbeat({ ...base, attempt_id: null })).toMatch(/attempt_id/);
+  });
+
+  it("stopping 缺三元组 → 报错", () => {
+    expect(validateHeartbeat({ ...base, state: "stopping", lease_epoch: null })).toMatch(
+      /lease_epoch/,
+    );
+  });
+
+  it("idle 带了三元组 → 报错（服务端要求全 null）", () => {
+    expect(validateHeartbeat({ ...base, state: "idle" })).toMatch(/idle/);
+  });
+
+  it("epoch 非正整数 → 报错", () => {
+    expect(validateHeartbeat({ ...base, lease_epoch: 0 })).toMatch(/>= 1/);
+    expect(validateHeartbeat({ ...base, lease_epoch: 1.5 })).toMatch(/>= 1/);
+  });
+
+  it("合法 running 请求 → null", () => {
+    expect(validateHeartbeat(base)).toBeNull();
   });
 });

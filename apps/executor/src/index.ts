@@ -11,4 +11,5 @@
 
 export * from "./core/index.js";
 export * from "./adapters/index.js";
+export * from "./transport/index.js";
 export * from "./result/index.js";

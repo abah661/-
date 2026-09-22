@@ -62,6 +62,11 @@ export interface AttemptInput {
   test_command?: TestCommand;
   /** agent 超时毫秒数 */
   agent_timeout_ms?: number;
+  /**
+   * 外部取消信号（Ctrl+C）。透传给 agent 适配器，用于真正终止子进程。
+   * 置位后本函数仍按正常路径返回，但调用方**不得**再推送或上报。
+   */
+  signal?: AbortSignal;
   /** 测试超时毫秒数 */
   test_timeout_ms?: number;
   /** 续租与心跳间隔毫秒数 */
@@ -204,6 +209,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
         cwd: worktreePath,
         model: input.model,
         ...(input.agent_timeout_ms !== undefined ? { timeout_ms: input.agent_timeout_ms } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
       },
       {},
       deps.agent_runner as OpenCodeProcessRunner,

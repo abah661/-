@@ -50,6 +50,15 @@ export interface OpenCodeTaskInput {
   model: string;
   /** 超时毫秒数 */
   timeout_ms?: number;
+  /**
+   * 外部取消信号（`Ctrl+C` / 关闭常驻进程）。
+   *
+   * 置位后立即向子进程发终止信号。之所以必须走信号而不是"调用方自己不管了"：
+   * 不真正终止子进程就会留下孤儿进程，继续占用 worktree 与模型配额。
+   * 取消**不**单独伪造状态码——进程被终止后自然是非零退出，
+   * 由既有的退出码路径得出 `AGENT_NONZERO_EXIT`，事实准确。
+   */
+  signal?: AbortSignal;
   /** 附加文件（`--file`），供上下文注入 */
   files?: readonly string[];
   /** 使用的 agent 名称（`--agent`），可选 */
@@ -402,11 +411,21 @@ export async function runOpenCodeTask(
     handle.kill("SIGTERM");
   }, timeout);
 
+  // 外部取消（Ctrl+C）：与超时复用同一条终止路径，不做特殊状态码。
+  const onAbort = (): void => {
+    handle.kill("SIGTERM");
+  };
+  if (input.signal) {
+    if (input.signal.aborted) onAbort();
+    else input.signal.addEventListener("abort", onAbort, { once: true });
+  }
+
   await Promise.race([
     exitedPromise,
     new Promise<void>((resolve) => setTimeout(resolve, timeout + KILL_GRACE_MS)),
   ]);
   clearTimeout(killTimer);
+  input.signal?.removeEventListener("abort", onAbort);
   if (!exited) {
     // 仍未退出：认定超时，并在放弃前再补一次强杀。
     timed_out = true;

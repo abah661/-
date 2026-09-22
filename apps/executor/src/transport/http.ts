@@ -315,7 +315,27 @@ export class CoordinatorClient {
     const allowRetry = spec.retry !== false;
     const maxAttempts = allowRetry ? this.policy.max_retries + 1 : 1;
 
-    const body = spec.body === undefined ? undefined : JSON.stringify(spec.body);
+    // 幂等键**必须进请求体**：协调器的各写端点都从 body 读 `idempotency_key`
+    // （`apps/coordinator/src/project-do.ts` 的 `requireIdempotencyScope`）。
+    // 本模块文件头也早已写明「写请求的 idempotency_key 放在 JSON 体内」，
+    // 但此前只在重试循环里使用了该字段、并未发送，导致续租/心跳/领取
+    // 因缺少必填字段被服务端判为 400 RESULT_SCHEMA_INVALID。
+    // 合并放在重试循环**之前**，因此整个重试过程复用同一个键 ——
+    // 这正是幂等保护生效的前提。
+    // 合并放在重试循环**之前**，因此整个重试过程复用同一个键 ——
+    // 这正是幂等保护生效的前提。
+    const canMerge =
+      spec.body !== null &&
+      typeof spec.body === "object" &&
+      !Array.isArray(spec.body) &&
+      spec.idempotency_key !== undefined;
+    const payload =
+      spec.body === undefined
+        ? undefined
+        : canMerge
+          ? { ...(spec.body as Record<string, unknown>), idempotency_key: spec.idempotency_key }
+          : spec.body;
+    const body = payload === undefined ? undefined : JSON.stringify(payload);
     const headers: Record<string, string> = {
       // 凭据只在此处进入请求头，不落日志
       Authorization: `Bearer ${this.config.token}`,

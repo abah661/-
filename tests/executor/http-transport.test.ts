@@ -28,6 +28,7 @@ import {
   HttpResultReporter,
 } from "../../apps/executor/src/transport/adapters.js";
 import type { HeartbeatRequest } from "../../apps/executor/src/core/heartbeat.js";
+import type { ResultReport } from "@dac/protocol";
 
 /* ------------------------------------------------------------------ *
  * 假 fetch
@@ -459,15 +460,59 @@ describe("HttpLeaseTransport", () => {
     });
   });
 
-  it("请求体带完整三元组 + executor_id + protocol_version", async () => {
+  /**
+   * 回归测试：真实服务端返回的是**裸租约**，没有 `lease` 信封。
+   *
+   * `apps/coordinator/src/project-do.ts` 的 `renewLease` 末尾直接
+   * `return jsonResponse(lease)`；只有 `leaseTask` 才返回 `{ task, lease }`。
+   * 上面那个用例（沿用旧夹具的包装形状）是**唯一**被覆盖过的形状，
+   * 于是「真实续租一律被判为应答不完整」这个缺陷在单元测试里长期隐形。
+   */
+  it("真实服务端形状：裸租约（无 lease 信封）必须能解析", async () => {
+    const fake = new FakeFetch([
+      {
+        status: 200,
+        body: {
+          task_id: "TASK-0001",
+          attempt_id: "TASK-0001-A1",
+          executor_id: "EXE-B-DESKTOP",
+          lease_epoch: 4,
+          expires_at: "2026-09-21T12:10:00.000Z",
+          binding: {
+            base_sha: "a".repeat(40),
+            rules_sha: "a".repeat(40),
+            contract_sha: "a".repeat(40),
+            acceptance_sha: "a".repeat(40),
+          },
+          agent_kind: "opencode",
+        },
+      },
+    ]);
+    const out = await new HttpLeaseTransport(makeClient(fake)).renew(
+      "TASK-0001",
+      "TASK-0001-A1",
+      3,
+    );
+    expect(out).toEqual({
+      kind: "renewed",
+      expires_at: "2026-09-21T12:10:00.000Z",
+      lease_epoch: 4,
+    });
+  });
+
+  it("请求体带完整三元组 + executor_id + protocol_version + 幂等键", async () => {
     const fake = new FakeFetch([leaseResponse]);
     await new HttpLeaseTransport(makeClient(fake)).renew("TASK-0001", "TASK-0001-A1", 3);
+    // 幂等键**必须在体内**：服务端 `RenewLeaseRequestSchema` 把
+    // `idempotency_key` 列为必填，且 `requireIdempotencyScope` 从 body 读取。
+    // 旧断言漏掉了它，等于把「缺必填字段 → 400」当作正确行为。
     expect(fake.captured[0]!.body).toEqual({
       protocol_version: "1",
       task_id: "TASK-0001",
       attempt_id: "TASK-0001-A1",
       executor_id: "EXE-B-DESKTOP",
       lease_epoch: 3,
+      idempotency_key: expect.any(String),
     });
     expect(fake.captured[0]!.url).toContain("/tasks/TASK-0001/lease/renew");
   });
@@ -562,6 +607,40 @@ describe("HttpRecoveryTransport", () => {
     expect(out.kind).toBe("still_mine");
   });
 
+  /**
+   * 回归测试：真实服务端的 `still_mine` 把租约字段**平铺在顶层**，
+   * 没有嵌套 `lease`（`project-do.ts` 的 `queryOwnership` 直接返回
+   * `{ ownership, task_id, attempt_id, executor_id, lease_epoch, expires_at }`）。
+   * 旧实现只读 `response.lease.expires_at`，于是真实归属查询一律被判为
+   * `unreachable` —— 重启恢复会永远走 `halt_offline`，本地 attempt 再也接不上。
+   */
+  it("真实服务端形状：still_mine 的租约字段平铺在顶层", async () => {
+    const fake = new FakeFetch([
+      {
+        status: 200,
+        body: {
+          ownership: "still_mine",
+          task_id: "TASK-0001",
+          attempt_id: "TASK-0001-A1",
+          executor_id: "EXE-B-DESKTOP",
+          lease_epoch: 1,
+          expires_at: "2026-09-21T12:10:00.000Z",
+        },
+      },
+    ]);
+    const out = await new HttpRecoveryTransport(makeClient(fake)).queryOwnership(query);
+    expect(out).toEqual({
+      kind: "still_mine",
+      lease: {
+        task_id: "TASK-0001",
+        attempt_id: "TASK-0001-A1",
+        executor_id: "EXE-B-DESKTOP",
+        lease_epoch: 1,
+        expires_at: "2026-09-21T12:10:00.000Z",
+      },
+    });
+  });
+
   it("请求体带全四项（只传 task_id 会得到不准确结论）", async () => {
     const fake = new FakeFetch([{ status: 200, body: { ownership: "unknown_task" } }]);
     await new HttpRecoveryTransport(makeClient(fake)).queryOwnership(query);
@@ -630,32 +709,67 @@ describe("HttpRecoveryTransport", () => {
 });
 
 describe("HttpResultReporter", () => {
-  it("幂等键是确定性的 report_result:<task>:<attempt>:<epoch>", async () => {
-    const fake = new FakeFetch([{ status: 200, body: { accepted: true, state: "validating" } }]);
-    await new HttpResultReporter(makeClient(fake)).report({
-      task_id: "TASK-0001",
-      attempt_id: "TASK-0001-A1",
-      lease_epoch: 7,
-      report: { status: "ready_for_integration" },
-    });
+  /**
+   * 结果报告的请求体就是**协议 ResultReport 本身**（平铺），
+   * 不是 `{ protocol_version, executor_id, lease_epoch, report }` 这种自定义信封。
+   * 依据：服务端 `reportResult` 对整个请求体做 `ResultReportSchema` 解析，
+   * 且路由层 `pathClaimsMatch` 会核对路径里的 task_id/attempt_id 与体内一致。
+   *
+   * 旧断言编码的是那个错误信封 —— 用它会得到 400 RESULT_SCHEMA_INVALID，
+   * 也就是**结果永远上报不出去**，而只跑假 fetch 的单元测试完全看不出来。
+   */
+  const sample: ResultReport = {
+    protocol_version: "1",
+    task_id: "TASK-0001",
+    attempt_id: "TASK-0001-A1",
+    executor_id: "EXE-B-DESKTOP",
+    lease_epoch: 7,
+    agent_kind: "opencode",
+    base_sha: "a".repeat(40),
+    head_sha: "b".repeat(40),
+    rules_sha: "a".repeat(40),
+    contract_sha: "a".repeat(40),
+    acceptance_sha: "a".repeat(40),
+    status: "ready_for_integration",
+    evidence_id: "EVID-TASK-0001-TASK-0001-A1-1",
+    changed_files: ["apps/executor/src/transport/adapters.ts"],
+    evidence: {
+      evidence_id: "EVID-TASK-0001-TASK-0001-A1-1",
+      command: ["npm", "test"],
+      exit_code: 0,
+      summary: { passed: 10, failed: 0, skipped: 0 },
+      log_artifact: null,
+      output_sha256: null,
+    },
+    error_code: null,
+    commit_shas: ["b".repeat(40)],
+    note: null,
+    reported_at: "2026-09-22T00:00:00.000Z",
+  };
+
+  it("请求体是平铺的 ResultReport，且路径与体内标识一致", async () => {
+    const fake = new FakeFetch([
+      { status: 200, body: { accepted: true, task_id: "TASK-0001", status: "validating" } },
+    ]);
+    const out = await new HttpResultReporter(makeClient(fake)).report(sample);
+    expect(fake.captured[0]!.url).toContain("/tasks/TASK-0001/attempts/TASK-0001-A1/result");
     expect(fake.captured[0]!.body).toMatchObject({
       protocol_version: "1",
+      task_id: "TASK-0001",
+      attempt_id: "TASK-0001-A1",
       executor_id: "EXE-B-DESKTOP",
       lease_epoch: 7,
+      status: "ready_for_integration",
     });
-    // 确定性键：同一 attempt 重复上报会被服务端识别为同一操作
-    expect(fake.captured[0]!.url).toContain("/tasks/TASK-0001/attempts/TASK-0001-A1/result");
+    // 不得再套信封
+    expect(fake.captured[0]!.body).not.toHaveProperty("report");
+    expect(out).toEqual({ accepted: true, state: "validating" });
   });
 
   it("旧 epoch 上报 → 409 上抛（说明该 attempt 已作废，不得伪装成功）", async () => {
     const fake = new FakeFetch([{ status: 409 }]);
     await expect(
-      new HttpResultReporter(makeClient(fake)).report({
-        task_id: "TASK-0001",
-        attempt_id: "TASK-0001-A1",
-        lease_epoch: 1,
-        report: {},
-      }),
+      new HttpResultReporter(makeClient(fake)).report({ ...sample, lease_epoch: 1 }),
     ).rejects.toMatchObject({ code: "LEASE_EPOCH_STALE" });
   });
 });

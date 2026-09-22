@@ -40,8 +40,23 @@ export interface InFlightRecord {
  * - `unreachable` 是 B 端本地网络状态，**不是服务端 JSON 值**——
  *   由 HTTP 客户端在请求失败时构造。
  */
+/**
+ * 归属查询返回的租约子集。
+ *
+ * 服务端 `queryOwnership` 的 `still_mine` 应答只回
+ * `task_id / attempt_id / executor_id / lease_epoch / expires_at`，
+ * **不含** `binding` 与 `agent_kind`（见 `apps/coordinator/src/project-do.ts`）。
+ * 因此这里刻意用 `Pick<>` 而不是完整 `Lease` —— 不要为了凑类型
+ * 给缺省值，那会让「服务端没给」和「服务端给了」变得无法区分。
+ * 恢复决策只用得到 epoch 与过期时间，够用。
+ */
+export type OwnershipLease = Pick<
+  Lease,
+  "task_id" | "attempt_id" | "executor_id" | "lease_epoch" | "expires_at"
+>;
+
 export type TaskOwnership =
-  | { kind: "still_mine"; lease: Lease }
+  | { kind: "still_mine"; lease: OwnershipLease }
   | {
       kind: "reassigned";
       reason: string;

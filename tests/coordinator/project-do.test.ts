@@ -323,6 +323,7 @@ describe("Worker route", () => {
     };
 
     expect((await worker.fetch(new Request("https://api/health"), env)).status).toBe(200);
+    expect((await worker.fetch(new Request("https://api/v1/health"), env)).status).toBe(200);
     expect((await worker.fetch(new Request("https://api/v1/projects/PROJECT-TEST/status"), env)).status).toBe(401);
     const authorized = await worker.fetch(
       new Request("https://api/v1/projects/PROJECT-TEST/status", {
@@ -350,5 +351,42 @@ describe("Worker route", () => {
     }), env);
     expect(response.status).toBe(403);
     expect(await json(response)).toMatchObject({ error: { code: "EXECUTOR_IDENTITY_MISMATCH" } });
+  });
+
+  it("兼容 B 端已实现的嵌套资源路径", async () => {
+    const worker = createCoordinatorWorker();
+    const forwarded: string[] = [];
+    const env: CoordinatorEnv = {
+      COORDINATOR_API_TOKEN: "admin-token",
+      PROJECTS: {
+        idFromName: () => ({}),
+        get: () => ({
+          fetch: async (request: Request) => {
+            forwarded.push(`${request.method} ${new URL(request.url).pathname}`);
+            return new Response("{}", { headers: { "content-type": "application/json" } });
+          },
+        }),
+      },
+    };
+    const headers = { authorization: "Bearer admin-token", "content-type": "application/json" };
+    const calls = [
+      ["https://api/v1/projects/PROJECT-TEST/tasks/TASK-0001/lease/renew", { task_id: "TASK-0001" }],
+      ["https://api/v1/projects/PROJECT-TEST/executors/EXE-B-TEST/heartbeat", { executor_id: "EXE-B-TEST" }],
+      ["https://api/v1/projects/PROJECT-TEST/tasks/TASK-0001/ownership", { task_id: "TASK-0001" }],
+      [
+        "https://api/v1/projects/PROJECT-TEST/tasks/TASK-0001/attempts/TASK-0001-A1/result",
+        { task_id: "TASK-0001", attempt_id: "TASK-0001-A1" },
+      ],
+    ] as const;
+    for (const [url, body] of calls) {
+      const response = await worker.fetch(new Request(url, { method: "POST", headers, body: JSON.stringify(body) }), env);
+      expect(response.status).toBe(200);
+    }
+    expect(forwarded).toEqual([
+      "POST /internal/renew_lease",
+      "POST /internal/executor_heartbeat",
+      "POST /internal/query_ownership",
+      "POST /internal/report_result",
+    ]);
   });
 });

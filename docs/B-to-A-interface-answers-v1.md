@@ -22,7 +22,7 @@ ownership 与执行器身份映射，已登记为 `docs/proposals/CP-0001-execut
 
 - 基址：`<COORDINATOR_BASE_URL>`。
 - 项目路由：`/v1/projects/<project_id>/...`。
-- 除 `GET /health` 外，全部请求使用 `Authorization: Bearer <token>`。
+- 健康检查正式路径为 `GET /v1/health`；兼容别名 `GET /health`。其他请求全部使用 `Authorization: Bearer <token>`。
 - B 端从环境变量 `COORDINATOR_API_TOKEN` 读取自己的 token；不写配置文件、不进日志、不进仓库。
 - Bearer token 在 Worker 端映射到唯一 `executor_id`，请求体不得冒充另一执行器。
 - 写请求的 `idempotency_key` 放在 JSON 请求体中。scope 不由客户端传，服务端按路由固定添加。
@@ -57,7 +57,9 @@ ownership 与执行器身份映射，已登记为 `docs/proposals/CP-0001-execut
 
 ### 续租
 
-`POST /v1/projects/<project_id>/tasks/renew`
+`POST /v1/projects/<project_id>/tasks/<task_id>/lease/renew`
+
+兼容别名：`POST /v1/projects/<project_id>/tasks/renew`。
 
 ```json
 {
@@ -75,7 +77,9 @@ ownership 与执行器身份映射，已登记为 `docs/proposals/CP-0001-execut
 
 ### 心跳
 
-`POST /v1/projects/<project_id>/executors/heartbeat`
+`POST /v1/projects/<project_id>/executors/<executor_id>/heartbeat`
+
+兼容别名：`POST /v1/projects/<project_id>/executors/heartbeat`。
 
 ```json
 {
@@ -95,7 +99,9 @@ ownership 与执行器身份映射，已登记为 `docs/proposals/CP-0001-execut
 
 ### 回报结果
 
-`POST /v1/projects/<project_id>/tasks/report`
+`POST /v1/projects/<project_id>/tasks/<task_id>/attempts/<attempt_id>/result`
+
+兼容别名：`POST /v1/projects/<project_id>/tasks/report`。
 
 请求体严格使用 `ResultReportSchema`，必须同时携带 `attempt_id`、`executor_id`
 和 `lease_epoch`。旧 epoch 报告返回 `409 LEASE_EPOCH_STALE`。
@@ -128,12 +134,13 @@ B 不需要理解或保存 DO 实例 ID，也不会收到 DO 重定向。
 重启恢复查询：
 
 ```text
-GET /v1/projects/<project_id>/tasks/ownership
-  ?task_id=TASK-0001
-  &attempt_id=TASK-0001-A1
-  &executor_id=EXE-B-...
-  &lease_epoch=1
+POST /v1/projects/<project_id>/tasks/<task_id>/ownership
 ```
+
+请求体包含 `task_id`、`attempt_id`、`executor_id`、`lease_epoch`。
+兼容别名为 `GET /v1/projects/<project_id>/tasks/ownership`，四项放在查询参数。
+嵌套路径中的 `task_id/executor_id/attempt_id` 必须与请求体对应字段完全一致，否则返回
+`409 CONTRACT_MISMATCH`。
 
 仍持有时返回 `ownership: "still_mine"` 和当前完整租约字段。
 不再持有时返回 `ownership: "reassigned"`，并附 `reason`、当前

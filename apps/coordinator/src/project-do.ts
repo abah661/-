@@ -155,7 +155,9 @@ export class ProjectDurableObject {
       case "POST executor_heartbeat":
         return this.executorHeartbeat(await parseJson(request));
       case "GET query_ownership":
-        return this.queryOwnership(new URL(request.url).searchParams);
+        return this.queryOwnership(Object.fromEntries(new URL(request.url).searchParams.entries()));
+      case "POST query_ownership":
+        return this.queryOwnership(await parseJson(request));
       case "POST report_result":
         return this.reportResult(await parseJson(request));
       case "POST contract_proposal":
@@ -302,8 +304,8 @@ export class ProjectDurableObject {
     });
   }
 
-  private async queryOwnership(searchParams: URLSearchParams): Promise<Response> {
-    const parsed = OwnershipQuerySchema.safeParse(Object.fromEntries(searchParams.entries()));
+  private async queryOwnership(input: unknown): Promise<Response> {
+    const parsed = OwnershipQuerySchema.safeParse(input);
     if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "租约归属查询无效", parsed.error.issues);
     const query = parsed.data;
     return this.withTransaction(async (_storage, state) => {

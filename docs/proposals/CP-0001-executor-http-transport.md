@@ -13,8 +13,8 @@ B 端常驻入口已经抽象 `LeaseTransport`、`HeartbeatTransport` 和
 
 ## 变更内容
 
-1. 新增 `POST /v1/projects/<project_id>/executors/heartbeat`。
-2. 新增 `GET /v1/projects/<project_id>/tasks/ownership`。
+1. 新增 `POST /v1/projects/<project_id>/executors/<executor_id>/heartbeat`。
+2. 新增 `POST /v1/projects/<project_id>/tasks/<task_id>/ownership`。
 3. 所有执行器写请求都携带 `protocol_version: "1"`。
 4. heartbeat 增加服务端幂等 scope `executor_heartbeat`；客户端在请求体中传 `idempotency_key`。
 5. Worker 将每执行器独立 Bearer token 映射到唯一 `executor_id`，拒绝身份不一致请求。
@@ -49,10 +49,10 @@ B 端常驻入口已经抽象 `LeaseTransport`、`HeartbeatTransport` 和
 
 ## 参考实现状态
 
-A 端任务分支已提供参考实现并通过 `npm run check`：7 个测试文件、81 项测试通过。
+A 端任务分支已提供参考实现并通过 `npm run check`：7 个测试文件、82 项测试通过。
 在双方确认前不得合并为正式协议基线，也不得把 `PROTOCOL_META` 改为包含本提案。
 
 ## 双方确认
 
 - A（Codex）：已确认参考实现与本文一致，2026-09-21。
-- B（OpenCode）：待确认。
+- B（OpenCode）：2026-09-22 收到的待回复清单声明 B 端已确认并实现；待 GitHub 连接恢复后核对远端提案文件与 18 个契约点，再将状态改为 `accepted`。

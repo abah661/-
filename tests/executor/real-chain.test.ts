@@ -29,6 +29,12 @@
  * | 2 | 假 agent 只注入了 `runAttempt`，**没注入常驻入口** | `DaemonDeps.agent_runner` 透传 |
  * | 3 | `spawn` 失败（`ENOENT`）时句柄永不结束 → 执行器永久死等 | `adapters/opencode.ts` 与 `core/process.ts` 增加启动失败通道，§6 锁定 |
  *
+ * 补充事实（B5 实测，供 A 端判断 P3）：本机 `opencode` **确已安装**，但它是 npm
+ * 全局安装的 `.cmd` shim（`%APPDATA%\npm\opencode.cmd`）。Node 的
+ * `spawn("opencode", …, { shell: false })` 在 Windows 上**无法解析 `.cmd`**，
+ * 因此当前 `executable: "opencode"` 的配置在真实链路里必然 ENOENT。
+ * §6 正是用这个真实形状取证的（不是模拟）。
+ *
  * ## 关于「假 agent」
  * 唯一被替换的是 **OpenCode 进程本身**（本机不调用真实模型，也不烧配额）。
  * Git、worktree、提交、推送、`ls-remote`、证据收集**全部是真的**。
@@ -266,9 +272,9 @@ function makeRealHarness(
   files: Readonly<Record<string, string>>,
   overrides: Partial<DaemonOptions> = {},
   /**
-   * agent 进程启动器。默认用一个**只写文件**的假 agent（本机不装
-   * `opencode`，也不烧模型配额）。传 `null` 表示「不注入」，
-   * 常驻入口会退回真实 `opencode` 可执行文件——这正是 §6 要测的场景。
+   * agent 进程启动器。默认用一个**只写文件**的假 agent——
+   * 真实的是工程链路（worktree/提交/推送/核对），模型调用本身不真实跑，
+   * 也不消耗配额。传 `null` 表示「不注入」，常驻入口会退回真实启动器。
    */
   agentRunner: OpenCodeProcessRunner | null = writingAgent(files),
 ): RealHarness {
@@ -754,10 +760,17 @@ describe("B5 §5 默认不删除 worktree 与在途记录", () => {
 });
 
 /* ================================================================== *
- * §6 agent 可执行文件不存在：必须**尽快**失败，不得永久挂住
+ * §6 agent 可执行文件起不来：必须**尽快**失败，不得永久挂住
+ *
+ * 用真实 `spawn` 去启动一个确定不存在的路径，取证两件事：
+ * 1. `runOpenCodeTask` 不再被永不兑现的句柄挂死（修复前会一路挂到超时）；
+ * 2. 常驻入口如实降级上报，不推送、不声称可整合。
+ *
+ * 同时这个形状就是本机的**真实情形**：`opencode` 已安装为 npm 的 `.cmd` shim，
+ * 而 `shell:false` 的 `spawn("opencode", …)` 解析不到它（实测 ENOENT）。
  * ================================================================== */
 
-describe("B5 §6 agent 可执行文件不存在（真实 spawn 一个缺失路径）", () => {
+describe("B5 §6 agent 可执行文件起不来（真实 spawn 一个不可解析的路径）", () => {
   it(
     "runOpenCodeTask 立即返回失败，而不是等满超时或抛未捕获异常",
     async () => {

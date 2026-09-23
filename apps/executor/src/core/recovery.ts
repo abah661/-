@@ -15,6 +15,44 @@ import { inspectWorktree, git } from "./worktree.js";
 import { isLeaseExpired } from "./lease.js";
 import type { Lease } from "@dac/protocol";
 
+/**
+ * 在途记录的生命周期状态（B5，评审单 P1-2）。
+ *
+ * ## 为什么需要状态而不是删除
+ * 原实现用 `save_in_flight(null)` → `rmSync` 直接把记录删掉。评审单判定这
+ * 违反清理规则：「不得把『运行完成』自动扩展为删除许可」。
+ *
+ * 现在一律**保留文件**，只推进状态。终态记录留在 `.local/` 里，
+ * 既是审计线索，也让「上次到底怎么结束的」可以被复查。
+ * 真正要清理必须走显式、已授权的动作（见 `clearInFlightRecord`）。
+ */
+export type InFlightState =
+  /** 正在执行，进程可能随时被杀 */
+  | "in_flight"
+  /** 结果已上报 */
+  | "reported"
+  /** 收到取消信号（Ctrl+C） */
+  | "skipped_aborted"
+  /** 运行期间租约失效，未推送未上报 */
+  | "skipped_lease_lost"
+  /** 上报失败（网络/服务端），已记录 */
+  | "failed_to_report"
+  /** 编排阶段抛异常 */
+  | "failed_orchestration"
+  /** 版本绑定四项不全，拒绝开工 */
+  | "refused_binding_incomplete"
+  /** 服务端确认旧租约已过期 */
+  | "abandoned_expired"
+  /** 服务端确认已重派给他人 */
+  | "abandoned_reassigned"
+  /** 服务端确认任务不存在 */
+  | "abandoned_unknown"
+  /**
+   * 重启后发现旧租约**仍归本机**，而本执行器不具备断点续跑能力。
+   * 安全停止并保留记录，等待租约自然到期或人工处理（评审单 P1-1）。
+   */
+  | "halted_still_mine";
+
 /** 本地持久化的在途任务记录（存于 .local/，忽略提交）。 */
 export interface InFlightRecord {
   task_id: string;
@@ -28,6 +66,13 @@ export interface InFlightRecord {
   completed_phases: readonly string[];
   /** 已创建的本地提交（可能未推送） */
   local_commits: readonly string[];
+  /**
+   * 生命周期状态。**可选**：B4 留下的记录没有这个字段，
+   * 读到旧记录时按 `in_flight` 处理（保守：不当作已终结）。
+   */
+  state?: InFlightState;
+  /** 状态变更时间（ISO 8601），便于排查「什么时候结束的」 */
+  state_updated_at?: string;
 }
 
 /**

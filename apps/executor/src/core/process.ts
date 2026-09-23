@@ -35,6 +35,16 @@ export interface ChildProcessHandle {
   exit_code: Promise<number | null>;
   /** 退出信号，正常退出时为 null */
   signal: Promise<NodeJS.Signals | null>;
+  /**
+   * 进程**启动失败**的错误（可执行文件不存在等）。正常启动为 `null`；
+   * 未提供该字段时视为「不会启动失败」。
+   *
+   * 与 `adapters/opencode.ts` 同一处缺陷（B5 由真实链路暴露）：
+   * spawn 失败时 Node 只发 `error`，`close` 不触发，且无监听者会被升级为
+   * 进程级未捕获异常。缺了这条通道，`runProcess` 会永久挂住，
+   * `collectEvidence` 于是永远拿不到测试证据。
+   */
+  spawn_error?: Promise<Error | null>;
 }
 
 /** 可替换的进程启动器，便于测试注入假实现。 */
@@ -43,12 +53,26 @@ export interface ProcessRunner {
 }
 
 function toHandle(child: ChildProcess): ChildProcessHandle {
+  // 必须**立刻**挂上 error 监听（见 `ChildProcessHandle.spawn_error`）。
+  const spawn_error = new Promise<Error | null>((resolve) => {
+    child.once("error", (error: Error) => resolve(error));
+  });
+
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("close", (code, sig) => resolve({ code, signal: sig }));
+  });
+
+  // 启动失败时没有进程可等：退出码与信号都按「未取得」返回，
+  // 绝不伪造 0 —— 那会把「没跑起来」冒充成正常结束。
+  const settled = Promise.race([closed, spawn_error.then(() => ({ code: null, signal: null }))]);
+
   return {
     pid: child.pid ?? null,
     stdout: child.stdout!,
     stderr: child.stderr!,
-    exit_code: new Promise((resolve) => child.once("close", (code) => resolve(code))),
-    signal: new Promise((resolve) => child.once("close", (_code, sig) => resolve(sig))),
+    exit_code: settled.then((result) => result.code),
+    signal: settled.then((result) => result.signal),
+    spawn_error,
   };
 }
 
@@ -137,6 +161,14 @@ export interface RunProcessResult {
   kill_failed: boolean;
   /** 是否因优雅停止无效而升级到了强杀（正常现象，非错误） */
   escalated_to_force: boolean;
+  /**
+   * 子进程**是否根本没启动起来**（B5 补充项）。
+   *
+   * 必须与 `exit_code: null` 区分：后者还可能是「超时后连强杀都无效」，
+   * 而 `spawn_failed: true` 明确表示「没有任何进程运行过」。
+   * 上层据此报出执行环境问题，而不是把它当成 agent 的代码失败。
+   */
+  spawn_failed: boolean;
 }
 
 export interface RunProcessOptions {
@@ -151,10 +183,38 @@ export interface RunProcessOptions {
 const DEFAULT_GRACE_MS = 5_000;
 
 /**
+ * 等待 `promise` 完成，**或**到 `ms` 毫秒后放弃等待。
+ *
+ * 返回 `true` 表示在超时前完成。定时器总会被清理——否则一个已经完成的
+ * 调用仍会留下长达 `timeout_ms` 的悬挂定时器，把进程的退出时间拖满。
+ */
+async function settledWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
  * 以固定参数数组调用子进程，并在超时后**停止整棵进程树**。
  *
- * 时钟来源可注入（`now`），使超时逻辑可在测试中确定性验证，
- * 不必依赖真实等待。
+ * ## B5 修复的真实缺陷（评审单之外的补充项）
+ * 原实现的终止升级链**无条件**先 `await sleep(timeout_ms)`，然后才判断
+ * 「进程是不是早就退出了」。也就是说：**即使子进程瞬间正常退出，也要
+ * 空等满整个超时**。在真实链路上，`collectEvidence` 每次采集测试证据都会
+ * 白等 `test_timeout_ms`（常驻入口默认 600 秒／次），每个 attempt 都如此。
+ *
+ * 这个缺陷用假进程测不出来——假实现里 `sleep` 与 `exit_code` 都是被注入的，
+ * 等待时长不影响断言。它是被 B5 的**真实子进程链路测试**逼出来的。
+ *
+ * 现在改为「退出 / 超时 谁先到听谁的」，并在超时后才走三级升级链。
  */
 export async function runProcess(
   spec: SpawnSpec,
@@ -168,69 +228,80 @@ export async function runProcess(
   let timed_out = false;
   let kill_failed = false;
   let escalated_to_force = false;
+  /** 进程是否**确实退出了**。只有它为 true 时才允许读退出码。 */
+  let exited = false;
 
-  const stdoutPromise = collectStream(handle.stdout);
-  const stderrPromise = collectStream(handle.stderr);
+  // 子进程异常收尾时 stdio 流可能以错误结束；不吞掉会变成未处理拒绝。
+  const stdoutPromise = collectStream(handle.stdout).catch(() => "");
+  const stderrPromise = collectStream(handle.stderr).catch(() => "");
+  const exitedPromise = handle.exit_code.then(() => {
+    exited = true;
+  });
+
+  // 启动失败与超时同等对待：都必须让本函数**尽快**返回。
+  // 缺了这条通道，可执行文件不存在会让 `collectEvidence` 永久挂住。
+  let spawn_error: Error | null = null;
+  const spawnFailure: Promise<void> = (
+    handle.spawn_error ?? new Promise<never>(() => undefined)
+  ).then((error) => {
+    spawn_error = error;
+  });
 
   /**
    * 终止升级流程，**必须自身可终结**。
    *
    * 分三级，每级都有明确的时间边界：
    * 1. T = timeout            → 优雅停止整棵树（SIGTERM / taskkill 不带 /F）
-   * 2. T + grace              → 强杀整棵树（SIGKILL / taskkill /F），并记 kill_failed
+   * 2. T + grace              → 强杀整棵树（SIGKILL / taskkill /F）
    * 3. T + grace + grace      → 放弃等待，按「未取得退出码」返回
    *
    * 为什么第 3 级必须有：若进程连强杀都不响应（驱动占用、僵尸态），
    * 无限 await 会让执行器永久卡死。返回一个 exit_code=null 的结果，
    * 让上层能记录并继续，远好过整套流程挂住。
    */
-  const waitForExit = async (): Promise<void> => {
+  const exitedInTime = await settledWithin(Promise.race([exitedPromise, spawnFailure]), options.timeout_ms);
+  if (!exitedInTime) {
+    timed_out = true;
     const pid = handle.pid;
-    let exited = false;
-    const exitedPromise = handle.exit_code.then(() => {
-      exited = true;
-    });
-
-    const sleep = (ms: number): Promise<void> =>
-      new Promise((resolve) => setTimeout(resolve, ms));
-
-    const escalation = async (): Promise<void> => {
-      await sleep(options.timeout_ms);
-      if (exited) return;
-      timed_out = true;
-      if (pid === null) return;
-
+    if (pid !== null) {
       // 第 1 级：优雅停止
       await killer.killTree(pid, false);
-      await Promise.race([exitedPromise, sleep(grace)]);
-      if (exited) return;
+      if (!(await settledWithin(exitedPromise, grace))) {
+        // 第 2 级：强杀。走到这里说明优雅停止无效，但强杀通常能成功，
+        // 因此只记「已升级」，尚不判定为失败。
+        escalated_to_force = true;
+        await killer.killTree(pid, true);
+        if (!(await settledWithin(exitedPromise, grace))) {
+          // 第 3 级：连强杀都无效 —— 这才是真正需要人工介入的 kill_failed。
+          kill_failed = true;
+          // 不再等待，直接往下走；exit_code 按未取得处理。
+        }
+      }
+    }
+  }
 
-      // 第 2 级：强杀。走到了这里说明优雅停止无效，但强杀通常能成功，
-      // 因此这里只记录「已升级」，尚不判定为失败。
-      escalated_to_force = true;
-      await killer.killTree(pid, true);
-      await Promise.race([exitedPromise, sleep(grace)]);
-      if (exited) return;
+  const failure = spawn_error as Error | null;
+  // 启动失败时 stdout/stderr 可能永远不结束，**不能**等它们。
+  const [stdout, stderr] =
+    failure !== null
+      ? (["", `子进程启动失败：${failure.message}`] as const)
+      : await Promise.all([stdoutPromise, stderrPromise]);
+  // 退出码只在**确认已退出**时读取。不要用 `Promise.race([exit_code, null])`
+  // 之类看似「不会挂住」的写法：那会在尚未退出时静默返回 null，
+  // 让「测试真的通过了」与「根本没拿到退出码」变得无法区分。
+  const exit_code = exited ? await handle.exit_code : null;
+  const signal = exited ? await handle.signal : null;
 
-      // 第 3 级：连强杀都无效 —— 这才是真正需要人工介入的 kill_failed。
-      kill_failed = true;
-      // 不再等待，直接返回；exit_code 按未取得处理。
-    };
-
-    await escalation();
+  return {
+    exit_code,
+    signal,
+    stdout,
+    stderr,
+    timed_out,
+    kill_failed,
+    escalated_to_force,
+    spawn_failed: failure !== null,
   };
-
-  await waitForExit();
-
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-  // 若放弃等待，则不问 exit_code（永不 resolve），按 null 处理。
-  const exit_code = (await Promise.race([
-    handle.exit_code,
-    Promise.resolve<number | null>(null),
-  ])) as number | null;
-  const signal = await Promise.race([handle.signal, Promise.resolve(null)]);
-
-  return { exit_code, signal, stdout, stderr, timed_out, kill_failed, escalated_to_force };
 }
 
 /**

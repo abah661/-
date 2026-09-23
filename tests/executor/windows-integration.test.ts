@@ -210,6 +210,60 @@ describe("真实进程树停止（Windows 重点项）", () => {
     30_000,
   );
 
+  /**
+   * B5 回归（真实链路逼出来的缺陷）。
+   *
+   * `runProcess` 原先**无条件**先 `await sleep(timeout_ms)`，再判断进程是否
+   * 早已退出。于是子进程瞬间正常结束时，调用方仍要空等满整个超时。
+   * 在真实链路上，`collectEvidence` 每次采集测试证据都会白等
+   * `test_timeout_ms`（常驻入口默认 600 秒／次）。
+   *
+   * 这条用例断言的核心不是「结果对不对」，而是**及时性**：
+   * 30 秒的超时下，一个立刻退出的进程必须在数秒内返回。
+   * 修复前这里会稳定地耗掉 30 秒。
+   */
+  it(
+    "真实进程立即退出时**立刻**返回，不空等满超时（B5 回归）",
+    async () => {
+      const started = Date.now();
+      const result = await runProcess(
+        {
+          executable: process.execPath,
+          args: ["-e", 'process.stdout.write("fast"); process.exit(0)'],
+          cwd: process.cwd(),
+        },
+        // 故意给一个很大的超时：修复前就会等这么久
+        { timeout_ms: 30_000, grace_ms: 1_000 },
+      );
+      const elapsed = Date.now() - started;
+
+      expect(result.timed_out).toBe(false);
+      expect(result.exit_code).toBe(0);
+      expect(result.stdout).toContain("fast");
+      // 留出充足余量给慢机器，但仍远小于 30 秒
+      expect(elapsed).toBeLessThan(15_000);
+    },
+    60_000,
+  );
+
+  it(
+    "真实非零退出码被如实返回（不得被静默抹成 null）",
+    async () => {
+      const result = await runProcess(
+        {
+          executable: process.execPath,
+          args: ["-e", "process.exit(7)"],
+          cwd: process.cwd(),
+        },
+        { timeout_ms: 30_000, grace_ms: 1_000 },
+      );
+
+      expect(result.timed_out).toBe(false);
+      expect(result.exit_code).toBe(7);
+    },
+    60_000,
+  );
+
   it("真实收集 stdout 与 stderr，两者不混淆", async () => {
     const result = await runProcess(
       {

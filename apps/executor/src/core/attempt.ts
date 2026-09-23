@@ -15,11 +15,16 @@
  * | 收集测试证据 | `core/evidence.ts` |
  * | 归一化结果 | `result/normalize.ts` |
  *
- * ## 三条不可违反的时序约束
+ * ## 四条不可违反的时序约束
  * 1. **续租必须先于 agent 启动**——否则 agent 跑长命令时租约会在中途过期。
- * 2. **租约丢失后不得推送、不得上报**。`onLeaseLost` 会立刻记录，
+ * 2. **租约丢失后不得提交、不得推送、不得上报**。`onLeaseLost` 会立刻记录，
  *    并且本模块在返回前复查，把 `push_skipped_due_to_lease_loss` 显式暴露。
- * 3. **只有仍持有租约时才清理 worktree**——已被重派时别人可能正在用该目录。
+ * 3. **worktree 默认不清理**。推送与远端 SHA 核对需要这个目录存在
+ *    （评审单 P0-1：原实现在推送前就把目录删了，真实推送必失败）。
+ *    是否清理由调用方在**推送与上报全部结束之后**决定。
+ * 4. **提交只能在校验全绿后发生**（评审单 P0-2）。四道门是：写入范围合规、
+ *    无敏感文件、测试证据全绿、租约仍有效。任一门未过即不提交，
+ *    由归一化层如实降级——不允许「越界文件被提交进任务分支」这种状态。
  */
 
 import { join } from "node:path";
@@ -28,9 +33,17 @@ import { LeaseGuard } from "../core/lease.js";
 import type { LeaseClock, LeaseTransport } from "../core/lease.js";
 import { Heartbeat } from "../core/heartbeat.js";
 import type { ExecutorPhase, HeartbeatTransport } from "../core/heartbeat.js";
-import { checkDiffScope, findSensitiveTouches } from "../core/diff-check.js";
+import { checkDiffScope, findSensitiveTouches, isPathAllowed } from "../core/diff-check.js";
+import {
+  buildCommitMessage,
+  createTaskCommit,
+  listStagedFiles,
+  readHeadSha,
+  stageAllChanges,
+} from "../core/commit.js";
+import type { CommitResult } from "../core/commit.js";
 import { collectEvidence } from "../core/evidence.js";
-import { git, inspectWorktree, prepareWorktree, removeWorktree } from "../core/worktree.js";
+import { inspectWorktree, prepareWorktree, removeWorktree } from "../core/worktree.js";
 import { normalizeResult } from "../result/normalize.js";
 import type { OpenCodeAdapterResult, OpenCodeProcessRunner } from "../adapters/opencode.js";
 import { runOpenCodeTask } from "../adapters/opencode.js";
@@ -43,6 +56,18 @@ import { runOpenCodeTask } from "../adapters/opencode.js";
 export interface TestCommand {
   executable: string;
   args: readonly string[];
+}
+
+/**
+ * 提交规格（B5，评审单 P0-2）。
+ *
+ * 由调用方按任务给出。**缺失即不创建提交**——`plan` / `diagnose` 这类
+ * 可能天然没有产出的任务走这条路，此时 `head_sha` 仍等于 `base_sha`，
+ * 归一化层会如实降级，而不是伪造一个空提交。
+ */
+export interface CommitSpec {
+  /** 简述，用于组成 `<TASK_ID>: <简述>`；通常是任务标题 */
+  summary: string;
 }
 
 export interface AttemptInput {
@@ -75,6 +100,11 @@ export interface AttemptInput {
   cleanup_worktree?: boolean;
   /** 证据编号前缀，形如 EVID-<TASK>-<ATTEMPT>-<序号> */
   evidence_seq?: number;
+  /**
+   * 提交规格（B5）。提供时，四道门全绿后由执行器创建提交；
+   * 未提供则不创建（见 `CommitSpec` 说明）。
+   */
+  commit_spec?: CommitSpec;
 }
 
 export interface AttemptDeps {
@@ -95,6 +125,10 @@ export interface AttemptTrace {
   sideEffectsSkipped: boolean;
   /** worktree 是否创建成功 */
   worktree_ready: boolean;
+  /** 本次是否创建了提交（含提交失败的结果），未尝试时为 null */
+  commit: CommitResult | null;
+  /** 未创建提交时的具体原因。**排障用**：能看出是四道门里的哪一道没过 */
+  commit_skipped_reason: string | null;
 }
 
 export interface AttemptOutcome {
@@ -106,6 +140,8 @@ export interface AttemptOutcome {
   worktree_path: string;
   /** 本地提交哈希（空数组表示未提交） */
   local_commits: readonly string[];
+  /** 本次创建的提交（未创建为 null） */
+  commit: CommitResult | null;
   /** 变更文件列表 */
   changed_files: readonly string[];
   /** 原始测试输出，供写入本地 artifact */
@@ -115,14 +151,6 @@ export interface AttemptOutcome {
 /* ------------------------------------------------------------------ *
  * 辅助
  * ------------------------------------------------------------------ */
-
-/** 取当前 HEAD 提交号；失败返回 null（不猜）。 */
-function headSha(repoPath: string): string | null {
-  const result = git(repoPath, ["rev-parse", "HEAD"]);
-  if (result.exit_code !== 0) return null;
-  const sha = result.stdout.trim();
-  return sha.length > 0 ? sha : null;
-}
 
 /* ------------------------------------------------------------------ *
  * 编排实现
@@ -144,6 +172,8 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     lease_lost_reason: null,
     sideEffectsSkipped: false,
     worktree_ready: false,
+    commit: null,
+    commit_skipped_reason: null,
   };
 
   const { lease } = input;
@@ -242,14 +272,81 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       rawTestOutput = `${collected.raw_stdout}\n${collected.raw_stderr}`;
     }
 
-    /* --- 6. 计算 head_sha 与本地提交 --------------------------- */
+    /* --- 6. 创建提交（B5，评审单 P0-2）------------------------- */
     setPhase("committing");
-    const head = headSha(worktreePath) ?? lease.binding.base_sha;
-    // 执行器**不自行提交**——提交由任务契约决定。
-    // 这里只记录「当前 HEAD 是否已偏离基线」，供归一化层判断
-    //（head_sha === base_sha 会被判为无产出并降级）。
-    const localCommits: readonly string[] =
-      head === lease.binding.base_sha ? [] : [head];
+
+    // 四道门 + 两项空产物保护。任一未过就**不提交**，交给归一化层如实降级；
+    // 绝不能出现「越界或敏感文件被提交进任务分支」这种事后无法解释的状态。
+    const evidenceGreen =
+      evidence !== null && evidence.exit_code === 0 && evidence.summary.failed === 0;
+    const commitSpec = input.commit_spec ?? null;
+
+    let commitBlockedReason: string | null = null;
+    if (commitSpec === null) {
+      commitBlockedReason = "调用方未提供 commit_spec";
+    } else if (sensitive.length > 0) {
+      commitBlockedReason = `触碰敏感文件：${sensitive.join(", ")}`;
+    } else if (!diff.ok) {
+      commitBlockedReason = `越界文件：${diff.violations.join(", ")}`;
+    } else if (!evidenceGreen) {
+      commitBlockedReason = "测试证据未全绿";
+    } else if (guard.lost) {
+      commitBlockedReason = "租约已失效";
+    } else if (diff.changed_files.length === 0) {
+      commitBlockedReason = "与基线无差异";
+    }
+
+    if (commitBlockedReason !== null) {
+      trace.commit_skipped_reason = commitBlockedReason;
+    } else if (commitSpec === null) {
+      // 逻辑上不可达（上面已置过 reason）。保留此分支只为让类型收窄：
+      // 走到 else 时 commitSpec 必然非空。
+      trace.commit_skipped_reason = "调用方未提供 commit_spec";
+    } else {
+      const staged = stageAllChanges(worktreePath);
+      if (!staged.ok) {
+        trace.commit_skipped_reason = `暂存失败：${staged.error ?? "unknown"}`;
+      } else {
+        // 提交前**对暂存内容再查一次**（评审单要求）：
+        // 这次查的是即将进入提交的东西，而不是工作区里可能尚未暂存的。
+        const stagedFiles = listStagedFiles(worktreePath);
+        const stagedViolations = stagedFiles.filter((path) =>
+          !isPathAllowed(path, input.write_scope),
+        );
+        const stagedSensitive = findSensitiveTouches(stagedFiles);
+
+        if (stagedViolations.length > 0) {
+          trace.commit_skipped_reason = `暂存内容越界：${stagedViolations.join(", ")}`;
+        } else if (stagedSensitive.length > 0) {
+          trace.commit_skipped_reason = `暂存内容含敏感文件：${stagedSensitive.join(", ")}`;
+        } else if (stagedFiles.length === 0) {
+          // 无待提交内容：agent 可能已自行提交。**不造空提交**，
+          // 下面用 rev-parse 读出真实 HEAD 沿用。
+          trace.commit_skipped_reason = "无待提交内容（沿用已有 HEAD）";
+        } else {
+          const message = buildCommitMessage({
+            task_id: lease.task_id,
+            attempt_id: lease.attempt_id,
+            binding: lease.binding,
+            summary: commitSpec.summary,
+          });
+          const created = createTaskCommit({
+            worktree_path: worktreePath,
+            subject: message.subject,
+            body: message.body,
+          });
+          trace.commit = created;
+          if (!created.committed) {
+            trace.commit_skipped_reason = `提交失败：${created.message ?? "unknown"}`;
+          }
+        }
+      }
+    }
+
+    // 提交号**只能来自真实的 `git rev-parse HEAD`**，不得由假体预填。
+    const head = readHeadSha(worktreePath) ?? lease.binding.base_sha;
+    // `head_sha === base_sha` 会被归一化层判为无产出并降级。
+    const localCommits: readonly string[] = head === lease.binding.base_sha ? [] : [head];
 
     /* --- 7. 归一化 -------------------------------------------- */
     setPhase("reporting");
@@ -276,6 +373,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       worktree_removed: false,
       worktree_path: worktreePath,
       local_commits: localCommits,
+      commit: trace.commit,
       changed_files: changedFiles,
       raw_test_output: rawTestOutput,
     };
@@ -286,7 +384,8 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     guard.stop();
     await renewLoop;
 
-    // 时序约束 3：只有仍持有租约时才清理
+    // 时序约束 3：默认**不清理**。推送与远端 SHA 核对需要该目录存在，
+    // 是否清理由调用方在推送与上报全部结束之后决定（评审单 P0-1）。
     if (input.cleanup_worktree && !trace.lease_lost && trace.worktree_ready) {
       try {
         removeWorktree(input.repo_root, worktreePath, true);
@@ -310,7 +409,7 @@ export function describeWorktree(worktreePath: string): {
 } {
   try {
     const status = inspectWorktree(worktreePath);
-    return { exists: true, dirty: status.dirty, head_sha: headSha(worktreePath) };
+    return { exists: true, dirty: status.dirty, head_sha: readHeadSha(worktreePath) };
   } catch {
     return { exists: false, dirty: false, head_sha: null };
   }

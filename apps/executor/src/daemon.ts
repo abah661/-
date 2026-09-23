@@ -1,5 +1,5 @@
 /**
- * 常驻执行器入口（TASK-B-EXECUTOR-B4）。
+ * 常驻执行器入口（TASK-B-EXECUTOR-B5，承接 B4 并修复评审单 6 项缺陷）。
  *
  * ## 与 `index.ts` 的关系
  * `index.ts` 是**库的导出面**（纯导出，无副作用），本文件是**可运行的入口**。
@@ -16,7 +16,7 @@
  * | 4 | 以稳定幂等键领取任务 | `HttpLeaseAcquirer`（同一次调用内复用键） |
  * | 5 | 空队列有上限轮询，**不当故障** | `max_idle_polls` |
  * | 6 | 先起独立续租与心跳，再调 OpenCode | `runAttempt` 内部时序（已由既有测试锁定） |
- * | 7 | 使用任务绑定的四项 SHA | `assertBindingComplete` |
+ * | 7 | 使用任务绑定的四项 SHA | `findBindingProblem` |
  * | 8 | 租约有效 + diff 合法 + 无敏感文件才推送 | `trace.sideEffectsSkipped` + `report.status` |
  * | 9 | 固定幂等键回报结果 | 服务端按 task/attempt/epoch 自算 |
  * | 10 | `401/403` → `blocked_auth`，不计返修 | `stop_reason: "auth_blocked"` |
@@ -25,14 +25,26 @@
  * | 13 | `Ctrl+C` → 停轮询/心跳/续租/子进程 | `signal` 透传到 agent 适配器 |
  * | 14 | 重启后先查归属再决定 | `decideRecovery` |
  *
+ * ## B5 修复的真实链路缺陷（评审单）
+ * | 缺陷 | 修法 |
+ * | --- | --- |
+ * | P0-1 推送前删 worktree | 常驻入口**始终**传 `cleanup_worktree: false`；清理推迟到推送、远端核对、上报全部结束之后，且必须显式开启 |
+ * | P0-2 不创建提交 | `runAttempt` 在四道门全绿后创建提交，`head_sha` 取自真实 `rev-parse` |
+ * | P0-3 只看推送退出码 | `gitPushBranch` push 后 `ls-remote` 核对远端 SHA，不一致即 `PUSH_REJECTED` |
+ * | P0-4 未推送仍报可整合 | `ready_for_integration` 必须以「远端 SHA 核对一致」为前提，否则降级为 `blocked_approval` |
+ * | P1-1 `still_mine` 后继续领取 | 安全停止并保留在途记录，不再进领取循环 |
+ * | P1-2 自动删除在途记录 | 改为终态标记，**从不自动删除** |
+ *
  * ## 两条不可违反的红线
  * 1. **不猜**。云端没回答的事实一律不得用本地推断替代（网络不可达就是不可达）。
- * 2. **不假装成功**。自报完成不算完成；没推送就不能说推送了。
+ * 2. **不假装成功**。自报完成不算完成；**没核对远端就不能说推送了**。
  *
  * ## 关于「不自动续跑未完成的 attempt」
- * 第 14 项要求「先查询归属，再决定继续或放弃」。B4 的实现是：**查得出来、
- * 但一律放弃**。原因是没有恢复中间 worktree 状态的能力，硬续跑会出现
- * 「两方同时改同一任务」。真正的断点续跑属 P5 范围，此处不假装实现。
+ * 第 14 项要求「先查询归属，再决定继续或放弃」。B5 的实现是：
+ * 查得出来、但**不续跑**——B5 不具备恢复中间 worktree 状态的能力，
+ * 硬续跑会出现「两方同时改同一任务」。评审单 P1-1 因此要求：
+ * `still_mine` 时必须**安全停止并保留记录**，等待租约自然到期或人工处理。
+ * 真正的断点续跑属 P5 范围，此处不假装实现。
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -40,16 +52,23 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import type { Capability, ErrorCode, ExecutorRegistration, Lease, ResultStatus, TaskNode, WriteScope } from "@dac/protocol";
-import { ERROR_POLICY } from "@dac/protocol";
+import { ERROR_POLICY, blockedStatusFor } from "@dac/protocol";
 
 import { runAttempt } from "./core/attempt.js";
 import type { AttemptDeps, AttemptInput, AttemptOutcome, TestCommand } from "./core/attempt.js";
+import type { OpenCodeProcessRunner } from "./adapters/opencode.js";
+import { readHeadSha } from "./core/commit.js";
 import { systemClock } from "./core/lease.js";
 import type { LeaseClock, LeaseTransport } from "./core/lease.js";
 import type { HeartbeatTransport } from "./core/heartbeat.js";
 import { decideRecovery } from "./core/recovery.js";
-import type { InFlightRecord, RecoveryDecision, RecoveryTransport } from "./core/recovery.js";
-import { git } from "./core/worktree.js";
+import type {
+  InFlightRecord,
+  InFlightState,
+  RecoveryDecision,
+  RecoveryTransport,
+} from "./core/recovery.js";
+import { git, removeWorktree } from "./core/worktree.js";
 import {
   HttpHeartbeatTransport,
   HttpLeaseAcquirer,
@@ -100,6 +119,15 @@ export interface DaemonOptions {
   heartbeat_interval_ms?: number;
   agent_timeout_ms?: number;
   test_timeout_ms?: number;
+  /**
+   * 是否在**推送、远端 SHA 核对、结果上报全部结束之后**清理 worktree。
+   *
+   * 默认 `false`（B5，评审单 P0-1）。B4 默认 `true`，导致 worktree 在
+   * `git push` 之前就被删掉——推送的工作目录根本不存在，真实推送必失败。
+   *
+   * 置为 `true` 也**不会**提前清理：清理点被固定在链路最末端。
+   * 按项目清理规则，删除需要准确范围与批准，所以这里默认保留。
+   */
   cleanup_worktree?: boolean;
   /** 是否在通过后推送任务分支 */
   enable_push?: boolean;
@@ -114,11 +142,22 @@ export interface DaemonOptions {
 /** 单次尝试的编排函数（可注入，便于在无 git/无进程的环境下测试）。 */
 export type AttemptRunner = (input: AttemptInput, deps: AttemptDeps) => Promise<AttemptOutcome>;
 
-/** 推送结果。 */
+/**
+ * 推送结果（B5 扩展）。
+ *
+ * 评审单 P0-3：原实现的 `pushed` 只看 `git push` 的退出码。退出码为 0
+ * **不等于**远端真的拿到了提交（推送被钩子改写、推到了别的 ref、
+ * 凭证走了错误身份……）。因此现在必须回读远端 SHA 才能说 `pushed`。
+ */
 export interface PushResult {
+  /** 仅当**远端 SHA 与本地 HEAD 逐字一致**时才为 true */
   pushed: boolean;
   error_code: ErrorCode | null;
   message: string | null;
+  /** 推送后本地 `HEAD` 的真实提交号；读不到为 null */
+  local_sha: string | null;
+  /** `git ls-remote` 读到的远端任务分支提交号；读不到为 null */
+  remote_sha: string | null;
 }
 
 export type PushFn = (input: {
@@ -137,12 +176,28 @@ export interface DaemonDeps {
   recovery_transport: RecoveryTransport;
   result_reporter: ResultReporter;
   attempt_runner?: AttemptRunner;
+  /**
+   * agent 进程启动器（B5 补充项）。
+   *
+   * 常驻入口必须能把它透传给 `runAttempt`，否则**注入不到 agent 那一层**：
+   * 编排里 `runAttempt` 会退回真实 `opencode` 可执行文件。B5 的真实链路
+   * 测试正是踩到这一点——假 agent 只注入了直接调用 `runAttempt` 的用例，
+   * 经常驻入口的用例仍在真实 `spawn opencode`（本机无此命令）。
+   */
+  agent_runner?: OpenCodeProcessRunner;
   push_branch?: PushFn;
   clock?: LeaseClock;
   /** 读取在途记录（重启恢复用）；返回 null 表示无在途 */
   load_in_flight?: () => InFlightRecord | null;
-  /** 写入/清除在途记录 */
-  save_in_flight?: (record: InFlightRecord | null) => void;
+  /**
+   * 写入在途记录。
+   *
+   * **不接受 `null`**（B5，评审单 P1-2）。B4 用 `save_in_flight(null)`
+   * 表达「删掉记录」，那是把「运行完成」自动当成删除许可。
+   * 现在结束一次 attempt 只能**推进状态**（见 `InFlightState`），
+   * 记录一律留在磁盘上；真正清理走显式动作。
+   */
+  save_in_flight?: (record: InFlightRecord) => void;
 }
 
 /** 一次 attempt 的本地记录。 */
@@ -170,7 +225,9 @@ export type DaemonStopReason =
   | "lease_lost"
   | "aborted"
   | "max_attempts_reached"
-  | "halt_offline_on_recovery";
+  | "halt_offline_on_recovery"
+  /** 重启后发现旧租约仍归本机，安全停止并保留记录（评审单 P1-1） */
+  | "halt_still_mine";
 
 export interface DaemonReport {
   stop_reason: DaemonStopReason;
@@ -211,6 +268,10 @@ export function buildTaskPrompt(task: TaskNode, lease: Lease): string {
     "",
     "要求：只修改允许范围内的文件；不要改动验收规则或 CI 配置；",
     "完成后在仓库根目录运行项目验证命令，并确保全绿。",
+    // B5（评审单 P0-2）：提交与推送由执行器统一负责。让 agent 也提交会造成
+    // 「谁的提交算数」二义，所以这里明确禁止，执行器只认自己 `rev-parse` 读到的 HEAD。
+    "不要自行执行 git commit 或 git push；改动留在工作区即可，",
+    "提交与推送由执行器在校验（写入范围、敏感文件、测试证据、租约）通过后统一完成。",
   );
   return lines.join("\n");
 }
@@ -219,11 +280,26 @@ export function buildTaskPrompt(task: TaskNode, lease: Lease): string {
  * 在途记录（重启恢复）
  * ------------------------------------------------------------------ */
 
-/** 在途记录的最小实现：写在 `.local/` 下（该目录已被 .gitignore 忽略）。 */
+/** 在途记录路径。导出以便测试与人工排查能指向同一个文件。 */
+export function inFlightPath(repoRoot: string): string {
+  return join(repoRoot, ".local", "executor-in-flight.json");
+}
+
+/**
+ * 在途记录的最小实现：写在 `.local/` 下（该目录已被 .gitignore 忽略）。
+ *
+ * ## B5 的语义变化（评审单 P1-2）
+ * B4 的 `save_in_flight(null)` 会 `rmSync` 把文件删掉。评审单判定这违反清理
+ * 规则：「不得把『运行完成』自动扩展为删除许可」。现在这里**没有任何删除路径**——
+ * 结束一次 attempt 只能推进 `state` 字段，文件始终留着，成为可复查的审计线索。
+ *
+ * 真正要清理必须调用 {@link clearInFlightRecord}，那是一个**显式动作**，
+ * 常驻入口在任何自动路径里都不会调用它。
+ */
 export function fileInFlightStore(
   repoRoot: string,
 ): Pick<DaemonDeps, "load_in_flight" | "save_in_flight"> {
-  const file = join(repoRoot, ".local", "executor-in-flight.json");
+  const file = inFlightPath(repoRoot);
   return {
     load_in_flight: (): InFlightRecord | null => {
       if (!existsSync(file)) return null;
@@ -238,15 +314,25 @@ export function fileInFlightStore(
         return null;
       }
     },
-    save_in_flight: (record: InFlightRecord | null): void => {
-      if (record === null) {
-        if (existsSync(file)) rmSync(file, { force: true });
-        return;
-      }
+    save_in_flight: (record: InFlightRecord): void => {
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     },
   };
+}
+
+/**
+ * 显式清理在途记录。
+ *
+ * **这不是常驻入口的自动路径**。按项目清理规则，删除需要准确范围与批准，
+ * 因此本函数只应由「人工确认后执行的一次性动作」调用。
+ * 常驻入口在任何情况下都不会调用它（这是评审单 P1-2 的核心要求）。
+ */
+export function clearInFlightRecord(repoRoot: string): { removed: boolean; path: string } {
+  const file = inFlightPath(repoRoot);
+  if (!existsSync(file)) return { removed: false, path: file };
+  rmSync(file, { force: true });
+  return { removed: true, path: file };
 }
 
 /* ------------------------------------------------------------------ *
@@ -254,7 +340,45 @@ export function fileInFlightStore(
  * ------------------------------------------------------------------ */
 
 /**
- * 推送任务分支。
+ * 读取远端某个分支的提交号。
+ *
+ * ## 两个必须记住的细节
+ * 1. `git ls-remote` 的输出是**制表符分隔**（`<sha>\t<ref>`）。必须按
+ *    `/\s+/` 切分——按单个空格切会让 `sha\tref` 粘成一个字段，比较永远失败。
+ * 2. 远端没有该分支时返回 `sha: null, error: null`——**这是正常情况**
+ *    （首次推送前就该是这样），不是错误。
+ */
+export function readRemoteBranchSha(
+  repoPath: string,
+  remote: string,
+  branch: string,
+): { sha: string | null; error: string | null } {
+  const ref = `refs/heads/${branch}`;
+  const result = git(repoPath, ["ls-remote", remote, ref]);
+  if (result.exit_code !== 0) {
+    return {
+      sha: null,
+      error: result.stderr.trim().slice(0, 500) || `git ls-remote 退出码 ${result.exit_code}`,
+    };
+  }
+  for (const line of result.stdout.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const parts = line.split(/\s+/).filter((part) => part.length > 0);
+    if (parts.length >= 2 && parts[1] === ref) return { sha: parts[0] ?? null, error: null };
+  }
+  return { sha: null, error: null };
+}
+
+/**
+ * 推送任务分支，并**核对远端结果**。
+ *
+ * 评审单 P0-3：退出码为 0 **不等于**远端真的拿到了提交。因此本函数在推送后：
+ * 1. 读本地 `HEAD`；
+ * 2. 用结构化参数执行 `git ls-remote <remote> refs/heads/<branch>`；
+ * 3. **仅在两者逐字一致时**才返回 `pushed: true`；否则一律 `PUSH_REJECTED`。
+ *
+ * 不一致或无法核对时**绝不**返回成功——否则会向上报出「可供整合」，
+ * 而那个提交可能只存在于本机，A 端根本取不到。
  *
  * 用**参数数组**调用 git，不经 shell —— 分支名与远端名都来自结构化数据，
  * 即使含有特殊字符也不会被解释为命令。
@@ -264,18 +388,69 @@ export function gitPushBranch(input: {
   branch: string;
   remote: string;
 }): PushResult {
-  const result = git(input.worktree_path, [
+  const push = git(input.worktree_path, [
     "push",
     input.remote,
     `refs/heads/${input.branch}:refs/heads/${input.branch}`,
   ]);
-  if (result.exit_code === 0) {
-    return { pushed: true, error_code: null, message: null };
+  if (push.exit_code !== 0) {
+    return {
+      pushed: false,
+      error_code: "PUSH_REJECTED",
+      message: push.stderr.trim().slice(0, 500) || "git push 失败",
+      local_sha: null,
+      remote_sha: null,
+    };
   }
+
+  const localSha = readHeadSha(input.worktree_path);
+  if (localSha === null) {
+    return {
+      pushed: false,
+      error_code: "PUSH_REJECTED",
+      message: "推送后无法读取本地 HEAD，无法核对远端",
+      local_sha: null,
+      remote_sha: null,
+    };
+  }
+
+  const remote = readRemoteBranchSha(input.worktree_path, input.remote, input.branch);
+  if (remote.error !== null) {
+    return {
+      pushed: false,
+      error_code: "PUSH_REJECTED",
+      message: `无法核对远端：${remote.error}`,
+      local_sha: localSha,
+      remote_sha: null,
+    };
+  }
+  if (remote.sha === null) {
+    return {
+      pushed: false,
+      error_code: "PUSH_REJECTED",
+      message: `远端不存在 refs/heads/${input.branch}`,
+      local_sha: localSha,
+      remote_sha: null,
+    };
+  }
+  if (remote.sha !== localSha) {
+    return {
+      pushed: false,
+      error_code: "PUSH_REJECTED",
+      message:
+        `远端 SHA 与本地 HEAD 不一致（本地 ${localSha.slice(0, 10)} / ` +
+        `远端 ${remote.sha.slice(0, 10)}）`,
+      local_sha: localSha,
+      remote_sha: remote.sha,
+    };
+  }
+
   return {
-    pushed: false,
-    error_code: "PUSH_REJECTED",
-    message: result.stderr.trim().slice(0, 500) || "git push 失败",
+    pushed: true,
+    error_code: null,
+    message: null,
+    local_sha: localSha,
+    remote_sha: remote.sha,
   };
 }
 
@@ -381,6 +556,47 @@ export async function runDaemon(
 
   const aborted = (): boolean => options.signal?.aborted === true;
 
+  /**
+   * 推进在途记录的状态（B5，评审单 P1-2）。
+   *
+   * **只写不删**。`save_in_flight` 现在不接受 `null`，所以这里唯一能做的事
+   * 就是把 `state` 往前推一格，并把变更时间记下来。
+   * 文件始终留在 `.local/executor-in-flight.json`，成为可复查的审计线索。
+   */
+  const markInFlight = (record: InFlightRecord, state: InFlightState): void => {
+    try {
+      deps.save_in_flight?.({
+        ...record,
+        state,
+        state_updated_at: new Date(clock.now()).toISOString(),
+      });
+    } catch {
+      // 记录写不进去不应掩盖主流程结果；但必须留痕。
+      log(`[in-flight] 状态写入失败（state=${state}）：继续，不影响本次结果`);
+    }
+  };
+
+  /**
+   * worktree 的**唯一**清理点（评审单 P0-1）。
+   *
+   * 位置刻意放在「提交 → 推送 → 远端 SHA 核对 → 上报」全部结束之后：
+   * B4 让 `runAttempt` 在 `finally` 里就把目录删了，而推送发生在其后，
+   * 于是 `git push` 的工作目录根本不存在——真实推送必失败。
+   *
+   * 默认**不清理**（`options.cleanup_worktree` 默认 `false`）。
+   * 即使显式开启，清理也只发生在这一个位置。
+   */
+  const finalizeWorktree = (worktreePath: string, attemptId: string): void => {
+    if (options.cleanup_worktree !== true) return;
+    if (!existsSync(worktreePath)) return;
+    const removed = removeWorktree(options.repo_root, worktreePath, true);
+    log(
+      removed
+        ? `[worktree] 已按显式配置清理 ${attemptId} 的 worktree（清理点在推送与上报之后）`
+        : `[worktree] 清理 ${attemptId} 的 worktree 失败：保留，需人工处理`,
+    );
+  };
+
   /* --- 2. 健康检查 ------------------------------------------- */
   const health = await deps.health();
   if (!health.ok) {
@@ -430,28 +646,47 @@ export async function runDaemon(
     switch (decision.kind) {
       case "halt_offline":
         // 第 12 项：网络不可达时**不猜**任务仍归自己。
-        log(`[recovery] 归属查询不可达（${decision.error}）：停止新操作`);
+        // 记录**原样保留**——还没拿到云端结论，不得推进状态。
+        log(`[recovery] 归属查询不可达（${decision.error}）：停止新操作，保留在途记录`);
         report.stop_reason = "halt_offline_on_recovery";
         return report;
+
       case "resume":
-        // 见文件头说明：能查出仍归我，但 B4 不具备断点续跑能力，
-        // 因此显式放弃并清记录，而不是假装续跑。
+        // 评审单 P1-1：服务端确认旧租约**仍归本机**，而 B5 不具备断点续跑能力。
+        // 此时必须**安全停止**：
+        //   - 不领取新任务：旧租约还在我手上，再领一份会让同一执行器同时持两份租约，
+        //     旧 attempt 就永远没人收尾；
+        //   - 不推送、不上报：本地状态与云端不一致，构造不出正确的报告；
+        //   - 不删除记录：那是把「停止」当成删除许可。
+        // 等旧租约自然到期，或人工处理后，再重启本进程。
+        markInFlight(inFlight, "halted_still_mine");
         log(
           `[recovery] 在途 attempt 仍归本机（from_phase=${decision.from_phase ?? "none"}）：` +
-            "B4 不支持断点续跑，放弃本地 attempt 并清理记录",
+            "B5 不具备断点续跑能力，安全停止并保留在途记录。" +
+            "等待租约到期或人工处理后重启；本次不领取新任务、不推送、不上报",
+        );
+        report.stop_reason = "halt_still_mine";
+        return report;
+
+      case "abandon_expired":
+        // 服务端已确认过期：本机不再是持有者，可以继续领取新任务。
+        markInFlight(inFlight, "abandoned_expired");
+        log("[recovery] 在途 attempt 租约已过期：放弃，交由协调器重派（记录保留为终态）");
+        break;
+
+      case "abandon_reassigned":
+        markInFlight(inFlight, "abandoned_reassigned");
+        log(
+          `[recovery] 在途 attempt 已被重派给 ${decision.to_executor}：` +
+            "本地放手，不推送不上报（记录保留为终态）",
         );
         break;
-      case "abandon_expired":
-        log("[recovery] 在途 attempt 租约已过期：放弃，交由协调器重派");
-        break;
-      case "abandon_reassigned":
-        log(`[recovery] 在途 attempt 已被重派给 ${decision.to_executor}：本地放手，不推送不上报`);
-        break;
+
       case "abandon_unknown":
-        log("[recovery] 在途 attempt 在云端不存在：清理本地记录");
+        markInFlight(inFlight, "abandoned_unknown");
+        log("[recovery] 在途 attempt 在云端不存在：记录保留为终态");
         break;
     }
-    deps.save_in_flight?.(null);
   }
 
   /* --- 5/4. 领取循环 ------------------------------------------ */
@@ -541,7 +776,7 @@ export async function runDaemon(
 
     /* --- 在途记录：供下次重启查询归属 ------------------------ */
     const worktreePath = join(options.worktree_root, lease.attempt_id);
-    deps.save_in_flight?.({
+    const flightRecord: InFlightRecord = {
       task_id: lease.task_id,
       attempt_id: lease.attempt_id,
       executor_id: lease.executor_id,
@@ -550,7 +785,9 @@ export async function runDaemon(
       worktree_path: worktreePath,
       completed_phases: [],
       local_commits: [],
-    });
+      state: "in_flight",
+    };
+    markInFlight(flightRecord, "in_flight");
 
     /* --- 6. 编排一次 attempt（续租/心跳在内部先于 agent 启动）- */
     const promptBuilder = options.prompt_for_task ?? buildTaskPrompt;
@@ -562,7 +799,14 @@ export async function runDaemon(
       model: options.model,
       write_scope: task.write_scope as WriteScope,
       heartbeat_interval_ms: options.heartbeat_interval_ms ?? 15_000,
-      cleanup_worktree: options.cleanup_worktree ?? true,
+      // 评审单 P0-1：**始终**不在编排内部清理。worktree 必须活到
+      // 「提交 → 推送 → 远端 SHA 核对 → 上报」全部结束之后；
+      // B4 在这里传的是 `options.cleanup_worktree ?? true`，
+      // 于是 worktree 在 `git push` 之前就没了，真实推送必失败。
+      // 是否清理改由链路最末端的 `finalizeWorktree` 决定（默认不清理）。
+      cleanup_worktree: false,
+      // 评审单 P0-2：提交由执行器创建，简述取任务标题。
+      commit_spec: { summary: task.title },
       ...(options.test_command !== undefined ? { test_command: options.test_command } : {}),
       ...(options.agent_timeout_ms !== undefined
         ? { agent_timeout_ms: options.agent_timeout_ms }
@@ -577,6 +821,7 @@ export async function runDaemon(
         lease_transport: deps.lease_transport,
         heartbeat_transport: deps.heartbeat_transport,
         clock,
+        ...(deps.agent_runner !== undefined ? { agent_runner: deps.agent_runner } : {}),
       });
     } catch (error) {
       log(`[attempt] 编排异常（${errorCodeOf(error)}）：记录并继续`);
@@ -589,7 +834,7 @@ export async function runDaemon(
         pushed: false,
         error_code: errorCodeOf(error),
       });
-      deps.save_in_flight?.(null);
+      markInFlight(flightRecord, "failed_orchestration");
       continue;
     }
 
@@ -610,7 +855,7 @@ export async function runDaemon(
         pushed: false,
         error_code: cancelled ? null : "LEASE_EPOCH_STALE",
       });
-      deps.save_in_flight?.(null);
+      markInFlight(flightRecord, cancelled ? "skipped_aborted" : "skipped_lease_lost");
       if (cancelled) {
         report.stop_reason = "aborted";
         break;
@@ -623,29 +868,58 @@ export async function runDaemon(
       continue;
     }
 
-    /* --- 8. 仅在「通过 + 有推送能力 + 明确开启推送」时推送 ---- */
+    /* --- 8. 推送与「可整合」的前置条件（评审单 P0-3 / P0-4）--- */
     let pushed = false;
     let reportToSend = outcome.report;
     const wouldPush = options.enable_push === true && hasPushCapability;
-    if (wouldPush && outcome.report.status === "ready_for_integration") {
-      const push = deps.push_branch?.({
-        worktree_path: outcome.worktree_path,
-        branch: `task/${lease.task_id}/${lease.attempt_id}`,
-        remote: options.remote ?? "origin",
-      }) ?? { pushed: false, error_code: "PUSH_REJECTED" as ErrorCode, message: "未配置推送实现" };
-      pushed = push.pushed;
-      if (pushed) {
-        log(`[push] 已推送 task/${lease.task_id}/${lease.attempt_id}`);
-      } else {
-        // 推不上去就不能声称「可供整合」——head_sha 不在远端，
-        // 协调器整合时会找不到提交。如实降级。
-        log(`[push] 推送失败（${push.error_code ?? "PUSH_REJECTED"}）：报告降级为 failed`);
+
+    if (reportToSend.status === "ready_for_integration") {
+      if (!wouldPush) {
+        // 评审单 P0-4：**未推送不得声称可整合**。
+        // B4 在这里直接跳过推送、原样上报 ready_for_integration，协调器于是
+        // 以为有个提交可供整合——而那个提交只存在于本机，A 端根本取不到。
+        // 现在明确降级为「需要批准」，并按协议给出 UNAUTHORIZED_OPERATION。
+        log(
+          "[push] 无推送授权（未开启 enable_push 或未声明 git_push 能力）：" +
+            "不得声称可供整合 → 降级为 blocked_approval",
+        );
         reportToSend = {
-          ...outcome.report,
-          status: "failed",
-          error_code: push.error_code ?? "PUSH_REJECTED",
-          note: push.message,
+          ...reportToSend,
+          status: blockedStatusFor("UNAUTHORIZED_OPERATION") as ResultStatus,
+          error_code: "UNAUTHORIZED_OPERATION",
+          note: "本地提交未推送，远端不存在对应提交，无可整合成果",
         };
+      } else {
+        const branch = `task/${lease.task_id}/${lease.attempt_id}`;
+        const push = deps.push_branch?.({
+          worktree_path: outcome.worktree_path,
+          branch,
+          remote: options.remote ?? "origin",
+        }) ?? {
+          pushed: false,
+          error_code: "PUSH_REJECTED" as ErrorCode,
+          message: "未配置推送实现",
+          local_sha: null,
+          remote_sha: null,
+        };
+        pushed = push.pushed;
+        if (pushed) {
+          // 只有「远端 SHA 与本地 HEAD 逐字一致」才会走到这里（P0-3）
+          log(
+            `[push] 已推送并核对远端 ${branch}` +
+              `（远端 ${(push.remote_sha ?? "").slice(0, 10)}）`,
+          );
+        } else {
+          // 推不上去、或推了但核对不一致，都不能声称「可供整合」——
+          // head_sha 不在远端，协调器整合时找不到提交。如实降级。
+          log(`[push] 推送未通过核对（${push.error_code ?? "PUSH_REJECTED"}）：报告降级为 failed`);
+          reportToSend = {
+            ...reportToSend,
+            status: "failed",
+            error_code: push.error_code ?? "PUSH_REJECTED",
+            note: push.message,
+          };
+        }
       }
     }
 
@@ -662,6 +936,7 @@ export async function runDaemon(
         error_code: null,
       });
       log(`[report] 已上报 ${task.task_id} / ${lease.attempt_id}：${reportToSend.status}`);
+      markInFlight(flightRecord, "reported");
     } catch (error) {
       const status = httpStatusOf(error);
       attemptRecords.push({
@@ -673,23 +948,23 @@ export async function runDaemon(
         pushed,
         error_code: errorCodeOf(error),
       });
+      markInFlight(flightRecord, "failed_to_report");
       if (status === 401 || status === 403) {
         log(`[report] 认证失效（HTTP ${status}）：转 blocked_auth，停止`);
-        deps.save_in_flight?.(null);
         report.stop_reason = "auth_blocked";
         break;
       }
       if (status === 409) {
         // 该 attempt 已作废（epoch 过期/被顶替）：结果不能算数，停止。
         log("[report] 上报被拒（409，租赁已变更）：停止，不伪造成功");
-        deps.save_in_flight?.(null);
         report.stop_reason = "lease_lost";
         break;
       }
       log(`[report] 上报失败（HTTP ${status ?? "无"} / ${errorCodeOf(error)}）：记录并继续`);
     }
 
-    deps.save_in_flight?.(null);
+    // 清理点固定在链路最末端：提交、推送、远端核对、上报都已结束。
+    finalizeWorktree(outcome.worktree_path, lease.attempt_id);
   }
 
   return report;

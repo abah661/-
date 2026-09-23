@@ -138,7 +138,14 @@ export function checkDiffScope(input: DiffCheckInput): DiffCheckResult {
   };
 }
 
-/** 是否触碰了敏感文件（错误码 SENSITIVE_FILE_DETECTED，需授权介入）。 */
+/**
+ * 是否触碰了敏感文件（错误码 SENSITIVE_FILE_DETECTED，需授权介入）。
+ *
+ * B5 补充了**凭据容器**类扩展名（`.pfx` / `.p12` / `.p7m`）。评审单 P0-2 要求
+ * 「不得提交范围外或敏感文件」，而这三类恰恰是本项目 Token 交接会用到的格式
+ * （见交接单 §6：`.cer` → `.p7m`）。它们一旦出现在提交里就是凭据泄露，
+ * 因此宁可在这里多拦一层，也不依赖写入范围声明去挡。
+ */
 export const SENSITIVE_PATH_PATTERNS: readonly string[] = [
   "**/.env",
   "**/.env.*",
@@ -148,6 +155,10 @@ export const SENSITIVE_PATH_PATTERNS: readonly string[] = [
   "**/id_rsa*",
   "**/credentials.json",
   "**/.credentials.json",
+  // 凭据容器（B5 新增）
+  "**/*.pfx",
+  "**/*.p12",
+  "**/*.p7m",
 ];
 
 export function findSensitiveTouches(changedFiles: readonly string[]): readonly string[] {

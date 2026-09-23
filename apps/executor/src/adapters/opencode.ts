@@ -87,13 +87,34 @@ export interface OpenCodeProcess {
   stderr: AsyncIterable<Uint8Array | string>;
   exit_code: Promise<number | null>;
   kill(signal?: NodeJS.Signals): void;
+  /**
+   * 进程**启动失败**的错误（例如可执行文件不在 PATH 上的 `ENOENT`）。
+   * 正常启动时为 `null`，未提供该字段时视为「不会启动失败」。
+   *
+   * ## 为什么必须有这个字段（B5 真实链路测试暴露的缺陷）
+   * 可执行文件不存在时，Node 只在子进程上发出 `error` 事件：
+   * `close` **不会**触发（因此 `exit_code` 永不兑现），`stdout` / `stderr`
+   * 也不会正常结束（`for await` 永久挂起），并且没有 `error` 监听者时
+   * 该错误会升级为**进程级未捕获异常**。
+   *
+   * 三者叠加的结果是：`opencode` 未安装时执行器**永久死等**，
+   * 既不返回失败也不上报，租约白白耗尽。因此启动失败必须是一条
+   * 显式的、可等待的通道，而不是靠「等 close」来碰运气。
+   */
+  spawn_error?: Promise<Error | null>;
 }
 
 export interface OpenCodeProcessRunner {
   start(executable: string, args: readonly string[], cwd: string): OpenCodeProcess;
 }
 
-class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
+/**
+ * 真实进程启动器。
+ *
+ * 导出是为了让集成测试能构造「可执行文件不存在」这一确定场景
+ * （B5 真实链路测试需要真实 spawn 一个不存在的路径，而不是模拟）。
+ */
+export class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
   start(executable: string, args: readonly string[], cwd: string): OpenCodeProcess {
     const child: ChildProcess = spawn(executable, [...args], {
       cwd,
@@ -102,11 +123,31 @@ class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    // 必须**立刻**挂上 error 监听：spawn 失败是异步抛出的，
+    // 迟一步就会变成未捕获异常并杀掉整个执行器进程。
+    const spawn_error = new Promise<Error | null>((resolve) => {
+      child.once("error", (error: Error) => resolve(error));
+    });
+
+    const closed = new Promise<number | null>((resolve) =>
+      child.once("close", (code) => resolve(code)),
+    );
+
     return {
       stdout: child.stdout!,
       stderr: child.stderr!,
-      exit_code: new Promise((resolve) => child.once("close", (code) => resolve(code))),
-      kill: (signal = "SIGTERM") => child.kill(signal),
+      // 启动失败时没有进程可等，退出码按「未取得」返回 null。
+      // 绝不在这里伪造 0 —— 那会让上层把「没跑起来」当成正常结束。
+      exit_code: Promise.race([closed, spawn_error.then(() => null)]),
+      kill: (signal = "SIGTERM") => {
+        try {
+          child.kill(signal);
+        } catch {
+          // 启动失败时没有可终止的进程；终止动作本身不应抛出。
+        }
+      },
+      spawn_error,
     };
   }
 }
@@ -397,13 +438,25 @@ export async function runOpenCodeTask(
 
   // 收集输出但不无限等待退出：超时后即使进程不理会终止信号，
   // 也必须让本函数返回，否则整套执行流程会卡死。
-  const stdoutPromise = collect(handle.stdout);
-  const stderrPromise = collect(handle.stderr);
+  //
+  // `catch` 不是装饰：子进程异常退出时 stdio 流可能以错误收尾，
+  // 未捕获的读取错误会变成未处理拒绝。
+  const stdoutPromise = collect(handle.stdout).catch(() => "");
+  const stderrPromise = collect(handle.stderr).catch(() => "");
   const exitPromise = handle.exit_code;
 
   let exited = false;
   const exitedPromise = exitPromise.then(() => {
     exited = true;
+  });
+
+  // 启动失败与超时同等对待：都必须让本函数**尽快**返回。
+  // 没有这个通道时，`opencode` 不在 PATH 上会让这里永久挂起。
+  let spawn_error: Error | null = null;
+  const spawnFailure: Promise<void> = (
+    handle.spawn_error ?? new Promise<never>(() => undefined)
+  ).then((error) => {
+    spawn_error = error;
   });
 
   const killTimer = setTimeout(() => {
@@ -422,17 +475,25 @@ export async function runOpenCodeTask(
 
   await Promise.race([
     exitedPromise,
+    spawnFailure,
     new Promise<void>((resolve) => setTimeout(resolve, timeout + KILL_GRACE_MS)),
   ]);
   clearTimeout(killTimer);
   input.signal?.removeEventListener("abort", onAbort);
-  if (!exited) {
+
+  const failure = spawn_error as Error | null;
+  if (failure === null && !exited) {
     // 仍未退出：认定超时，并在放弃前再补一次强杀。
     timed_out = true;
     handle.kill("SIGKILL");
   }
 
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+  // 启动失败时 stdout / stderr 可能永远不结束，**不能**等它们，
+  // 否则上面刚修好的「尽快返回」会在这里重新挂住。
+  const [stdout, stderr] =
+    failure !== null
+      ? (["", `子进程启动失败：${failure.message}`] as const)
+      : await Promise.all([stdoutPromise, stderrPromise]);
   const exit_code = exited ? await exitPromise : null;
 
   const parsed = parseOpenCodeEvents(stdout);
@@ -444,7 +505,12 @@ export async function runOpenCodeTask(
   let status: OpenCodeAdapterStatus = "completed";
   let error_code: ErrorCode | null = null;
 
-  if (timed_out) {
+  if (failure !== null) {
+    // 进程根本没起来 —— 不是「agent 干得不好」，而是执行环境缺少
+    // 可执行文件。语义上与 `runner.start` 同步抛错的分支保持一致。
+    status = classified?.status ?? "failed";
+    error_code = classified?.error_code ?? "INTERNAL_ERROR";
+  } else if (timed_out) {
     status = "failed";
     error_code = "AGENT_TIMEOUT";
   } else if (classified) {

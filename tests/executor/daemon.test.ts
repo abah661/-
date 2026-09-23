@@ -1,5 +1,5 @@
 /**
- * 常驻执行器入口（B4）测试。
+ * 常驻执行器入口测试（B4 建立，B5 按评审单扩展）。
  *
  * 覆盖交接单 §5 要求的 10 项：
  * 1. 启动配置完整/缺失
@@ -13,12 +13,22 @@
  * 9. 日志中不出现 Bearer Token
  * 10. Windows 中文和空格路径不退化
  *
+ * B5 按评审单新增/改写的部分（以 `P0-x` / `P1-x` 标注）：
+ * - P0-1 worktree 保留到推送与上报之后
+ * - P0-2 执行器创建提交
+ * - P0-3 推送后核对远端 SHA（`readRemoteBranchSha` / `gitPushBranch`）
+ * - P0-4 未推送不得 `ready_for_integration`
+ * - P1-1 `still_mine` 安全停止并保留记录
+ * - P1-2 在途记录不自动删除
+ *
  * 说明：`attempt` 内部的时序（**续租循环必须先于 agent 启动**）由
  * `tests/executor/attempt.test.ts` 用真实 `runAttempt` 覆盖；
  * 本文件覆盖的是**跨边界**顺序与各条错误路径的分支结果。
+ * 真实临时仓库 + 真实 worktree + 本地 bare remote 的端到端链路由
+ * `tests/executor/real-chain.test.ts` 覆盖（评审单「B5 必须增加的真实测试」）。
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -41,8 +51,10 @@ import { CoordinatorClient, CoordinatorHttpError, MissingConfigError } from "../
 import type { ExecutorConfig } from "../../apps/executor/src/transport/http.js";
 import {
   ENV_KEYS,
+  clearInFlightRecord,
   fileInFlightStore,
   findBindingProblem,
+  inFlightPath,
   isBlockedCode,
   loadDaemonOptions,
   runDaemon,
@@ -90,6 +102,15 @@ const TASK: TaskNode = {
 
 const TOKEN = "s3cr3t-bearer-token-value";
 
+/**
+ * 假推送返回的 SHA。
+ *
+ * B5 起 `pushed: true` 的语义变成「**远端 SHA 与本地 HEAD 逐字一致**」
+ * （评审单 P0-3），所以假实现也必须给出两端一致的值，否则就不是一个
+ * 合法的「推送成功」。
+ */
+const FAKE_PUSH_SHA = "e".repeat(40);
+
 const CONFIG: ExecutorConfig = {
   base_url: "https://coordinator.example.invalid",
   project_id: "PROJECT-TEST",
@@ -133,15 +154,18 @@ function makeOutcome(overrides: Partial<AttemptOutcome> = {}): AttemptOutcome {
   return {
     report: makeReport(),
     trace: {
-      phases: ["preparing_worktree", "running_agent", "reporting"],
+      phases: ["preparing_worktree", "running_agent", "committing", "reporting"],
       lease_lost: false,
       lease_lost_reason: null,
       sideEffectsSkipped: false,
       worktree_ready: true,
+      commit: { committed: true, sha: SHA_B, error_code: null, message: null },
+      commit_skipped_reason: null,
     },
     worktree_removed: true,
     worktree_path: "/repo/.local/worktrees/TASK-0001-A1",
     local_commits: [SHA_B],
+    commit: { committed: true, sha: SHA_B, error_code: null, message: null },
     changed_files: ["apps/executor/src/daemon.ts"],
     raw_test_output: "Tests 10 passed",
     ...overrides,
@@ -178,7 +202,13 @@ interface Harness {
   acquireCalls: () => number;
   reports: ResultReport[];
   pushes: Array<{ worktree_path: string; branch: string; remote: string }>;
-  saved: Array<InFlightRecord | null>;
+  /**
+   * 在途记录的写入历史（B5：不再有 `null` —— 删除路径已从存储层移除）。
+   *
+   * 评审单 P1-2 要求「默认保留历史/终态记录」，所以这里断言的是
+   * **状态的推进**，而不再是「记录被清掉」。
+   */
+  saved: InFlightRecord[];
   attemptInputs: AttemptInput[];
   attemptDeps: AttemptDeps[];
 }
@@ -198,7 +228,7 @@ function makeHarness(config: {
   const logs: string[] = [];
   const reports: ResultReport[] = [];
   const pushes: Array<{ worktree_path: string; branch: string; remote: string }> = [];
-  const saved: Array<InFlightRecord | null> = [];
+  const saved: InFlightRecord[] = [];
   const attemptInputs: AttemptInput[] = [];
   const attemptDeps: AttemptDeps[] = [];
   const script = config.script ?? [{ kind: "empty" }];
@@ -278,7 +308,15 @@ function makeHarness(config: {
       push_branch: (input) => {
         events.push("push");
         pushes.push(input);
-        return config.pushResult ?? { pushed: true, error_code: null, message: null };
+        return (
+          config.pushResult ?? {
+            pushed: true,
+            error_code: null,
+            message: null,
+            local_sha: FAKE_PUSH_SHA,
+            remote_sha: FAKE_PUSH_SHA,
+          }
+        );
       },
       load_in_flight: () => config.inFlight ?? null,
       save_in_flight: (record) => {
@@ -553,6 +591,35 @@ describe("B4 §5 续租/心跳/执行/上报的顺序", () => {
     expect(h.attemptDeps[0]!.heartbeat_transport).toBe(h.deps.heartbeat_transport);
   });
 
+  /** 评审单 P0-1 / P0-2：常驻入口传给编排器的两个关键参数。 */
+  it("常驻入口：**始终**不清理 worktree，并把提交规格交给编排器（P0-1 / P0-2）", async () => {
+    const h = makeHarness({ script: [{ kind: "leased", task: TASK, lease: LEASE }] });
+    await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
+    const input = h.attemptInputs[0]!;
+    // P0-1：绝不在这里清理——worktree 要活到推送与远端核对之后。
+    // 即使调用方没传 cleanup_worktree（默认 undefined），也必须是 false。
+    expect(input.cleanup_worktree).toBe(false);
+    // P0-2：提交规格必须交给编排器，否则不会创建任何提交
+    expect(input.commit_spec).toEqual({ summary: TASK.title });
+  });
+
+  it("推送未通过远端核对 → 上报降级为 failed，不得声称可整合（P0-3）", async () => {
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      pushResult: {
+        pushed: false,
+        error_code: "PUSH_REJECTED",
+        message: "远端 SHA 与本地 HEAD 不一致",
+        local_sha: SHA_A,
+        remote_sha: SHA_B,
+      },
+    });
+    await runDaemon(withLog(makeOptions({ max_idle_polls: 1, enable_push: true }), h.logs), h.deps);
+    expect(h.pushes).toHaveLength(1); // 真的尝试推了
+    expect(h.reports[0]!.status).toBe("failed");
+    expect(h.reports[0]!.error_code).toBe("PUSH_REJECTED");
+  });
+
   it("推送发生在上报**之前**（上报里的 commit_shas 必须已在远端）", async () => {
     const h = makeHarness({ script: [{ kind: "leased", task: TASK, lease: LEASE }] });
     await runDaemon(
@@ -566,14 +633,39 @@ describe("B4 §5 续租/心跳/执行/上报的顺序", () => {
     expect(h.events.indexOf("push")).toBeLessThan(h.events.indexOf("report"));
   });
 
-  it("未显式开启推送 → 结果照常上报，但**不推送**（能力声明不等于授权动作）", async () => {
+  /**
+   * 评审单 P0-4（B5 反向锁定）。
+   *
+   * B4 的测试原本断言「enable_push=false 时**不推送但照常上报
+   * ready_for_integration**」——那等于告诉协调器有个提交可供整合，
+   * 而对应的 SHA 只存在于 B 本机，A 端根本取不到。评审单明确要求
+   * 「修改现有反向测试，锁定『未推送不得 ready_for_integration』」。
+   */
+  it("未显式开启推送 → 不推送，且**不得**上报 ready_for_integration（降级 blocked_approval）", async () => {
     const h = makeHarness({ script: [{ kind: "leased", task: TASK, lease: LEASE }] });
     // registration.capabilities 含 git_push，但没有 enable_push
     await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
     expect(h.events).not.toContain("push");
     expect(h.pushes).toHaveLength(0);
+    // 仍然上报（要说清楚发生了什么），但不能声称可整合
     expect(h.events).toContain("report");
-    expect(h.reports[0]!.status).toBe("ready_for_integration");
+    expect(h.reports[0]!.status).not.toBe("ready_for_integration");
+    expect(h.reports[0]!.status).toBe("blocked_approval");
+    expect(h.reports[0]!.error_code).toBe("UNAUTHORIZED_OPERATION");
+  });
+
+  it("声明了 dry_run 而未声明 git_push → 同样不得 ready_for_integration", async () => {
+    const h = makeHarness({ script: [{ kind: "leased", task: TASK, lease: LEASE }] });
+    const options = makeOptions({ max_idle_polls: 1, enable_push: true });
+    // 开了 enable_push，但能力里没有 git_push：授权动作与能力声明必须**同时**满足
+    options.registration = {
+      ...options.registration,
+      capabilities: ["code", "test", "dry_run"],
+    };
+    await runDaemon(withLog(options, h.logs), h.deps);
+    expect(h.pushes).toHaveLength(0);
+    expect(h.reports[0]!.status).toBe("blocked_approval");
+    expect(h.reports[0]!.error_code).toBe("UNAUTHORIZED_OPERATION");
   });
 });
 
@@ -719,7 +811,14 @@ describe("B4 §8 优雅停止与重启恢复", () => {
     expect(report.stop_reason).toBe("aborted");
   });
 
-  it("重启恢复：仍归本机也**不续跑**（B4 不具备断点续跑能力），清记录后继续", async () => {
+  /**
+   * 评审单 P1-1（B5 反向锁定）。
+   *
+   * B4 的行为是：查得仍归本机 → **删掉在途记录 → 立刻进领取循环**。
+   * 那会造成同一执行器同时持两份租约，旧 attempt 永远没人收尾，
+   * 而且「旧 worktree 与旧租约」的事实被本地丢失了。
+   */
+  it("重启恢复：仍归本机 → 安全停止、保留记录、不领取新任务（P1-1）", async () => {
     const record: InFlightRecord = {
       task_id: "TASK-0001",
       attempt_id: "TASK-0001-A1",
@@ -744,13 +843,26 @@ describe("B4 §8 优雅停止与重启恢复", () => {
       },
     });
     const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
-    // 顺序：先查归属，再进入领取循环（health/register 在其之前）
+
+    // ① 决策被识别为 resume（仍归我）
+    expect(report.recovery).toEqual({ kind: "resume", from_phase: "running_agent" });
+    // ② 本轮**安全停止**，而不是继续领取
+    expect(report.stop_reason).toBe("halt_still_mine");
+
     const recoveryIndex = h.events.indexOf("query_ownership");
     expect(recoveryIndex).toBeGreaterThanOrEqual(0);
-    expect(h.events.slice(recoveryIndex + 1)).toContain("acquire");
-    expect(report.recovery).toEqual({ kind: "resume", from_phase: "running_agent" });
-    expect(h.saved).toContain(null); // 记录被清理
-    expect(report.attempts).toHaveLength(0); // 没有自动续跑
+    // ③ 查完归属之后不得再领任务
+    expect(h.events.slice(recoveryIndex + 1)).not.toContain("acquire");
+    // ④ 不得推送、不得上报
+    expect(h.events).not.toContain("push");
+    expect(h.events).not.toContain("report");
+    expect(report.attempts).toHaveLength(0);
+
+    // ⑤ 记录**被保留**并推进为终态（P1-2：不再有任何删除路径）
+    expect(h.saved).toHaveLength(1);
+    expect(h.saved[0]!.state).toBe("halted_still_mine");
+    expect(h.saved[0]!.task_id).toBe("TASK-0001");
+    expect(typeof h.saved[0]!.state_updated_at).toBe("string");
   });
 
   it("重启恢复：归属不可达 → halt_offline，停止新操作", async () => {
@@ -770,10 +882,13 @@ describe("B4 §8 优雅停止与重启恢复", () => {
     const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
     expect(report.stop_reason).toBe("halt_offline_on_recovery");
     expect(h.events).not.toContain("acquire");
+    // 还没拿到云端结论 → **不得**推进记录状态
+    expect(h.saved).toHaveLength(0);
   });
 
-  it("重启恢复：已被重派 → 本地放手，不推送不上报", async () => {
+  it("重启恢复：已被重派 → 本地放手，记录保留为终态，可继续领取", async () => {
     const h = makeHarness({
+      script: [{ kind: "empty" }],
       inFlight: {
         task_id: "TASK-0001",
         attempt_id: "TASK-0001-A1",
@@ -792,10 +907,44 @@ describe("B4 §8 优雅停止与重启恢复", () => {
         lease_epoch: 2,
       },
     });
-    const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+    const report = await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
     expect(report.recovery?.kind).toBe("abandon_reassigned");
     expect(h.events).not.toContain("push");
     expect(h.events).not.toContain("report");
+    // 服务端已确认不再归我 → 记录推进为终态，但**文件仍在**
+    expect(h.saved[0]!.state).toBe("abandoned_reassigned");
+    // 但可以继续领取新任务（不再持有旧租约）
+    expect(h.events).toContain("acquire");
+  });
+
+  it("重启恢复：租约已过期 → 记录保留为终态，可继续领取", async () => {
+    const h = makeHarness({
+      script: [{ kind: "empty" }],
+      inFlight: {
+        task_id: "TASK-0001",
+        attempt_id: "TASK-0001-A1",
+        executor_id: CONFIG.executor_id,
+        lease_epoch: 1,
+        expired_at: "2020-01-01T00:00:00.000Z",
+        worktree_path: "C:\\repo\\wt",
+        completed_phases: [],
+        local_commits: [],
+      },
+      recovery: {
+        kind: "still_mine",
+        lease: {
+          task_id: "TASK-0001",
+          attempt_id: "TASK-0001-A1",
+          executor_id: CONFIG.executor_id,
+          lease_epoch: 1,
+          expires_at: "2020-01-01T00:00:00.000Z",
+        },
+      },
+    });
+    const report = await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
+    expect(report.recovery?.kind).toBe("abandon_expired");
+    expect(h.saved[0]!.state).toBe("abandoned_expired");
+    expect(h.events).toContain("acquire");
   });
 });
 
@@ -887,9 +1036,55 @@ describe("B4 §10 Windows 中文与空格路径", () => {
       ),
       h.deps,
     );
-    const record = h.saved.find((item) => item !== null) as InFlightRecord;
+    const record = h.saved[0]!;
     expect(record.worktree_path).toBe(join(chineseWorktree, LEASE.attempt_id));
     expect(record.worktree_path.endsWith(LEASE.attempt_id)).toBe(true);
+  });
+
+  /**
+   * 评审单 P1-2（B5 反向锁定）。
+   *
+   * B4 的存储层用 `save_in_flight(null)` → `rmSync` 表达「运行完成」，
+   * 等于把「跑完了」当成删除许可。现在存储层**没有删除路径**：
+   * 结束只能推进 `state`，文件始终留着；真要清理得走显式动作。
+   */
+  it("在途记录：结束时推进状态而**不删除文件**（P1-2）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dac-inflight-"));
+    try {
+      const store = fileInFlightStore(dir);
+      const file = inFlightPath(dir);
+      expect(store.load_in_flight?.()).toBeNull();
+
+      const record: InFlightRecord = {
+        task_id: "TASK-0001",
+        attempt_id: "TASK-0001-A1",
+        executor_id: CONFIG.executor_id,
+        lease_epoch: 1,
+        expired_at: LEASE.expires_at,
+        worktree_path: join(dir, "worktrees", "TASK-0001-A1"),
+        completed_phases: [],
+        local_commits: [],
+      };
+      store.save_in_flight?.(record);
+      expect(store.load_in_flight?.()).toEqual(record);
+      expect(existsSync(file)).toBe(true);
+
+      // 「结束」= 推进状态，而不是删除
+      store.save_in_flight?.({ ...record, state: "reported", state_updated_at: "x" });
+      const after = store.load_in_flight?.();
+      expect(after).not.toBeNull();
+      expect(after!.state).toBe("reported");
+      expect(existsSync(file)).toBe(true);
+
+      // 只有**显式**清理动作才会删文件，且它不在常驻入口的自动路径里
+      const cleared = clearInFlightRecord(dir);
+      expect(cleared.removed).toBe(true);
+      expect(cleared.path).toBe(file);
+      expect(existsSync(file)).toBe(false);
+      expect(store.load_in_flight?.()).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("在途记录能真实读写含中文与空格的目录（Windows 不退化）", () => {
@@ -909,8 +1104,6 @@ describe("B4 §10 Windows 中文与空格路径", () => {
       };
       store.save_in_flight?.(record);
       expect(store.load_in_flight?.()).toEqual(record);
-      store.save_in_flight?.(null);
-      expect(store.load_in_flight?.()).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

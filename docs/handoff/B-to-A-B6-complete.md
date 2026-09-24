@@ -6,9 +6,11 @@
 - **分支**：`task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B6`
 - **B6 基线**：`934db7b18d01dff5712b8919751e9ac23b5a223f`（= B5 顶端）
   — 未改写、未强推 B5；B5 远端仍是 `934db7b`
-- **远端 SHA**：`7f44579a06a52098ac06cad356bfe5a38a4726f9`
+- **代码提交**：`7f44579a06a52098ac06cad356bfe5a38a4726f9`
+  —— 本分支上**最后一次修改代码**的提交；其后各提交只追加文档
+- **远端 SHA**：与本地 `git rev-parse HEAD` **逐字一致**
   —— `git ls-remote origin refs/heads/task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B6`
-  与本地 `git rev-parse HEAD` **逐字一致**
+  （本交接单自身也是提交，故此处不写死 SHA 以免自指矛盾）
 - **`main` 未被改动**：远端仍为 `ae659a9f5bbf59c08c0c435b916a2eaa0a4ad25e`；
   未推送任何其他分支、未 force-push
 
@@ -19,6 +21,7 @@
 | 1 | `35f95633c76e80466425c15dae9cfca1cc08ecdc` | B6-1 / B6-2 实现（8 文件，+1438/−75） |
 | 2 | `f336f91d07f832d8b562f17273f3bfbe0bc32776` | 交付报告 `B6-B-executor-launch-and-records.md` |
 | 3 | `7f44579a06a52098ac06cad356bfe5a38a4726f9` | **跨平台缺陷修复 + 回归用例 + 报告第六节** |
+| 4 | `be9a74392f069814845c58ae7c41e3c0dff82aed` | B6 交接单（本文件） |
 
 ### 实际执行命令 / 退出码（Node v22.22.2，Windows 本机）
 
@@ -87,15 +90,23 @@ A 端指示解析「`node.exe` 路径 + CLI 的 **JS 入口**」。实测本机
 
 ## 三、🔴 B 端引入的跨平台缺陷（CI 暴露，已修）
 
-**必须如实上报：B6 的推送在 CI 上红过两次，另有一次 Windows 失败原因未明。**
+**必须如实上报：B6 的推送在 CI 上红过三次。**
+其中两次（#17 / #18 的 `ubuntu-latest`）是 **B 端引入的真实缺陷**，
+已修复并确认关闭（见 3.2）；另一次（#19 的 `windows-latest`）
+**未能复现**（见 3.3）。两件事都不淡化。
 
-### 3.1 CI 运行记录（三次，逐条如实）
+### 3.1 CI 运行记录（逐条如实）
 
 | 运行 | 提交 | `windows-latest` | `ubuntu-latest` |
 | --- | --- | --- | --- |
 | **#17** | `35f9563` | success（31 s） | **failure**（9 s） |
 | **#18** | `f336f91` | success（29 s） | **failure**（11 s） |
 | **#19** | `7f44579` | **failure**（182 s） | success（11 s） |
+| **#20** | `be9a743` | success（28 s） | success（12 s） |
+
+链接：#17 <https://github.com/abah661/-/actions/runs/36001118441>
+· #19 <https://github.com/abah661/-/actions/runs/36004505007>
+· #20 <https://github.com/abah661/-/actions/runs/36005310681>
 
 ### 3.2 #17 / #18 的 Ubuntu 失败：B 端引入的真实缺陷（已修）
 
@@ -108,7 +119,7 @@ A 端指示解析「`node.exe` 路径 + CLI 的 **JS 入口**」。实测本机
 不再自己拼。`7f44579` 即该修复，并新增一条跨平台回归用例。
 #19 的 Ubuntu **转为 success**，该缺陷确认关闭。
 
-### 3.3 ⚠️ #19 的 Windows 失败：B 端目前无法解释（提请 A 端看日志）
+### 3.3 ⚠️ #19 的 Windows 失败：**未能复现**（提请 A 端知悉）
 
 `check (windows-latest)` 在 `7f44579` 上失败，`Run project checks` 耗时
 **182 s**；而同一作业在 #17 / #18 都是 success 且只用 29–31 s。
@@ -123,10 +134,14 @@ B 端已做的排除（均为实测，非推测）：
    与一处路径拼接实现；而在 CI 上（无 opencode）解析结果为 `not_found`，
    **根本不会进入被改动的分支**。
 
-GitHub 对公开仓库的 job 日志端点需要认证（B 端实测 HTTP 403），
-`gh` CLI 亦不可用，因此 B 端**拿不到 182 s 里的失败详情**，故**不作结论**、
-也不把该失败写成「偶发」草草带过。**提请 A 端打开该作业日志给出失败用例名**，
-B 端据此返修；同时 B 端已推送新提交以触发新一次运行作对照。
+**对照结果**：#20 用的是**同一套代码**（`be9a743` 只在 `7f44579` 之上追加了
+本交接单文件），`windows-latest` **success，且 `Run project checks` 只用 28 s**
+（#19 为 182 s）。**#19 的失败因此未能复现。**
+
+B 端据此**不把它记作代码缺陷**（不存在可复现路径），但也**不草草写成「偶发」**：
+GitHub 对公开仓库的 job 日志端点需认证（B 端实测 HTTP 403）、`gh` CLI 不可用，
+B 端自始至终**拿不到那 182 s 里的失败详情**。
+若 A 端认为需要，可打开该作业日志给出失败用例名，B 端据此继续排查。
 
 <https://github.com/abah661/-/actions/runs/36004505007/job/107649076274>
 

@@ -160,9 +160,10 @@ A 端指示解析「`node.exe` 路径 + CLI 的 JS 入口文件路径」。实�
 | `git diff --check` | `0` |
 | `git status --short` | `0`（提交后干净） |
 
-**21 个测试文件：440 passed | 1 skipped | 0 failed（共 441）**
+**21 个测试文件：441 passed | 1 skipped | 0 failed（共 442）**
 
-- 新增 `tests/executor/opencode-launcher.test.ts`：**16/16**
+- 新增 `tests/executor/opencode-launcher.test.ts`：**17/17**
+  （含第六节补入的跨平台回归用例）
 - `tests/executor/real-chain.test.ts`：**17/17**（含新增 §7 四例、§8 一例）
 - `tests/executor/daemon.test.ts`：**44/44**
 - 1 个 skip 是既有的平台门控；**未删除断言、未跳过失败用例、未降低标准**
@@ -181,3 +182,68 @@ A 端指示解析「`node.exe` 路径 + CLI 的 JS 入口文件路径」。实�
 4. 最小任务图
 5. **2.2 节的形态差异确认**（原生 `opencode.exe` 的绝对路径启动是否接受为
    B6-2 的等价实现）
+
+---
+
+## 六、CI 反馈与返修（B6 第二轮）
+
+### 6.1 事实
+
+`35f9563` 推送后，**CI 运行 #17 在 `ubuntu-latest` 上转红**，`windows-latest` 通过。
+
+| 作业 | 结论 |
+| --- | --- |
+| `check (windows-latest)` | **success**（31 s） |
+| `check (ubuntu-latest)` | **failure**（`Run project checks` 9 s） |
+
+**这是 B 端引入的真实缺陷**，不是环境问题。B 端本地是 Windows，全量 441 例全绿，
+因此它在推送前**不会**被本地检查发现。特此记录，不做淡化。
+
+### 6.2 根因：shim 路径的分隔符被硬拼成反斜杠
+
+`opencode-launcher.ts` 的 `extractTargetPath` 原实现：
+
+```ts
+.replace(/%~?dp0%?/gi, `${shimDir}\\`)   // 追加反斜杠
+.replace(/[\\/]+/g, "\\")                // 无条件把分隔符统一成 "\\"
+```
+
+在 Windows 上 `path.join` 本就产出反斜杠，看不出差异；但在 Linux 上 `join` 是
+POSIX 语义，于是 shim 展开得到 `D:\npm-global\node_modules\...` ——
+**既不是合法 POSIX 路径，也不等于 `join` 的结果**，
+`isFile()` 判定随之失败，单测断言随之失败。
+
+用一个独立脚本直接对照两种语义即可复现（本机实测）：
+
+| 语义 | 实现产出 | 测试期望 | 相等 |
+| --- | --- | --- | --- |
+| `path.posix`（Linux CI） | `D:\npm-global\node_modules\opencode-ai\bin\opencode.exe` | `D:/npm-global/node_modules/opencode-ai/bin/opencode.exe` | **否** |
+| `path.win32`（本机） | `D:\\npm-global\\node_modules\\...\\opencode.exe` | `D:\\npm-global\\node_modules\\...\\opencode.exe` | 是 |
+
+### 6.3 修法
+
+**分隔符一律交给 `path.join` 决定，不再自己拼。**
+把 `%dp0%` / `%~dp0` / `$basedir` 前缀**剥掉**得到相对路径，
+shim 文本里的反斜杠先归一并交给平台 `join`；shim 内写死绝对路径时
+（Windows 与 POSIX 两种都要认）不再前置 shim 目录。
+
+### 6.4 验证（三重）
+
+1. **正反两组对照脚本**：修复前 posix 下不相等、修复后两种语义下都相等。
+2. **本地 POSIX 语义模拟**：把 `node:path` 解析成 `path.posix`
+   后运行测试（临时配置置于已被忽略的 `.local/`，不参与提交，
+   并先用一条探针用例确认替换确实生效）。
+   - `opencode-launcher.test.ts`：**win32 17/17，posix 17/17**
+3. **原生 Windows 全量**：`441 passed | 1 skipped | 0 failed`，退出码 0。
+
+> 口径说明：POSIX 模拟的**整体**套件会有 Windows 专属用例失败
+> （如 `windows-paths.test.ts`、协议样例），这是模拟只更换路径语义、
+> 未更换 `process.platform` 造成的**模拟副作用**，与本缺陷无关。
+> 因此本条证据**只用于**上面那个纯粹依赖路径语义的文件。
+
+### 6.5 新增回归用例
+
+`tests/executor/opencode-launcher.test.ts` 增加
+「shim 展开的分隔符必须由平台 `join` 决定（跨平台回归）」：
+期望值完全由平台 `join` 构造，且 shim 文本里**混用** `\` 与 `/`，
+因此在两个平台上都必须成立 —— 这条用例在缺陷复现前会失败。

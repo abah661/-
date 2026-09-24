@@ -231,6 +231,35 @@ describe("B6-2 从 PATH 与 shim 文本解析", () => {
     expect(r.spec.source).toBe("shim_exe");
   });
 
+  it("shim 展开的分隔符必须由平台 `join` 决定（跨平台回归）", () => {
+    /*
+     * 这条用例是被 **CI 的 Ubuntu 作业转红**逼出来的。
+     *
+     * 最初的实现把 shim 里的分隔符 `.replace(/[\\/]+/g, "\\")` 无条件统一成反斜杠。
+     * 在 Windows 上毫无问题；但在 Linux 上 `join` 是 POSIX 语义，于是拼出
+     * `D:\npm-global\node_modules\...` —— 一个既不是 POSIX 路径、
+     * 也不等于 `join` 结果的畸形串，`isFile` 判定随之失败。
+     *
+     * 这里把「期望值」完全交给平台 `join` 构造，所以它在两个平台上都必须成立。
+     * 另外混入正斜杠，确保实现对两种分隔符都做归一，而不是只认反斜杠。
+     */
+    const exe = join(PKG_DIR, "bin", "opencode.exe");
+    const cmd = join(NPM_PREFIX, "opencode.cmd");
+    const shim = '@ECHO off\n"%dp0%\\node_modules/opencode-ai\\bin/opencode.exe"   %*\n';
+
+    const probe = makeProbe({
+      dirs: { [NPM_PREFIX]: ["opencode.cmd"] },
+      files: { [cmd]: shim, [exe]: "MZ" },
+    });
+
+    const r = resolveOpenCodeLaunch({ path_env: NPM_PREFIX, probe });
+
+    expect(r.kind).toBe("resolved");
+    if (r.kind !== "resolved") return;
+    expect(r.spec.command).toBe(exe);
+    expect(r.spec.source).toBe("shim_exe");
+  });
+
   it("`.ps1` 里的 `$basedir` 同样能展开", () => {
     const entry = join(PKG_DIR, "bin", "opencode.js");
     const ps1 = join(NPM_PREFIX, "opencode.ps1");

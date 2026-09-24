@@ -49,7 +49,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, win32 } from "node:path";
 
 /* ------------------------------------------------------------------ *
  * 类型
@@ -397,19 +397,39 @@ function resolveFromShimText(
   return null;
 }
 
-/** 从一行 shim 文本里取出目标路径，并展开 `%dp0%` / `$basedir`。 */
+/**
+ * 从一行 shim 文本里取出目标路径。
+ *
+ * `%dp0%` / `%~dp0`（`.cmd`）与 `$basedir`（`.ps1`）都指 shim 自身所在目录，
+ * 因此先把变量**剥掉**得到相对路径，再用平台自身的 `join` 拼回去。
+ *
+ * ## 这里踩过一个真实的跨平台坑（必须记住）
+ * 最初的写法是 `.replace(/[\\/]+/g, "\\")` —— 把分隔符**无条件**统一成反斜杠。
+ * 在本机（Windows）看不出问题，但 CI 的 Ubuntu 作业里 `join` 是 POSIX 语义，
+ * 于是拼出 `D:\npm-global\node_modules\...` 这种既不是 POSIX 路径、
+ * 也不等于 `join` 结果的畸形串，`isFile` 判定随之失败，作业转红。
+ *
+ * 教训：**分隔符一律交给 `path.join` 决定**，不要自己拼。
+ */
 function extractTargetPath(line: string, shimDir: string): string | null {
   const quoted = line.match(/"([^"\r\n]+)"/);
-  const candidate = quoted?.[1] ?? line.match(/(\S+\.(?:exe|js|mjs|cjs))\b/i)?.[1];
-  if (candidate === undefined) return null;
+  const raw = quoted?.[1] ?? line.match(/(\S+\.(?:exe|js|mjs|cjs))\b/i)?.[1];
+  if (raw === undefined) return null;
 
-  const expanded = candidate
-    // npm 的 `.cmd` 写 `%dp0%`，`.ps1` 写 `$basedir`；两者都指 shim 自身目录。
-    .replace(/%~?dp0%?/gi, `${shimDir}\\`)
-    .replace(/\$basedir/gi, shimDir)
-    .replace(/[\\/]+/g, "\\")
-    .replace(/\\+$/, "");
-  return expanded === "" ? null : expanded;
+  const hadDirVar = /%~?dp0%?|\$basedir/i.test(raw);
+  const relative = raw
+    .replace(/%~?dp0%?[\\/]*/gi, "")
+    .replace(/\$basedir[\\/]*/gi, "")
+    // 先把 shim 文本里的反斜杠统一成正斜杠（它只是文本，不是本机路径），
+    // 再交给 `join` 按当前平台决定真正的分隔符。
+    .replace(/\\/g, "/");
+  if (relative === "") return null;
+
+  // shim 里写死绝对路径时不再前置 shim 目录；Windows 与 POSIX 两种绝对路径都要认。
+  if (!hadDirVar && (isAbsolute(relative) || win32.isAbsolute(relative))) {
+    return join(relative);
+  }
+  return join(shimDir, relative);
 }
 
 /**

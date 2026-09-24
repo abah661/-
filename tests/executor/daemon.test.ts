@@ -54,8 +54,11 @@ import {
   clearInFlightRecord,
   fileInFlightStore,
   findBindingProblem,
-  inFlightPath,
+  inFlightDir,
+  inFlightRecordPath,
+  isActiveInFlightRecord,
   isBlockedCode,
+  listInFlightRecords,
   loadDaemonOptions,
   runDaemon,
 } from "../../apps/executor/src/daemon.js";
@@ -337,6 +340,25 @@ function makeHarness(config: {
 /** 让 daemon 记录日志，便于断言脱敏。 */
 function withLog(options: DaemonOptions, logs: string[]): DaemonOptions {
   return { ...options, log: (line) => logs.push(line) };
+}
+
+/** 构造一条在途记录（B6-1 测试用）。默认 `state: "in_flight"`，即「活动租约」。 */
+function makeInFlightRecord(
+  dir: string,
+  attemptId: string,
+  taskId = "TASK-0001",
+): InFlightRecord {
+  return {
+    task_id: taskId,
+    attempt_id: attemptId,
+    executor_id: CONFIG.executor_id,
+    lease_epoch: 1,
+    expired_at: LEASE.expires_at,
+    worktree_path: join(dir, "worktrees", attemptId),
+    completed_phases: [],
+    local_commits: [],
+    state: "in_flight",
+  };
 }
 
 /** 构造一个可分类的 HTTP 错误。 */
@@ -1042,46 +1064,112 @@ describe("B4 §10 Windows 中文与空格路径", () => {
   });
 
   /**
-   * 评审单 P1-2（B5 反向锁定）。
+   * 评审单 P1-2（B5）+ B6-1（B6）。
    *
    * B4 的存储层用 `save_in_flight(null)` → `rmSync` 表达「运行完成」，
-   * 等于把「跑完了」当成删除许可。现在存储层**没有删除路径**：
-   * 结束只能推进 `state`，文件始终留着；真要清理得走显式动作。
+   * 等于把「跑完了」当成删除许可。B5 去掉了删除路径，但**仍把所有 attempt
+   * 写进同一个文件**——第二个 attempt 一落盘就把第一个覆盖掉（B6-1）。
+   * 现在：每 attempt 一份文件，结束只推进 `state`，历史不得被覆盖。
    */
-  it("在途记录：结束时推进状态而**不删除文件**（P1-2）", () => {
+  it("在途记录：每 attempt 一份文件，结束只推进状态、**不删除**（P1-2 + B6-1）", () => {
     const dir = mkdtempSync(join(tmpdir(), "dac-inflight-"));
     try {
       const store = fileInFlightStore(dir);
-      const file = inFlightPath(dir);
       expect(store.load_in_flight?.()).toBeNull();
 
-      const record: InFlightRecord = {
-        task_id: "TASK-0001",
-        attempt_id: "TASK-0001-A1",
-        executor_id: CONFIG.executor_id,
-        lease_epoch: 1,
-        expired_at: LEASE.expires_at,
-        worktree_path: join(dir, "worktrees", "TASK-0001-A1"),
-        completed_phases: [],
-        local_commits: [],
-      };
+      const record = makeInFlightRecord(dir, "TASK-0001-A1");
+      const file = inFlightRecordPath(dir, record.attempt_id);
       store.save_in_flight?.(record);
       expect(store.load_in_flight?.()).toEqual(record);
       expect(existsSync(file)).toBe(true);
 
       // 「结束」= 推进状态，而不是删除
       store.save_in_flight?.({ ...record, state: "reported", state_updated_at: "x" });
-      const after = store.load_in_flight?.();
-      expect(after).not.toBeNull();
-      expect(after!.state).toBe("reported");
       expect(existsSync(file)).toBe(true);
+      // 关键（B6-1）：终态记录**不再**被当成活动租约返回……
+      expect(store.load_in_flight?.()).toBeNull();
+      // ……但它本人还在磁盘上，可复查
+      const all = listInFlightRecords(dir);
+      expect(all).toHaveLength(1);
+      expect(all[0]!.state).toBe("reported");
 
       // 只有**显式**清理动作才会删文件，且它不在常驻入口的自动路径里
-      const cleared = clearInFlightRecord(dir);
+      const cleared = clearInFlightRecord(dir, record.attempt_id);
       expect(cleared.removed).toBe(true);
       expect(cleared.path).toBe(file);
       expect(existsSync(file)).toBe(false);
-      expect(store.load_in_flight?.()).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * B6-1 的核心验收：**记录不会再被后续任务覆盖**。
+   *
+   * 连续完成两个不同 attempt 后，两份记录都必须存在且各自状态正确；
+   * 重启恢复只处理仍为 `in_flight` 的那一份。
+   */
+  it("B6-1：连续两个 attempt 的记录都在，且只恢复 in_flight 的那一份", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dac-attempts-"));
+    try {
+      const store = fileInFlightStore(dir);
+
+      const first = makeInFlightRecord(dir, "TASK-0001-A1");
+      store.save_in_flight?.(first);
+      store.save_in_flight?.({
+        ...first,
+        state: "reported",
+        state_updated_at: "2026-09-24T00:00:00.000Z",
+      });
+
+      // 第二个 attempt 落盘：**不得**覆盖第一个
+      const second = makeInFlightRecord(dir, "TASK-0002-A1", "TASK-0002");
+      store.save_in_flight?.(second);
+
+      const all = listInFlightRecords(dir);
+      expect(all.map((r) => r.attempt_id)).toEqual(["TASK-0001-A1", "TASK-0002-A1"]);
+      const firstOnDisk = all.find((r) => r.attempt_id === "TASK-0001-A1")!;
+      expect(firstOnDisk.state).toBe("reported");
+      expect(isActiveInFlightRecord(firstOnDisk)).toBe(false);
+
+      // 重启只会拿到仍为 in_flight 的那一份
+      const loaded = store.load_in_flight?.();
+      expect(loaded?.attempt_id).toBe("TASK-0002-A1");
+      expect(loaded?.state).toBe("in_flight");
+
+      // 两份文件各自独立存在于磁盘
+      expect(existsSync(inFlightRecordPath(dir, "TASK-0001-A1"))).toBe(true);
+      expect(existsSync(inFlightRecordPath(dir, "TASK-0002-A1"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * B6-1（集成）：磁盘上只留下终态记录时，重启**不得**发起恢复查询。
+   *
+   * 这条是「终态记录不会再次被当成活动租约恢复」的真实检验：
+   * 断言 `query_ownership` 从未被调用，且 `recovery` 为 null。
+   */
+  it("B6-1：磁盘上只有终态记录时，重启不做恢复查询", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dac-terminal-"));
+    try {
+      const store = fileInFlightStore(dir);
+      store.save_in_flight?.({
+        ...makeInFlightRecord(dir, "TASK-0009-A1", "TASK-0009"),
+        state: "halted_still_mine",
+      });
+
+      const h = makeHarness({ script: [] });
+      const report = await runDaemon(
+        withLog(makeOptions({ max_idle_polls: 1 }), h.logs),
+        { ...h.deps, ...store },
+      );
+
+      expect(report.recovery).toBeNull();
+      expect(h.events).not.toContain("query_ownership");
+      // 终态记录原样保留
+      expect(listInFlightRecords(dir)).toHaveLength(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1092,18 +1180,11 @@ describe("B4 §10 Windows 中文与空格路径", () => {
     try {
       const store = fileInFlightStore(dir);
       expect(store.load_in_flight?.()).toBeNull();
-      const record: InFlightRecord = {
-        task_id: "TASK-0001",
-        attempt_id: "TASK-0001-A1",
-        executor_id: CONFIG.executor_id,
-        lease_epoch: 1,
-        expired_at: LEASE.expires_at,
-        worktree_path: join(dir, "worktrees", "TASK-0001-A1"),
-        completed_phases: [],
-        local_commits: [],
-      };
+      const record = makeInFlightRecord(dir, "TASK-0001-A1");
       store.save_in_flight?.(record);
       expect(store.load_in_flight?.()).toEqual(record);
+      // 目录形态本身也要正确（B6-1）
+      expect(inFlightDir(dir).endsWith(join(".local", "executor-attempts"))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

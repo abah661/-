@@ -33,6 +33,12 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import type { ErrorCode } from "@dac/protocol";
+import { describeLaunchResolution, resolveOpenCodeLaunch } from "./opencode-launcher.js";
+import type {
+  OpenCodeLaunchConfig,
+  OpenCodeLaunchResolution,
+  OpenCodeLaunchSource,
+} from "./opencode-launcher.js";
 
 /* ------------------------------------------------------------------ *
  * 输入与配置
@@ -66,8 +72,21 @@ export interface OpenCodeTaskInput {
 }
 
 export interface OpenCodeAdapterConfig {
-  /** opencode 可执行文件；默认 `opencode` */
+  /**
+   * 兜底可执行文件名；默认 `opencode`。
+   *
+   * **注意（B6-2）**：在 Windows 上以裸名 `opencode` 启动**必然 `ENOENT`**，
+   * 因为 npm 只提供 `.cmd` / `.ps1` shim，而 Node 在 `shell: false` 下
+   * 不解析它们。正常路径是先经 `launcher`（或自动探测）解析出真实目标，
+   * 本字段只是「什么都没解析出来」时的最后手段。
+   */
   executable?: string;
+  /**
+   * 显式启动方式（B6-2，A 端裁定）。给出即优先使用，见
+   * `adapters/opencode-launcher.ts`：支持原生可执行文件与
+   * `node.exe` + JS 入口两种形态，**都不经 shell**。
+   */
+  launcher?: OpenCodeLaunchConfig;
   /** 兜底模型。**仍建议每次显式传入**，此项仅为兼容调用方便利 */
   default_model?: string;
   default_timeout_ms?: number;
@@ -378,6 +397,16 @@ export interface OpenCodeAdapterResult {
   invalid_json_lines: number;
   /** 出错时请求打向的 URL；用于诊断「是否走错 provider」 */
   request_url: string | null;
+  /**
+   * 实际使用的启动方式（B6-2）。
+   *
+   * `bare_name` 表示**没能解析出真实目标**、退回了裸命令名
+   * （Windows 上等于必然 `ENOENT`）。这是一个可观测的降级信号，
+   * 不该被埋在日志里。
+   */
+  launch_source: OpenCodeLaunchSource | "bare_name";
+  /** 启动方式的解析依据；解析失败时是搜索过的路径清单 */
+  launch_detail: string;
 }
 
 function sha256(value: string): string {
@@ -408,11 +437,45 @@ export async function runOpenCodeTask(
   config: OpenCodeAdapterConfig = {},
   runner: OpenCodeProcessRunner = new NodeOpenCodeProcessRunner(),
 ): Promise<OpenCodeAdapterResult> {
-  const args = buildOpenCodeRunArgs(input, config);
+  const cliArgs = buildOpenCodeRunArgs(input, config);
+
+  /*
+   * B6-2（A 端裁定）：**先解析出真实启动目标，再以绝对路径 + 参数数组启动**。
+   *
+   * Windows 上把裸名 `opencode` 交给 `spawn(..., { shell: false })` 是必然
+   * `ENOENT`——npm 只装了 `.cmd` / `.ps1` shim。解析结果要么是原生可执行文件
+   * （本机的 `opencode.exe`），要么是 `node.exe` + JS 入口；两者都**不经 shell**，
+   * 因此 A 端红线（保持 `shell: false`、不拼命令串）原样成立。
+   */
+  /*
+   * 优先级：显式 `launcher` > 显式 `executable` > 本机环境自动解析。
+   *
+   * `executable` 一旦被显式给出就**不再自动探测**——调用方点名了用哪个文件，
+   * 探测不该把它换掉。这条约束是被真实测试逼出来的：`{ executable: <不存在的路径> }`
+   * 原先会被自动探测替换成本机真实的 `opencode.exe` 并**真的启动**，
+   * 于是「起不来要快速失败」这条路径被悄悄换成了另一件事。
+   */
+  const launch: OpenCodeLaunchResolution | null =
+    config.launcher !== undefined
+      ? resolveOpenCodeLaunch({ configured: config.launcher })
+      : config.executable !== undefined
+        ? null
+        : resolveOpenCodeLaunch();
+
+  const resolvedSpec = launch !== null && launch.kind === "resolved" ? launch.spec : null;
+  const command = resolvedSpec !== null ? resolvedSpec.command : (config.executable ?? "opencode");
+  const prefixArgs: readonly string[] = resolvedSpec?.prefix_args ?? [];
+  const args: string[] = [...prefixArgs, ...cliArgs];
+  const launch_source: OpenCodeLaunchSource | "bare_name" =
+    launch === null ? "explicit_executable" : (resolvedSpec?.source ?? "bare_name");
+  const launch_detail =
+    launch === null
+      ? `调用方显式指定的可执行文件：${config.executable ?? "opencode"}`
+      : describeLaunchResolution(launch);
 
   let handle: OpenCodeProcess;
   try {
-    handle = runner.start(config.executable ?? "opencode", args, input.cwd);
+    handle = runner.start(command, args, input.cwd);
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
     const classified = classifyOpenCodeFailure({ structured: null, text });
@@ -430,6 +493,8 @@ export async function runOpenCodeTask(
       stderr_sha256: sha256(text),
       invalid_json_lines: 0,
       request_url: null,
+      launch_source,
+      launch_detail,
     };
   }
 
@@ -542,5 +607,7 @@ export async function runOpenCodeTask(
     stderr_sha256: sha256(stderr),
     invalid_json_lines: parsed.invalid_json_lines,
     request_url: parsed.error?.url ?? null,
+    launch_source,
+    launch_detail,
   };
 }

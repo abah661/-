@@ -45,7 +45,11 @@ import type { CommitResult } from "../core/commit.js";
 import { collectEvidence } from "../core/evidence.js";
 import { inspectWorktree, prepareWorktree, removeWorktree } from "../core/worktree.js";
 import { normalizeResult } from "../result/normalize.js";
-import type { OpenCodeAdapterResult, OpenCodeProcessRunner } from "../adapters/opencode.js";
+import type {
+  OpenCodeAdapterConfig,
+  OpenCodeAdapterResult,
+  OpenCodeProcessRunner,
+} from "../adapters/opencode.js";
 import { runOpenCodeTask } from "../adapters/opencode.js";
 
 /* ------------------------------------------------------------------ *
@@ -112,6 +116,14 @@ export interface AttemptDeps {
   heartbeat_transport: HeartbeatTransport;
   clock?: LeaseClock;
   agent_runner?: OpenCodeProcessRunner;
+  /**
+   * agent 适配器配置（B6-2）。
+   *
+   * 常驻入口必须把它透传下来，否则编排里只能退回默认启动方式——
+   * 在 Windows 上那就是裸名 `opencode`，必然 `ENOENT`。
+   * 与 `agent_runner` 同一层：**只允许经依赖注入往下传**，不读全局环境。
+   */
+  agent_config?: OpenCodeAdapterConfig;
   /** 注入 now() 便于测试确定性 */
   now?: () => number;
 }
@@ -241,7 +253,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
         ...(input.agent_timeout_ms !== undefined ? { timeout_ms: input.agent_timeout_ms } : {}),
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
       },
-      {},
+      deps.agent_config ?? {},
       deps.agent_runner as OpenCodeProcessRunner,
     );
 

@@ -35,6 +35,12 @@
  * | P1-1 `still_mine` 后继续领取 | 安全停止并保留在途记录，不再进领取循环 |
  * | P1-2 自动删除在途记录 | 改为终态标记，**从不自动删除** |
  *
+ * ## B6 补充（评审单：B5 的 P1-2 只完成了一半）
+ * | 项 | 落点 |
+ * | --- | --- |
+ * | B6-1 终态记录仍被后续任务覆盖 | 记录改为一 attempt 一份：`.local/executor-attempts/<attempt_id>.json`；`load_in_flight` **只**加载仍为 `in_flight` 的记录 |
+ * | B6-2 Windows 下裸名 `opencode` 必然 `ENOENT` | 新增 `adapters/opencode-launcher.ts`，解析出原生可执行文件或 `node.exe` + JS 入口后以**绝对路径 + 参数数组**启动，`shell: false` 不变 |
+ *
  * ## 两条不可违反的红线
  * 1. **不猜**。云端没回答的事实一律不得用本地推断替代（网络不可达就是不可达）。
  * 2. **不假装成功**。自报完成不算完成；**没核对远端就不能说推送了**。
@@ -47,7 +53,7 @@
  * 真正的断点续跑属 P5 范围，此处不假装实现。
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -57,6 +63,11 @@ import { ERROR_POLICY, blockedStatusFor } from "@dac/protocol";
 import { runAttempt } from "./core/attempt.js";
 import type { AttemptDeps, AttemptInput, AttemptOutcome, TestCommand } from "./core/attempt.js";
 import type { OpenCodeProcessRunner } from "./adapters/opencode.js";
+import {
+  describeLaunchResolution,
+  resolveOpenCodeLaunch,
+} from "./adapters/opencode-launcher.js";
+import type { OpenCodeLaunchConfig } from "./adapters/opencode-launcher.js";
 import { readHeadSha } from "./core/commit.js";
 import { systemClock } from "./core/lease.js";
 import type { LeaseClock, LeaseTransport } from "./core/lease.js";
@@ -107,6 +118,14 @@ export interface DaemonOptions {
   worktree_root: string;
   /** OpenCode 模型。**必填**：不传会落到环境变量 provider 并 401 */
   model: string;
+  /**
+   * OpenCode 启动方式（B6-2）。
+   *
+   * 缺省时由 `adapters/opencode-launcher.ts` 从**本机环境**自动解析
+   * （PATH / `npm_config_prefix` / `%APPDATA%\npm`）。
+   * 这里只允许放本地路径，**不得硬编码任何用户目录**。
+   */
+  agent_launcher?: OpenCodeLaunchConfig;
   /** 测试命令（固定程序 + 参数数组，不经 shell） */
   test_command?: TestCommand;
   /** 提示词构造；默认 `buildTaskPrompt` */
@@ -280,18 +299,94 @@ export function buildTaskPrompt(task: TaskNode, lease: Lease): string {
  * 在途记录（重启恢复）
  * ------------------------------------------------------------------ */
 
-/** 在途记录路径。导出以便测试与人工排查能指向同一个文件。 */
-export function inFlightPath(repoRoot: string): string {
-  return join(repoRoot, ".local", "executor-in-flight.json");
+/**
+ * 在途记录目录（B6-1，评审单）。
+ *
+ * ## 为什么从「一个文件」改成「一个目录」
+ * B5 把所有 attempt 存进**同一个** `.local/executor-in-flight.json`，
+ * 每次 `save_in_flight` 都整文件覆盖。于是下一次领取任务时
+ * `markInFlight(newRecord, "in_flight")` 会把上一条终态记录直接抹掉：
+ * 连续跑 N 个 attempt，磁盘上最多只剩最后一条。
+ *
+ * 那样一来「终态记录留在 `.local/` 里，可复查」只是纸面成立——B5 报告里
+ * 这句话因此被评审驳回（B6-1）。现在改为**每个 attempt 一份、互不覆盖**：
+ *
+ * ```text
+ * .local/executor-attempts/<attempt_id>.json
+ * ```
+ *
+ * 记录**只能由它自己的 attempt 推进状态**，绝不会被后续任务覆盖或自动删除。
+ */
+export function inFlightDir(repoRoot: string): string {
+  return join(repoRoot, ".local", "executor-attempts");
 }
 
 /**
- * 在途记录的最小实现：写在 `.local/` 下（该目录已被 .gitignore 忽略）。
+ * 单个 attempt 的记录文件路径。
  *
- * ## B5 的语义变化（评审单 P1-2）
- * B4 的 `save_in_flight(null)` 会 `rmSync` 把文件删掉。评审单判定这违反清理
- * 规则：「不得把『运行完成』自动扩展为删除许可」。现在这里**没有任何删除路径**——
- * 结束一次 attempt 只能推进 `state` 字段，文件始终留着，成为可复查的审计线索。
+ * `attempt_id` 做 URL 编码后再作文件名：既避免路径分隔符注入，
+ * 又能容纳中文 —— 编码是**可逆的**，所以路径可以由 attempt_id 重算。
+ */
+export function inFlightRecordPath(repoRoot: string, attemptId: string): string {
+  return join(inFlightDir(repoRoot), `${encodeURIComponent(attemptId)}.json`);
+}
+
+/** 解析单个记录文件；损坏或字段缺失时返回 null（跳过，不污染列表）。 */
+function readInFlightFile(file: string): InFlightRecord | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (parsed === null || typeof parsed !== "object") return null;
+    const record = parsed as Partial<InFlightRecord>;
+    if (typeof record.task_id !== "string" || typeof record.attempt_id !== "string") return null;
+    return parsed as InFlightRecord;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 一条记录是否仍代表**活动租约**。
+ *
+ * 只有 `in_flight` 算。B4 留下的旧记录没有 `state` 字段，
+ * 按保守原则仍视为 `in_flight`（「不知道」不能当成「已终结」）。
+ */
+export function isActiveInFlightRecord(record: InFlightRecord): boolean {
+  return record.state === undefined || record.state === "in_flight";
+}
+
+/**
+ * 列出全部在途记录，**含终态**。按文件名排序（attempt_id 近似时间序）。
+ *
+ * 导出是为了让测试与人工排查能一次看到所有 attempt 的下场，
+ * 而不只是「最后一条」。
+ */
+export function listInFlightRecords(repoRoot: string): readonly InFlightRecord[] {
+  const dir = inFlightDir(repoRoot);
+  if (!existsSync(dir)) return [];
+  let names: readonly string[];
+  try {
+    names = readdirSync(dir).sort();
+  } catch {
+    return [];
+  }
+  const records: InFlightRecord[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const record = readInFlightFile(join(dir, name));
+    if (record !== null) records.push(record);
+  }
+  return records;
+}
+
+/**
+ * 在途记录的最小实现：每 attempt 一个文件，写在 `.local/` 下
+ * （该目录已被 .gitignore 忽略）。
+ *
+ * ## 两条不可动摇的语义
+ * 1. **互不覆盖**（B6-1）：写入只针对 `record.attempt_id` 自己的文件。
+ * 2. **只写不删**（B5 评审 P1-2）：这里没有任何删除路径，结束一次 attempt
+ *    只能推进 `state`。B4 的 `save_in_flight(null)` → `rmSync` 把「跑完了」
+ *    当成了删除许可，已被移除。
  *
  * 真正要清理必须调用 {@link clearInFlightRecord}，那是一个**显式动作**，
  * 常驻入口在任何自动路径里都不会调用它。
@@ -299,22 +394,18 @@ export function inFlightPath(repoRoot: string): string {
 export function fileInFlightStore(
   repoRoot: string,
 ): Pick<DaemonDeps, "load_in_flight" | "save_in_flight"> {
-  const file = inFlightPath(repoRoot);
   return {
     load_in_flight: (): InFlightRecord | null => {
-      if (!existsSync(file)) return null;
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-        if (parsed === null || typeof parsed !== "object") return null;
-        const record = parsed as Partial<InFlightRecord>;
-        if (typeof record.task_id !== "string" || typeof record.attempt_id !== "string") return null;
-        return parsed as InFlightRecord;
-      } catch {
-        // 记录损坏：按「无在途」处理，但在日志里会说清楚（由调用方记录）
-        return null;
-      }
+      // **只加载仍为 `in_flight` 的记录**：终态记录（reported / failed_* /
+      // abandoned_* / halted_still_mine）不得再被当成活动租约去查归属、
+      // 更不能被再次恢复执行。
+      const active = listInFlightRecords(repoRoot).filter(isActiveInFlightRecord);
+      // 多条活动记录意味着并发在途（异常）。取**最早**的一条走归属查询，
+      // 其余原样保留——不擅自替别的 attempt 做决定，也不删它们的记录。
+      return active[0] ?? null;
     },
     save_in_flight: (record: InFlightRecord): void => {
+      const file = inFlightRecordPath(repoRoot, record.attempt_id);
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     },
@@ -322,14 +413,18 @@ export function fileInFlightStore(
 }
 
 /**
- * 显式清理在途记录。
+ * 显式清理**单个** attempt 的在途记录。
  *
  * **这不是常驻入口的自动路径**。按项目清理规则，删除需要准确范围与批准，
- * 因此本函数只应由「人工确认后执行的一次性动作」调用。
+ * 因此本函数只应由「人工确认后执行的一次性动作」调用，且必须点名 attempt_id——
+ * 「清空整个目录」这种粗粒度动作不在本函数能力范围内。
  * 常驻入口在任何情况下都不会调用它（这是评审单 P1-2 的核心要求）。
  */
-export function clearInFlightRecord(repoRoot: string): { removed: boolean; path: string } {
-  const file = inFlightPath(repoRoot);
+export function clearInFlightRecord(
+  repoRoot: string,
+  attemptId: string,
+): { removed: boolean; path: string } {
+  const file = inFlightRecordPath(repoRoot, attemptId);
   if (!existsSync(file)) return { removed: false, path: file };
   rmSync(file, { force: true });
   return { removed: true, path: file };
@@ -559,9 +654,10 @@ export async function runDaemon(
   /**
    * 推进在途记录的状态（B5，评审单 P1-2）。
    *
-   * **只写不删**。`save_in_flight` 现在不接受 `null`，所以这里唯一能做的事
-   * 就是把 `state` 往前推一格，并把变更时间记下来。
-   * 文件始终留在 `.local/executor-in-flight.json`，成为可复查的审计线索。
+   * **只写不删，且只写自己那一份**。`save_in_flight` 不接受 `null`，
+   * 所以这里唯一能做的事就是把 `state` 往前推一格、把变更时间记下来。
+   * 记录落在 `.local/executor-attempts/<attempt_id>.json`（B6-1），
+   * 且**只被它自己的 attempt 推进**——后续任务不会覆盖它。
    */
   const markInFlight = (record: InFlightRecord, state: InFlightState): void => {
     try {
@@ -822,6 +918,11 @@ export async function runDaemon(
         heartbeat_transport: deps.heartbeat_transport,
         clock,
         ...(deps.agent_runner !== undefined ? { agent_runner: deps.agent_runner } : {}),
+        // B6-2：启动方式与 `agent_runner` 同一层往下传。不给时由适配器
+        // 自动解析本机环境——**不要**在这里塞任何写死的路径。
+        ...(options.agent_launcher !== undefined
+          ? { agent_config: { launcher: options.agent_launcher } }
+          : {}),
       });
     } catch (error) {
       log(`[attempt] 编排异常（${errorCodeOf(error)}）：记录并继续`);
@@ -984,7 +1085,50 @@ export const ENV_KEYS = {
   host_label: "EXECUTOR_HOST_LABEL",
   repo_root: "EXECUTOR_REPO_ROOT",
   agent: "COORDINATOR_AGENT_KIND",
+  /**
+   * OpenCode 启动方式（B6-2）。四项都**可选**：一个都不给就自动解析。
+   * 全部是**本机路径**，不含凭据。
+   */
+  opencode_exe: "EXECUTOR_OPENCODE_EXE",
+  opencode_js_entry: "EXECUTOR_OPENCODE_JS_ENTRY",
+  opencode_node: "EXECUTOR_OPENCODE_NODE",
+  opencode_search_dirs: "EXECUTOR_OPENCODE_SEARCH_DIRS",
 } as const;
+
+/**
+ * 从环境变量装配 OpenCode 启动方式（B6-2）。
+ *
+ * **全部可选**：一个都没给时返回 `undefined`，由适配器
+ * （`adapters/opencode-launcher.ts`）从 PATH / npm 全局目录自动解析——
+ * 这是常规路径，因为「路径来自本机环境」正是 A 端的要求。
+ *
+ * 显式给了就以显式值为准：显式值指向不存在的文件时**明确失败**，
+ * 不会静默退回裸命令名去撞 `ENOENT`。
+ */
+function buildLauncherConfig(
+  env: Readonly<Record<string, string | undefined>>,
+): OpenCodeLaunchConfig | undefined {
+  const exe = env[ENV_KEYS.opencode_exe]?.trim();
+  const jsEntry = env[ENV_KEYS.opencode_js_entry]?.trim();
+  const nodePath = env[ENV_KEYS.opencode_node]?.trim();
+  const searchRaw = env[ENV_KEYS.opencode_search_dirs]?.trim();
+
+  const searchDirs =
+    searchRaw === undefined || searchRaw === ""
+      ? []
+      : searchRaw
+          .split(process.platform === "win32" ? ";" : ":")
+          .map((part) => part.trim())
+          .filter((part) => part !== "");
+
+  const config: OpenCodeLaunchConfig = {};
+  if (exe !== undefined && exe !== "") config.exe_path = exe;
+  if (jsEntry !== undefined && jsEntry !== "") config.js_entry = jsEntry;
+  if (nodePath !== undefined && nodePath !== "") config.node_path = nodePath;
+  if (searchDirs.length > 0) config.search_dirs = searchDirs;
+
+  return Object.keys(config).length > 0 ? config : undefined;
+}
 
 /** 从环境变量装配运行参数。缺失配置抛 `MissingConfigError`，**不回退到占位值**。 */
 export function loadDaemonOptions(
@@ -1005,6 +1149,9 @@ export function loadDaemonOptions(
   const rawKind = env[ENV_KEYS.agent]?.trim();
   const agentKind: DaemonRegistration["agent_kind"] =
     rawKind === "codex" || rawKind === "mock" ? rawKind : "opencode";
+
+  // B6-2：启动方式优先取显式配置，缺省由适配器从本机环境解析。
+  const launcher = buildLauncherConfig(env);
 
   // 能力按「本机真正具备什么」声明，不夸大：
   // 推送能力取决于是否显式开启，dry 模式声明 dry_run 而不声明 git_push。
@@ -1033,6 +1180,7 @@ export function loadDaemonOptions(
     ...(env["EXECUTOR_MAX_ATTEMPTS"]?.trim()
       ? { max_attempts: Number(env["EXECUTOR_MAX_ATTEMPTS"]) }
       : {}),
+    ...(launcher !== undefined ? { agent_launcher: launcher } : {}),
   };
 }
 
@@ -1044,6 +1192,16 @@ export function loadDaemonOptions(
  */
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   const options = loadDaemonOptions(process.env);
+
+  /*
+   * B6-2：启动时就把「用哪种方式启动 OpenCode」打出来。
+   * 解析失败时连**搜索过的路径**一起列出——否则 Windows 上的 `ENOENT`
+   * 只能靠猜。两种情况下日志都不含凭据（只有本机文件路径）。
+   */
+  const launch = resolveOpenCodeLaunch(
+    options.agent_launcher !== undefined ? { configured: options.agent_launcher } : {},
+  );
+  process.stdout.write(`[launch] ${describeLaunchResolution(launch)}\n`);
 
   const controller = new AbortController();
   const onSignal = (): void => controller.abort();

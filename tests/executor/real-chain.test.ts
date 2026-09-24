@@ -1,5 +1,5 @@
 /**
- * 真实链路集成测试（B5）。
+ * 真实链路集成测试（B5 建立，B6 扩展）。
  *
  * ## 为什么必须有这一层
  * 评审单原文：「**仅增加 mock 顺序断言不够**」。
@@ -22,6 +22,13 @@
  * | 5 | 默认运行不删除 worktree 与在途记录 | §5 |
  * | 6 | 真实链路不得绕过 diff、敏感文件、租约与测试证据检查 | §2 |
  *
+ * ## 覆盖评审单「B6 检查与交付」
+ * | 要求 | 用例 |
+ * | --- | --- |
+ * | B6-1 连续两个 attempt 的终态记录都保留、互不覆盖 | §8 |
+ * | B6-2 解析出的启动目标真实可启动（`--version`），不返回 `ENOENT` | §7 |
+ * | B6-2 适配器确实用解析结果作为 `command`（不再把裸 `opencode` 交给 spawn） | §7 |
+ *
  * ## 本文件额外逼出的三个缺陷（评审单未列出）
  * | 缺陷 | 现象 | 修复 |
  * | --- | --- | --- |
@@ -29,11 +36,25 @@
  * | 2 | 假 agent 只注入了 `runAttempt`，**没注入常驻入口** | `DaemonDeps.agent_runner` 透传 |
  * | 3 | `spawn` 失败（`ENOENT`）时句柄永不结束 → 执行器永久死等 | `adapters/opencode.ts` 与 `core/process.ts` 增加启动失败通道，§6 锁定 |
  *
- * 补充事实（B5 实测，供 A 端判断 P3）：本机 `opencode` **确已安装**，但它是 npm
- * 全局安装的 `.cmd` shim（`%APPDATA%\npm\opencode.cmd`）。Node 的
- * `spawn("opencode", …, { shell: false })` 在 Windows 上**无法解析 `.cmd`**，
- * 因此当前 `executable: "opencode"` 的配置在真实链路里必然 ENOENT。
- * §6 正是用这个真实形状取证的（不是模拟）。
+ * ## B5 报告的 P3 阻塞事实（B6 已处置）
+ * 本机 `opencode` **确已安装**，但 PATH 上只有 npm 的 `.cmd` / `.ps1` shim
+ * （`%APPDATA%\npm\opencode.cmd`）。Node 的 `spawn("opencode", …, { shell: false })`
+ * 在 Windows 上**无法解析 `.cmd`**，所以 `executable: "opencode"` 必然 ENOENT。
+ * §6 用这个真实形状取证「起不来时要快速失败」。
+ *
+ * ## B6-2：真实形态与 A 端假设不同（实测）
+ * A 端裁定「保持 `shell: false`，解析出 `node.exe` + CLI JS 入口后用参数数组启动」。
+ * 但本机的 `opencode-ai@1.18.31` **没有 JS 入口**，它是原生程序：
+ * ```text
+ * opencode.cmd   → "%dp0%\node_modules\opencode-ai\bin\opencode.exe"   %*
+ * package.json   → "bin": { "opencode": "./bin/opencode.exe" }
+ * bin/opencode.exe → 179 998 248 字节，文件头 "MZ"（PE 可执行）
+ * 包内唯一的 .mjs   → postinstall.mjs（安装脚本，不是 CLI）
+ * ```
+ * 因此 `adapters/opencode-launcher.ts` **按形态分派**：原生 exe 用绝对路径直接启动；
+ * 若环境里确有 JS 入口则用 `node.exe` + 入口启动。两者都不经 shell，
+ * A 端「绝不经 `cmd.exe /c`、绝不拼命令串」的红线原样成立。
+ * §7 用真实 `spawn` 验证「解析出的目标确实能跑起来」。
  *
  * ## 关于「假 agent」
  * 唯一被替换的是 **OpenCode 进程本身**（本机不调用真实模型，也不烧配额）。
@@ -46,7 +67,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -60,8 +81,15 @@ import type { HeartbeatRequest, HeartbeatTransport } from "../../apps/executor/s
 import type { LeaseClock, LeaseTransport, RenewOutcome } from "../../apps/executor/src/core/lease.js";
 import type { InFlightRecord, RecoveryTransport } from "../../apps/executor/src/core/recovery.js";
 import { git, resolveGitExecutable } from "../../apps/executor/src/core/worktree.js";
-import type { OpenCodeProcessRunner } from "../../apps/executor/src/adapters/opencode.js";
+import type {
+  OpenCodeProcess,
+  OpenCodeProcessRunner,
+} from "../../apps/executor/src/adapters/opencode.js";
 import { NodeOpenCodeProcessRunner, runOpenCodeTask } from "../../apps/executor/src/adapters/opencode.js";
+import {
+  describeLaunchResolution,
+  resolveOpenCodeLaunch,
+} from "../../apps/executor/src/adapters/opencode-launcher.js";
 import type {
   LeaseAcquirer,
   LeaseAcquisition,
@@ -70,7 +98,13 @@ import type {
   ReportAck,
   ResultReporter,
 } from "../../apps/executor/src/transport/adapters.js";
-import { fileInFlightStore, gitPushBranch, inFlightPath, readRemoteBranchSha, runDaemon } from "../../apps/executor/src/daemon.js";
+import {
+  fileInFlightStore,
+  gitPushBranch,
+  inFlightRecordPath,
+  readRemoteBranchSha,
+  runDaemon,
+} from "../../apps/executor/src/daemon.js";
 import type { DaemonDeps, DaemonOptions } from "../../apps/executor/src/daemon.js";
 
 /* ------------------------------------------------------------------ *
@@ -439,7 +473,7 @@ describe("B5 §1 真实链路：未提交改动 → 提交 → 推送 → 远端
 
       /* --- 默认不清理 worktree，也不删除在途记录（P0-1 / P1-2，测试 5）--- */
       expect(existsSync(worktreePath)).toBe(true);
-      const recordFile = inFlightPath(repo.root);
+      const recordFile = inFlightRecordPath(repo.root, "TASK-0001-A1");
       expect(existsSync(recordFile)).toBe(true);
       const record = JSON.parse(readFileSync(recordFile, "utf8")) as InFlightRecord;
       expect(record.state).toBe("reported");
@@ -747,7 +781,7 @@ describe("B5 §5 默认不删除 worktree 与在途记录", () => {
       // worktree 仍被 git 登记（不是被删了一半）
       expect(show(repo.root, ["worktree", "list"])).toContain("TASK-0001-A1");
 
-      const recordFile = inFlightPath(repo.root);
+      const recordFile = inFlightRecordPath(repo.root, "TASK-0001-A1");
       expect(existsSync(recordFile)).toBe(true);
       const record = JSON.parse(readFileSync(recordFile, "utf8")) as InFlightRecord;
       expect(record.state).toBe("reported");
@@ -830,5 +864,210 @@ describe("B5 §6 agent 可执行文件起不来（真实 spawn 一个不可解�
       expect(report.attempts[0]!.pushed).toBe(false);
     },
     120_000,
+  );
+});
+
+/* ================================================================== *
+ * §7 B6-2：解析出的 OpenCode 启动目标必须**真的能跑**
+ *
+ * A 端 B6-2 验收要求：在 B 的 Windows 环境用相同方式运行 `opencode --version`，
+ * 并实际验证适配器启动不返回 `ENOENT`。
+ *
+ * 本组**只校验启动方式**，不做真实模型调用——A 端明确要求不得用版本检查
+ * 冒充真实模型任务成功；反过来也不该为验证「起得来」而烧配额。
+ * 环境里没有 opencode（例如 Linux CI）时本组跳过，**不伪造通过**。
+ * ================================================================== */
+
+/** 立即以给定退出码结束的假进程。§7 只关心 command / args 与解析结果。 */
+function immediateExitProcess(code: number): OpenCodeProcess {
+  return {
+    stdout: (async function* () {
+      /* 无输出 */
+    })(),
+    stderr: (async function* () {
+      /* 无输出 */
+    })(),
+    exit_code: Promise.resolve(code),
+    kill: () => undefined,
+    spawn_error: Promise.resolve(null),
+  };
+}
+
+describe("B6 §7 OpenCode 启动方式：解析 → 真实启动", () => {
+  const resolution = resolveOpenCodeLaunch();
+
+  it("从本机环境解析出绝对路径目标（无任何硬编码用户目录）", () => {
+    if (resolution.kind !== "resolved") {
+      // 环境里没装 opencode：跳过而不是伪造通过
+      console.warn(
+        `[B6 §7] 跳过（本环境未解析出 opencode）：${describeLaunchResolution(resolution)}`,
+      );
+      return;
+    }
+    // 不再是裸命令名——那正是 Windows 上必然 ENOENT 的形态
+    expect(resolution.spec.command).not.toBe("opencode");
+    expect(isAbsolute(resolution.spec.command)).toBe(true);
+    if (resolution.spec.prefix_args.length > 0) {
+      // JS 入口形态：command 必须是 node，入口必须也是绝对路径
+      expect(resolution.spec.command.toLowerCase()).toContain("node");
+      expect(isAbsolute(resolution.spec.prefix_args[0]!)).toBe(true);
+    }
+  });
+
+  it("解析出的目标能真实启动并打印版本（不返回 ENOENT）", async () => {
+    if (resolution.kind !== "resolved") return;
+    const runner = new NodeOpenCodeProcessRunner();
+    const handle = runner.start(
+      resolution.spec.command,
+      [...resolution.spec.prefix_args, "--version"],
+      tmpdir(),
+    );
+
+    /*
+     * 两个都必须注意的细节（各自让本用例失败过一次）：
+     *
+     * 1. `spawn_error` 只在**失败**时兑现，直接 await 它会永久挂起
+     *    （最初把本用例变成了 60 秒超时）。
+     * 2. stdout 必须在**等待退出之前**就开始读：子进程的 stdio 是 paused 模式，
+     *    没人读时管道里的数据不会停在原地等着——先等 `close` 再读只会拿到空串。
+     *    `runOpenCodeTask` 里也是先 `collect(...)` 再 race。
+     */
+    const stdoutPromise = (async (): Promise<string> => {
+      const chunks: string[] = [];
+      for await (const chunk of handle.stdout) {
+        chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      }
+      return chunks.join("");
+    })();
+
+    const outcome = await Promise.race([
+      handle.exit_code.then((code) => ({ kind: "exited" as const, code })),
+      (handle.spawn_error ?? new Promise<never>(() => undefined)).then((error) => ({
+        kind: "spawn_failed" as const,
+        error,
+      })),
+      new Promise<{ kind: "no_exit" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "no_exit" }), 30_000),
+      ),
+    ]);
+
+    if (outcome.kind === "spawn_failed") {
+      throw new Error(`启动失败（本用例要求不得出现 ENOENT）：${outcome.error?.message ?? ""}`);
+    }
+    expect(outcome.kind).toBe("exited");
+    if (outcome.kind !== "exited") {
+      handle.kill("SIGKILL");
+      return;
+    }
+    expect(outcome.code).toBe(0);
+    expect(await stdoutPromise).toMatch(/\d+\.\d+\.\d+/);
+  }, 60_000);
+
+  it("适配器用解析结果作为 command，且参数数组仍然隔离", async () => {
+    const seen: Array<{ command: string; args: readonly string[] }> = [];
+    const recording: OpenCodeProcessRunner = {
+      start(command, args): OpenCodeProcess {
+        seen.push({ command, args });
+        return immediateExitProcess(0);
+      },
+    };
+
+    const result = await runOpenCodeTask(
+      { prompt: "只验证启动参数", cwd: tmpdir(), model: "myapi/test-model", timeout_ms: 5_000 },
+      {},
+      recording,
+    );
+
+    expect(seen).toHaveLength(1);
+    const call = seen[0]!;
+    if (resolution.kind === "resolved") {
+      expect(call.command).toBe(resolution.spec.command);
+      expect(call.args.slice(0, resolution.spec.prefix_args.length)).toEqual([
+        ...resolution.spec.prefix_args,
+      ]);
+      expect(result.launch_source).toBe(resolution.spec.source);
+    }
+    // 提示词仍是**最后一个**位置参数（参数数组隔离，全程未经 shell）
+    expect(call.args[call.args.length - 1]).toBe("只验证启动参数");
+    expect(result.launch_detail.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  /**
+   * 回归锁定：显式 `executable` **不得**被自动探测覆盖。
+   *
+   * 这条是被真实失败逼出来的——最初的实现无条件自动探测，于是
+   * `{ executable: <不存在的路径> }` 被悄悄替换成本机真实的 `opencode.exe`
+   * 并**真的启动了它**（§6 因此拿到 `exit_code = 1` 而不是 `null`）。
+   * 「点名了哪个文件就用哪个文件」必须是一条硬约束。
+   */
+  it("显式 executable 不被自动探测覆盖", async () => {
+    const seen: string[] = [];
+    const recording: OpenCodeProcessRunner = {
+      start(command): OpenCodeProcess {
+        seen.push(command);
+        return immediateExitProcess(1);
+      },
+    };
+    const missing = join(tmpdir(), `dac-not-here-${Date.now()}-${Math.random()}`);
+
+    const result = await runOpenCodeTask(
+      { prompt: "x", cwd: tmpdir(), model: "myapi/test-model", timeout_ms: 5_000 },
+      { executable: missing },
+      recording,
+    );
+
+    expect(seen).toEqual([missing]);
+    expect(result.launch_source).toBe("explicit_executable");
+  }, 30_000);
+});
+
+/* ================================================================== *
+ * §8 B6-1：连续两个 attempt 的终态记录都必须留下
+ *
+ * 评审单 B6-1 的指控是「下一次领取任务会覆盖上一条终态记录」。
+ * 这里用**真实链路**连跑两个 attempt，再逐个检查磁盘上的记录文件——
+ * 单文件实现会让第一个记录消失，从而必然失败。
+ * ================================================================== */
+
+describe("B6 §8 连续两个 attempt 的在途记录互不覆盖", () => {
+  it(
+    "两个 attempt 各留一份终态记录，第二个不覆盖第一个",
+    async () => {
+      const repo = makeRealRepo();
+      const leaseA = makeLease(repo);
+      const leaseB: Lease = { ...leaseA, task_id: "TASK-0002", attempt_id: "TASK-0002-A1" };
+      const taskA = makeTask({ allow: ["apps/demo/**"], deny: [] });
+      const taskB: TaskNode = { ...taskA, task_id: "TASK-0002", title: "第二个任务" };
+
+      const h = makeRealHarness(
+        repo,
+        [
+          { kind: "leased", task: taskA, lease: leaseA },
+          { kind: "leased", task: taskB, lease: leaseB },
+        ],
+        { "apps/demo/feature.ts": "export const f = 1;\n" },
+        { enable_push: false, max_attempts: 2 },
+      );
+
+      const report = await runDaemon(h.options, h.deps);
+      expect(report.attempts).toHaveLength(2);
+
+      // 两份记录**同时**存在于磁盘（B6-1 的核心证据）
+      const fileA = inFlightRecordPath(repo.root, "TASK-0001-A1");
+      const fileB = inFlightRecordPath(repo.root, "TASK-0002-A1");
+      expect(existsSync(fileA)).toBe(true);
+      expect(existsSync(fileB)).toBe(true);
+
+      const recA = JSON.parse(readFileSync(fileA, "utf8")) as InFlightRecord;
+      const recB = JSON.parse(readFileSync(fileB, "utf8")) as InFlightRecord;
+      expect(recA.task_id).toBe("TASK-0001");
+      expect(recB.task_id).toBe("TASK-0002");
+      expect(recA.attempt_id).toBe("TASK-0001-A1");
+      expect(recB.attempt_id).toBe("TASK-0002-A1");
+      // 两个都走到终态，且第一个没有被第二个的 in_flight 写入抹掉
+      expect(recA.state).toBe("reported");
+      expect(recB.state).toBe("reported");
+    },
+    180_000,
   );
 });

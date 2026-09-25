@@ -11,11 +11,12 @@ import { buildFixedIntegrationPlan, parsePendingIntegrationBatch, verifyIntegrat
 
 function usage(): void {
   console.error(`用法：
-  npm exec --workspace @dac/cli -- dac validate-result <json>
-  npm exec --workspace @dac/cli -- dac validate-graph <json>
-  npm exec --workspace @dac/cli -- dac plan-integration <batch-json>
-  npm exec --workspace @dac/cli -- dac verify-integration <batch-json> <evidence-json>
-  npm exec --workspace @dac/cli -- dac validate-timing`);
+  node --import tsx tools/cli/src/index.ts validate-result <json>
+  node --import tsx tools/cli/src/index.ts validate-graph <json>
+  node --import tsx tools/cli/src/index.ts plan-integration <batch-json>
+  node --import tsx tools/cli/src/index.ts verify-integration <batch-json> <evidence-json>
+  node --import tsx tools/cli/src/index.ts validate-timing
+verify-integration 的本地 JSON 不提供可信来源；未接入独立回查时返回失败。`);
 }
 
 async function readJson(path: string): Promise<unknown> {
@@ -59,7 +60,7 @@ try {
     console.log(JSON.stringify({ batch, commands: buildFixedIntegrationPlan(batch, ".local/integration-worktree") }, null, 2));
   } else if (command === "verify-integration" && file && secondFile) {
     const batch = parsePendingIntegrationBatch(await readJson(file));
-    const verification = verifyIntegrationEvidence(batch, (await readJson(secondFile)) as Parameters<typeof verifyIntegrationEvidence>[1]);
+    const verification = verifyIntegrationEvidence(batch, await readJson(secondFile));
     if (!verification.valid) {
       console.error(verification.problems.join("\n"));
       process.exitCode = 1;

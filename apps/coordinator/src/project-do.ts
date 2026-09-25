@@ -1,6 +1,8 @@
 import {
   assertTransition,
   analyzeGraph,
+  DEFAULT_TIMING,
+  ERROR_POLICY,
   EventEnvelopeSchema,
   ExecutorRegistrationSchema,
   IntegrationBatchSchema,
@@ -38,6 +40,8 @@ import {
   type ProjectState,
   type StorageTransactionLike,
 } from "./storage.js";
+import { safelyParallel, validatePlannedTask, validateReadyReport } from "./policy.js";
+import { parsePendingIntegrationBatch } from "@dac/integration";
 
 const INTERNAL_PREFIX = "/internal/";
 
@@ -60,7 +64,7 @@ function responseForIdempotency(state: ProjectState, key: string, body: unknown)
 }
 
 function saveIdempotent(state: ProjectState, key: string, body: unknown, responseBody: unknown, status: number): void {
-  state.idempotency[key] = { fingerprint: fingerprint(body), response: { status, body: responseBody } };
+  state.idempotency[key] = { fingerprint: fingerprint(body), response: { status, body: structuredClone(responseBody) } };
 }
 
 function requireTaskGraph(state: ProjectState): TaskGraph {
@@ -88,7 +92,13 @@ function hasCapabilities(task: TaskNode, registration: ExecutorRegistration): bo
 }
 
 function reportTargetStatus(report: ResultReport): TaskNode["status"] {
-  return report.status === "failed" ? "repair_pending" : report.status;
+  if (report.status === "ready_for_integration" || report.status === "cancelled") return report.status;
+  if (!report.error_code) return "needs_input";
+  const policy = ERROR_POLICY[report.error_code];
+  if (policy.disposition === "repairable") return "repair_pending";
+  if (policy.disposition === "blocked") return (policy.blockedStatus ?? "needs_input") as TaskNode["status"];
+  // v1 没有 failed 状态，fatal/retryable 先安全阻塞，不能按代码错误无限返修。
+  return "needs_input";
 }
 
 function assertBindingMatches(lease: Lease, report: ResultReport): void {
@@ -104,6 +114,13 @@ function reapExpiredLeases(state: ProjectState): void {
   for (const [taskId, lease] of Object.entries(state.leases)) {
     if (Date.parse(lease.expires_at) > now) continue;
     const task = state.graph?.tasks.find((candidate) => candidate.task_id === taskId);
+    if (task?.status === "running" || task?.status === "validating") {
+      assertTransition(task.status, "repair_pending");
+      task.status = "repair_pending";
+      assertTransition(task.status, "ready");
+      task.status = "ready";
+      task.assigned_executor = null;
+    }
     if (task?.status === "leased") {
       assertTransition(task.status, "ready");
       task.status = "ready";
@@ -194,8 +211,14 @@ export class ProjectDurableObject {
     const registration = parsed.data;
     const idempotencyKey = `register_executor:${registration.executor_id}`;
     return this.withTransaction(async (_storage, state) => {
-      const replay = responseForIdempotency(state, idempotencyKey, registration);
-      if (replay) return replay;
+      const previous = state.executors[registration.executor_id];
+      if (previous && Object.values(state.leases).some((lease) => lease.executor_id === registration.executor_id && !leaseExpired(lease))) {
+        const { registered_at: _oldTime, ...oldConfig } = previous;
+        const { registered_at: _newTime, ...newConfig } = registration;
+        if (fingerprint(oldConfig) !== fingerprint(newConfig)) {
+          throw new ApiError(409, "EXECUTOR_BUSY", "执行中不能修改执行器配置");
+        }
+      }
       state.executors[registration.executor_id] = registration;
       const body = { executor_id: registration.executor_id, registered: true };
       saveIdempotent(state, idempotencyKey, registration, body, 200);
@@ -212,6 +235,7 @@ export class ProjectDurableObject {
     }
     const { problems } = analyzeGraph(graph);
     if (problems.length > 0) throw new ApiError(422, "TASK_GRAPH_INVALID", "任务图未通过语义校验", problems);
+    graph.tasks.forEach(validatePlannedTask);
     return this.withTransaction(async (_storage, state) => {
       const key = requireIdempotencyScope({ idempotency_key: graph.requirement_ref }, "submit_requirement");
       const replay = responseForIdempotency(state, key, graph);
@@ -230,15 +254,29 @@ export class ProjectDurableObject {
     const request = parsed.data as LeaseRequest;
     return this.withTransaction(async (_storage, state) => {
       reapExpiredLeases(state);
-      const key = requireIdempotencyScope(request, "lease_task");
+      const key = requireIdempotencyScope(request, `lease_task:${request.executor_id}`);
       const replay = responseForIdempotency(state, key, request);
-      if (replay) return replay;
+      if (replay) {
+        const body = await replay.clone().json() as { lease: Lease | null };
+        if (body.lease) {
+          const active = state.leases[body.lease.task_id];
+          if (!active || active.attempt_id !== body.lease.attempt_id || leaseExpired(active)) {
+            throw new ApiError(409, "LEASE_EPOCH_STALE", "幂等领取记录已失去租约，须使用新领取键");
+          }
+        }
+        return replay;
+      }
       const registration = state.executors[request.executor_id];
       if (!registration) throw new ApiError(403, "EXECUTOR_NOT_REGISTERED", "执行器尚未注册");
       if (registration.agent_kind !== request.agent_kind) throw new ApiError(409, "EXECUTOR_MISMATCH", "agent_kind 与注册信息不一致");
       const graph = requireTaskGraph(state);
+      if (Object.values(state.leases).some((lease) => lease.executor_id === request.executor_id)) {
+        throw new ApiError(409, "EXECUTOR_BUSY", "每个执行器只能持有一个活动租约");
+      }
       const task = graph.tasks.find(
-        (candidate) => candidate.status === "ready" && dependencyReady(state, candidate) && hasCapabilities(candidate, registration),
+        (candidate) => candidate.status === "ready" && dependencyReady(state, candidate) && hasCapabilities(candidate, registration) &&
+          candidate.requires.every((capability) => request.capabilities.includes(capability)) &&
+          graph.tasks.every((other) => !["leased", "running", "validating", "ready_for_integration", "integrating"].includes(other.status) || safelyParallel(candidate, other)),
       );
       if (!task) {
         const body = { task: null, lease: null, status: "empty" };
@@ -246,16 +284,18 @@ export class ProjectDurableObject {
         return jsonResponse(body);
       }
       const attemptNumber = task.attempts_used + 1;
+      if (attemptNumber > 999) throw new ApiError(409, "ATTEMPT_LIMIT_REACHED", "v1 attempt_id 已达到上限，需要人工处理");
       const attemptId = `${task.task_id}-A${attemptNumber}`;
       const lease: Lease = {
         task_id: task.task_id,
         attempt_id: attemptId,
         executor_id: request.executor_id,
         lease_epoch: attemptNumber,
-        expires_at: new Date(Date.now() + 180_000).toISOString(),
+        expires_at: new Date(Date.now() + DEFAULT_TIMING.leaseTtlMs).toISOString(),
         binding: graph.binding,
         agent_kind: registration.agent_kind,
       };
+      assertTransition(task.status, "leased");
       task.status = "leased";
       task.assigned_executor = request.executor_id;
       task.attempts_used = attemptNumber;
@@ -271,9 +311,8 @@ export class ProjectDurableObject {
     if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "续约请求无效", parsed.error.issues);
     const request = parsed.data as RenewLeaseRequest;
     return this.withTransaction(async (_storage, state) => {
-      const key = requireIdempotencyScope(request, "renew_lease");
+      const key = requireIdempotencyScope(request, `renew_lease:${request.executor_id}`);
       const replay = responseForIdempotency(state, key, request);
-      if (replay) return replay;
       const lease = state.leases[request.task_id];
       if (!lease || lease.attempt_id !== request.attempt_id || lease.lease_epoch !== request.lease_epoch) {
         throw new ApiError(409, "LEASE_EPOCH_STALE", "续约不匹配当前租约");
@@ -282,7 +321,8 @@ export class ProjectDurableObject {
       if (lease.executor_id !== request.executor_id) {
         throw new ApiError(409, "NOT_LEASE_HOLDER", "执行器不是当前租约持有者");
       }
-      lease.expires_at = new Date(Date.now() + 180_000).toISOString();
+      if (replay) return replay;
+      lease.expires_at = new Date(Date.now() + DEFAULT_TIMING.leaseTtlMs).toISOString();
       saveIdempotent(state, key, request, lease, 200);
       return jsonResponse(lease);
     });
@@ -293,9 +333,8 @@ export class ProjectDurableObject {
     if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "执行器心跳无效", parsed.error.issues);
     const heartbeat = parsed.data as ExecutorHeartbeatRequest;
     return this.withTransaction(async (_storage, state) => {
-      const key = requireIdempotencyScope(heartbeat, "executor_heartbeat");
+      const key = requireIdempotencyScope(heartbeat, `executor_heartbeat:${heartbeat.executor_id}`);
       const replay = responseForIdempotency(state, key, heartbeat);
-      if (replay) return replay;
       if (!state.executors[heartbeat.executor_id]) {
         throw new ApiError(403, "EXECUTOR_NOT_REGISTERED", "执行器尚未注册");
       }
@@ -308,7 +347,15 @@ export class ProjectDurableObject {
         if (lease.executor_id !== heartbeat.executor_id) {
           throw new ApiError(409, "NOT_LEASE_HOLDER", "执行器不是当前租约持有者");
         }
+        if (heartbeat.state === "running") {
+          const task = findTask(state, heartbeat.task_id);
+          if (task.status === "leased") {
+            assertTransition(task.status, "running");
+            task.status = "running";
+          }
+        }
       }
+      if (replay) return replay;
       const receivedAt = new Date().toISOString();
       state.heartbeats[heartbeat.executor_id] = { ...heartbeat, received_at: receivedAt };
       const body = { accepted: true, executor_id: heartbeat.executor_id, received_at: receivedAt };
@@ -379,6 +426,8 @@ export class ProjectDurableObject {
         throw new ApiError(409, "NOT_LEASE_HOLDER", "执行器不是当前租约持有者");
       }
       assertBindingMatches(lease, report);
+      if (lease.agent_kind !== report.agent_kind) throw new ApiError(409, "EXECUTOR_MISMATCH", "报告 agent_kind 与租约不一致");
+      validateReadyReport(task, report);
       // 结果报告由持有租约的执行器提交，因此报告本身可以确认已开工。
       // 协议要求 leased → running 只能由当前租约持有者推进；这里完成这一步，
       // 随后再按报告状态推进到 validating 或异常状态。
@@ -386,13 +435,14 @@ export class ProjectDurableObject {
         assertTransition(task.status, "running");
         task.status = "running";
       }
-      if (report.status === "ready_for_integration" && task.status === "running") {
+      const target = reportTargetStatus(report);
+      if ((target === "ready_for_integration" || target === "blocked_approval") && task.status === "running") {
         assertTransition(task.status, "validating");
         task.status = "validating";
       }
-      const target = reportTargetStatus(report);
       if (task.status !== target) assertTransition(task.status, target);
       task.status = target;
+      task.assigned_executor = null;
       state.reports[report.task_id] = report;
       delete state.leases[report.task_id];
       const body = { accepted: true, task_id: task.task_id, status: task.status };
@@ -419,6 +469,9 @@ export class ProjectDurableObject {
     const parsed = EventEnvelopeSchema.safeParse(input);
     if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "GitHub 事件无效", parsed.error.issues);
     const event = parsed.data as EventEnvelope;
+    if (event.project_id !== this.projectId || !event.event_type.startsWith("github.")) {
+      throw new ApiError(422, "EVENT_INVALID", "此入口仅接收当前项目的 GitHub 事件记录");
+    }
     return this.withTransaction(async (_storage, state) => {
       const key = `github_event:${event.event_id}`;
       const replay = responseForIdempotency(state, key, event);
@@ -434,11 +487,31 @@ export class ProjectDurableObject {
     const parsed = IntegrationBatchSchema.safeParse(input);
     if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "整合批次无效", parsed.error.issues);
     const batch = parsed.data as IntegrationBatch;
+    try { parsePendingIntegrationBatch(batch); }
+    catch { throw new ApiError(422, "BATCH_INVALID", "新批次必须 pending、候选唯一且不能含基线"); }
+    if (batch.project_id !== this.projectId || batch.ci_run_id !== null || batch.merged_sha !== null || batch.tree_sha !== null) {
+      throw new ApiError(422, "BATCH_INVALID", "项目不匹配或新批次夹带未经验证的验收结果");
+    }
     return this.withTransaction(async (_storage, state) => {
       const key = `integration_batch:${batch.batch_id}`;
       const replay = responseForIdempotency(state, key, batch);
       if (replay) return replay;
       if (state.batches[batch.batch_id]) throw new ApiError(409, "BATCH_EXISTS", "整合批次已存在");
+      const graph = requireTaskGraph(state);
+      if (Object.values(state.batches).some((current) => current.conclusion === "pending")) {
+        throw new ApiError(409, "BATCH_BUSY", "每个项目只允许一个活动整合批次");
+      }
+      for (const field of ["base_sha", "rules_sha", "contract_sha", "acceptance_sha"] as const) {
+        if (batch[field] !== graph.binding[field]) throw new ApiError(409, "VERSION_BINDING_MISMATCH", "批次版本与任务图不一致");
+      }
+      const selected = batch.candidate_heads.map((head) => graph.tasks.find((task) =>
+        task.status === "ready_for_integration" && state.reports[task.task_id]?.head_sha === head));
+      if (selected.some((task) => !task)) throw new ApiError(422, "BATCH_INVALID", "候选不对应已交付任务");
+      for (const task of selected) {
+        if (!task) continue;
+        assertTransition(task.status, "integrating");
+        task.status = "integrating";
+      }
       state.batches[batch.batch_id] = batch;
       const body = { accepted: true, batch_id: batch.batch_id, conclusion: batch.conclusion };
       saveIdempotent(state, key, batch, body, 201);
@@ -447,7 +520,8 @@ export class ProjectDurableObject {
   }
 
   private async status(): Promise<Response> {
-    const state = await loadProjectState(this.state.storage, this.projectId);
+    return this.withTransaction(async (_storage, state) => {
+    reapExpiredLeases(state);
     return jsonResponse({
       project_id: this.projectId,
       protocol: PROTOCOL_META,
@@ -457,6 +531,7 @@ export class ProjectDurableObject {
       leases: state.leases,
       batches: state.batches,
       event_count: state.events.length,
+    });
     });
   }
 

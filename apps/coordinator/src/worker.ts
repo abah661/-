@@ -30,10 +30,12 @@ function authorize(request: Request, env: CoordinatorEnv): Principal | null {
   const authorization = request.headers.get("authorization");
   if (!authorization?.startsWith("Bearer ")) return null;
   const token = authorization.slice("Bearer ".length);
+  if (!token.trim()) return null;
   if (env.COORDINATOR_API_TOKEN && token === env.COORDINATOR_API_TOKEN) return { kind: "admin" };
   if (!env.COORDINATOR_EXECUTOR_TOKENS_JSON) return null;
   try {
     const tokens = JSON.parse(env.COORDINATOR_EXECUTOR_TOKENS_JSON) as Record<string, unknown>;
+    if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) return null;
     for (const [executorId, candidate] of Object.entries(tokens)) {
       if (typeof candidate === "string" && candidate === token) return { kind: "executor", executorId };
     }
@@ -59,17 +61,21 @@ async function claimedExecutorId(request: Request, target: RouteTarget): Promise
   if (!executorActions.has(target.action)) return null;
   try {
     const body = await request.clone().json() as { executor_id?: unknown };
-    return typeof body.executor_id === "string" ? body.executor_id : null;
+    return body && typeof body.executor_id === "string" ? body.executor_id : null;
   } catch {
     return null;
   }
 }
 
 async function pathClaimsMatch(request: Request, target: RouteTarget): Promise<boolean> {
-  if (!target.pathClaims || request.method === "GET") return true;
+  if (!target.pathClaims) return true;
+  if (request.method === "GET") {
+    const query = new URL(request.url).searchParams;
+    return Object.entries(target.pathClaims).every(([key, value]) => query.get(key) === value);
+  }
   try {
     const body = await request.clone().json() as Record<string, unknown>;
-    return Object.entries(target.pathClaims).every(([key, value]) => body[key] === value);
+    return !!body && Object.entries(target.pathClaims).every(([key, value]) => body[key] === value);
   } catch {
     return false;
   }
@@ -96,7 +102,7 @@ function route(pathname: string): RouteTarget | null {
     status: "status",
     context: "context",
   };
-  const action = actionMap[routeName];
+  const action = Object.hasOwn(actionMap, routeName) ? actionMap[routeName] : undefined;
   if (action) return { projectId, action };
   const renew = routeName.match(/^tasks\/([^/]+)\/lease\/renew$/);
   if (renew?.[1]) return { projectId, action: "renew_lease", pathClaims: { task_id: decodeURIComponent(renew[1]) } };
@@ -126,10 +132,21 @@ export function createCoordinatorWorker() {
       if ((url.pathname === "/health" || url.pathname === "/v1/health") && request.method === "GET") {
         return jsonResponse({ ok: true, service: "dual-agent-coordinator" });
       }
-      const target = route(url.pathname);
+      let target: RouteTarget | null;
+      try {
+        target = route(url.pathname);
+      } catch {
+        return errorResponse(400, "INVALID_PATH", "路径编码无效");
+      }
       if (!target) return errorResponse(404, "NOT_FOUND", "未知协调器路由");
+      if (target.projectId.length > 64 || /[\x00-\x1f/\\]/.test(target.projectId)) {
+        return errorResponse(400, "INVALID_PATH", "project_id 无效");
+      }
       const principal = authorize(request, env);
       if (!principal) return errorResponse(401, "AUTH_REQUIRED", "需要有效的 Bearer 认证");
+      if (principal.kind === "executor" && ["submit_requirement", "github_event", "integration_batch"].includes(target.action)) {
+        return errorResponse(403, "UNAUTHORIZED_OPERATION", "此操作需要管理身份");
+      }
       if (!(await pathClaimsMatch(request, target))) {
         return errorResponse(409, "CONTRACT_MISMATCH", "路径标识与请求体不一致");
       }

@@ -2,6 +2,10 @@
 
 日期：2026-09-25
 
+> 本日后续审计增加了 Git 检查失败时错误放行、敏感路径遗漏、子进程凭据隔离和
+> agent 身份/实际适配器不一致等返修项。请同时执行最新 `B-second-computer-setup.md`
+> 中 B7-1 至 B7-6，不能只修复本页的超时问题。
+
 审查分支：`task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B6`
 
 审查提交：`aa2837408cb98f10b0d619d223c9094b096a1fcd`

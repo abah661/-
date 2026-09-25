@@ -1,271 +1,267 @@
-# 第二台电脑（B 端）接入与双机联调交接单
+# 给第二台电脑的交接单：B7 修复与双机联调准备
 
-日期：2026-09-22  
-适用对象：第二台 Windows 电脑上的 Codex / OpenCode agent  
-用途：完成 B 端常驻执行器入口、安全接入测试 Worker，并与 A 端进行真实双机联调。
+版本：2026-09-25 A 端审计版。本版取代 2026-09-22 的 B4 接入单。
+用途：交给第二台 Windows 电脑上的 agent；用户无需手工写代码或传登录密码。
 
-> 本文件不包含任何 Token、密码、登录文件或私钥。不要要求用户把登录密码发到聊天中，
-> 不要把任何凭据写进 Git、Markdown、日志、截图或命令行参数。
+## 用户现在要做什么
 
-## 用户只需要做三件事
+把本文件发给 B 电脑的 agent，并说：
 
-1. 把本文件交给第二台电脑上的 agent。
-2. 对它说：
+> 按这份最新交接单继续 B7。先检查现有仓库与未提交内容，不要重新从 B4 搭建。
+> 在 B 的范围修复、测试并按既有授权推送 B7 任务分支。缺失信息一次列出。
+> 已批准范围不要重复询问；需要本人登录时告诉我具体页面。
+> 不要索取密码、明文 Token、PFX、私钥或整个登录文件。
 
-   > 按这份交接单执行。能自动完成的直接完成；只有安装全局软件、登录账号或移动加密凭据文件时再告诉我点哪里。不要向我要密码或 Token。
+B 完成后，回传阶段报告和仅含公钥的 `B-token-public.cer`。
+B7 的修复、本地测试不依赖目标业务仓库或 Token，先完成这些工作。
 
-3. 当 agent 生成 `B-token-public.cer` 时，把这个**公钥文件**带回 A 电脑。它不是密码，可以安全转交。A 电脑随后会生成一个只有 B 电脑能解开的 `.p7m` 文件，再把该文件带回 B 电脑。
+## 1. 已核实的事实与基线
 
-其余操作由两台电脑上的 agent 完成。用户不需要手工输入代码命令。
-
----
-
-## 给第二台电脑 agent 的强制任务
-
-你是本项目的 B 端执行者。先完整读取仓库根目录 `AGENTS.md`，再执行本交接单。
-本文件是任务交接，不替代 `AGENTS.md`；两者冲突时执行更严格的限制。
-
-### 1. 已确认的项目事实
-
-| 项目 | 固定值 |
+| 项目 | 值 / 状态 |
 | --- | --- |
-| 协调系统仓库 | `https://github.com/abah661/-.git` |
-| 当前权威分支 | `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` |
-| B4 最低代码基线 | `d493bd263febefcc4faca21da617520ce03fefa8`（必须是当前 HEAD 的祖先） |
-| B4 工作分支 | `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4` |
-| 测试 Worker | `https://dual-agent-coordinator-test.dual-agent-coordinator.workers.dev` |
-| B 执行器身份 | `EXE-B-OPENCODE` |
-| 协议版本 | `1`，已冻结 |
-| 最近双平台 CI | `35701997194`，Windows 与 Ubuntu 均为 `success` |
-| Worker 版本 | `f318a0e7-72fc-45c4-a2db-7cbcb143da20` |
+| 协调系统远端 | https://github.com/abah661/-.git |
+| A 任务分支 | `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` |
+| A 本轮审计起点 | `c2f5f0247c0f5dc1bdadf77d8177e2281cb22727`，当时尚未推送；不是本轮修复后的 SHA |
+| B6 远端分支 | `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B6` |
+| B7 必须包含的 B6 基线 | `aa2837408cb98f10b0d619d223c9094b096a1fcd` |
+| B7 分支 | `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B7` |
+| B6 双平台 CI 历史证据 | run `36005891915`；不能冒充 B7 CI |
+| Worker | https://dual-agent-coordinator-test.dual-agent-coordinator.workers.dev |
+| B 身份 | `EXE-B-OPENCODE` |
+| 协议 | v1 已冻结；不修改 `packages/protocol/**` |
+| B7 远端状态 | A 在 2026-09-25 本轮检查时尚未发现该分支；执行前再次核实 |
+| 独立目标仓库 | A 本地夹具已建，远端 URL 尚未确定 |
+| 双机验收 | P3/P5 尚未完成 |
 
-测试 Worker 已通过 A 端真实云端闭环。B 端模块、Windows 测试和 HTTP 传输层已经存在，
-但 `apps/executor/src/index.ts` 当前只是导出模块，**还不是可常驻运行的执行器**。
-在领取、执行、续租、上报循环真正接通前，不得声称 B 执行器已上线。
+B4 常驻入口与 B5/B6 修复已经存在。不要照旧说明重新实现常驻入口。
+A 接受 B6 的分 attempt 留档、绝对路径原生 `opencode.exe` 无 shell 启动。
+B6 尚未整合：进程终止和检查失败时错误放行等问题仍需修复。
 
-### 2. 权限与修改边界
+A 本轮也在修复协调器、Codex 适配器和整合检查。
+**本地已修复、远端已推送、测试 Worker 已部署是三个不同状态。**
+先从 A 的最新审计报告确认三个 SHA/版本；不要假定线上 Worker 已包含本版行为。
+B7 可以先基于 B6 修复自身代码，A 会在独立验收后进行受控组合。
 
-本任务允许：
+## 2. 文件归属和授权
 
-- 只读检查整仓库；
-- 修改 `apps/executor/**`；
-- 修改或新增 `tests/executor/**`；
-- 在 `docs/handoff/**`、`docs/reports/**` 中记录 B4 的真实证据；
-- 创建并推送 `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4`。
+B 可修改 `apps/executor/**`、`tests/executor/**`，并在
+`docs/handoff/**`、`docs/reports/**` 写证据。
+B 任务分支的修复和推送已有用户授权；按照授权表核对具体范围。
 
-本任务不允许：
+A 负责 `apps/coordinator/**`、`packages/codex-adapter/**`、
+`packages/integration/**`、管理 CLI、冻结协议及 CI。
+不要覆盖 A 代码、改冻结协议、修改 CI、操作 Cloudflare、迁移数据库、推送 main。
+自动合并、生产部署、全局安装、自启、删除及历史重写不在本次范围内。
 
-- 修改 `apps/coordinator/**`、`packages/protocol/**`、`.github/workflows/**`；
-- 覆盖 A 端实现或修改冻结协议来迁就执行器；
-- 直接推送 `main`、自动合并、rebase、强制推送；
-- 修改 Cloudflare、数据库或生产环境；
-- 安装全局软件、配置开机自启或系统服务而不先取得用户明确同意；
-- 删除文件、工作树、日志或历史而不先取得用户明确同意。
+先读适用父级及仓库 `AGENTS.md`。现有文件和未提交工作必须保留。
+源码不能携带凭据，验证日志也不能含凭据。
 
-如果发现协调器或协议确实需要变化，只写变更提案和复现证据，交给 A 端处理。
+## 3. 继续现有仓库，不从头开始
 
-### 3. 首轮检查与仓库准备
-
-先检查，不要凭记忆填写版本：
+先执行只读检查，记录退出码：
 
 ```powershell
-git --version
+git status --short
+git branch --show-current
+git log -5 --oneline
+git remote -v
 node --version
 npm --version
+git --version
 opencode --version
 ```
 
-要求 Node.js `22.x`。OpenCode 必须使用 B 自己的模型服务登录，不能复用 A 的 Codex
-订阅或登录文件。缺少工具时一次列出；继续完成不依赖该工具的工作。安装全局依赖前停下，
-只向用户申请安装该具体软件，不索取账号密码。
+使用 Node 22.x。B6 报告的 OpenCode 为 1.18.31；实际版本以本机输出为准。
+不要为了更新版本主动安装全局依赖。模型登录只由 B 用户在 B 电脑完成。
 
-在一个全新目录克隆权威分支：
+获取 B6 分支，在**新的隔离 worktree**创建 B7；以下在已有协调系统仓库执行：
 
 ```powershell
-git clone --branch task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1 --single-branch https://github.com/abah661/-.git dual-agent-coordinator-b
-Set-Location dual-agent-coordinator-b
-git rev-parse HEAD
-git merge-base --is-ancestor d493bd263febefcc4faca21da617520ce03fefa8 HEAD
+git fetch origin task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B6
+git cat-file -t aa2837408cb98f10b0d619d223c9094b096a1fcd
+git worktree add ../dual-agent-b7 -b task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B7 aa2837408cb98f10b0d619d223c9094b096a1fcd
 ```
 
-`git merge-base --is-ancestor` 必须返回退出码 `0`，表示当前交接分支包含已经通过
-P4 验收的代码基线。`HEAD` 允许包含该基线之后的文档提交，因此不要求与上述 SHA
-逐字相同。若退出码不是 `0`，停止写代码并报告实际 SHA，不要自行选择“差不多”的版本。
+若 B7 分支或目录已存在，先查看其状态并继续已有工作，不能删除、reset 或强行覆盖。
+若 B6 远端前进了，先报告差异；保留新提交，不盲目退回旧点。
+切入新 worktree 后，读取规则并执行 `npm ci`、`npm run check`。
+已有有效依赖时不必反复安装。
 
-然后执行：
+## 4. B7 必修问题和验收要求
+
+### B7-1：进程终止必须有等待上限
+
+B6 的 `core/process.ts` 在强杀失败后仍无界等待 stdout/stderr。
+`SystemTreeKiller.killTree()` 对 taskkill 的等待也无上限。
+
+修复必须覆盖进程、两个输出流、终止工具自身。最终宽限结束仍未退出时，
+返回失败，保留 `kill_failed`，停止当前执行器接新任务并要求处理残留进程。
+不得因无法终止而继续提交、推送或报告成功。
+
+测试：永不退出、流永不关闭、killer 抛错/失败/卡住、继承管道的子进程；
+断言有限时间内返回和无提交/推送副作用。另跑真实 Windows 进程树测试。
+
+### B7-2：Git 检查失败必须拒绝，而不是合规
+
+A 对精确 B6 源码的实际复现：不存在的仓库调用 `checkDiffScope()`，返回
+`{"changed_files":[],"violations":[],"ok":true,"has_uncommitted":false}`。
+
+必须检查所有 diff、status、ls-files、staged 检查的退出码。无效 SHA、仓库不存在、
+Git 不可用、权限错误和部分检查失败都必须阻止提交/推送。
+检查输出使用 NUL 分隔的路径（`-z`），避免中文引号转义、空格和换行文件名误判。
+重命名必须核对旧路径和新路径，不能漏掉禁止目录中的删除。
+
+测试至少覆盖：无效仓库/基线、单条 Git 命令失败、中文和空格路径、重命名跨范围。
+提交前再次核对真正暂存的 diff；通过测试的提交与最终推送 SHA 必须一致。
+
+### B7-3：敏感文件及环境变量边界
+
+A 对 B6 的实际复现：
+`findSensitiveTouches([".env",".ENV","B-token-public.cer",".codex/config.toml"])`
+只命中 `.env`。
+
+Windows 上按大小写不敏感检查敏感路径，覆盖 `.env*`、auth/credentials、
+`.codex/**`、私钥以及 `.cer/.pem/.key/.pfx/.p12/.p7m` 等本项目禁止提交的文件。
+公钥虽然不是密码，仍不应进入代码仓库。
+
+子进程环境须移除协调器管理/执行器 Token、Cloudflare 部署和 GitHub 写入凭据。
+HTTP 传输在父进程使用 Token；不能让目标仓库测试或模型生成的代码继承它。
+模型自身必需的登录按本机配置处理，不向对方导出。
+
+增加回归测试证明禁止文件不会被提交、进程和日志不包含测试用凭据。
+不要用真实 Token 当测试夹具。
+
+### B7-4：执行器身份必须对应实际适配器
+
+B6 的 CLI 允许声明 codex/mock，但 `runAttempt()` 实际调用 OpenCode。
+在未实现相应适配器路由前，B 的启动入口只能接受 opencode；
+遇到 codex/mock 配置应明确拒绝，不能登记一种身份却执行另一种工具。
+A 的 Codex 常驻接入由 A 负责，不能由 B 擅自改 A 适配器。
+
+### B7-5：与 A 修复后的接口对齐
+
+A 本轮收紧的行为（以已部署版本为准）：
+
+- 执行器 Token 不能提交任务图、创建整合批次或向 GitHub 事件入口写数据，返回 403。
+- 同一执行器最多一个活动租约；冲突范围的任务不会并行分配。
+- 新一次轮询使用新幂等键；同一次网络重试复用原键。
+- 过期领取/续约/心跳的旧键不能恢复所有权，返回 409。
+- 注册时间变化允许重启注册；活动租约期间不允许改变执行器配置。
+- 成功报告必须有真实通过用例，证据 ID 一致，commit_shas 包含 head_sha，
+  agent_kind 匹配租约，声明的 changed_files 在范围内。
+- 登录/配额/授权错误按错误码阻塞；fatal 不当作代码返修。
+  retryable 当前保守进入 needs_input，自动重派/退避尚未实现。
+
+401 是认证失效；403 可能是权限或身份问题，不能全部解释成“重新登录”。
+409 也需读取结构化错误码；不能无限重试、重注册或忽略错误继续推送。
+最终以服务端接受的状态为准，保留原始非敏感错误码。
+
+### B7-6：测试命令配置必须真正可运行
+
+B6 的 `loadDaemonOptions()` 只判断 `EXECUTOR_TEST_COMMAND` 是否非空，
+无论内容是什么都改成 `npm run check`；不设置时又不提供测试命令。
+这会让本次只有 `npm test` 的目标仓库无法通过真实测试。
+在本地受信任配置中明确测试程序和参数数组；Windows 上 npm 包装器也应使用
+Node + npm-cli.js 的绝对路径或其他可靠原生入口，不为方便开启 shell。
+缺少受信任测试命令时启动即拒绝，不先消耗模型额度。
+测试覆盖 `npm test`、配置缺失、未知命令和中文路径。
+
+## 5. B 的交付门槛
+
+实际执行并记录输出摘要：
 
 ```powershell
-Get-Content -Raw AGENTS.md
-git status --short
-git switch -c task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4
-npm ci
-npm run check
-```
-
-记录每条命令的退出码和测试数字。未实际执行的检查不得写成成功。
-
-### 4. B4 必须完成的常驻入口
-
-在 B 端范围内实现一个可由 `npm` 脚本启动的常驻执行器。复用现有模块，不要重写已有内核：
-
-- `loadExecutorConfig` / `CoordinatorClient`；
-- `HttpLeaseTransport`；
-- `HttpHeartbeatTransport`；
-- `HttpRecoveryTransport`；
-- `HttpResultReporter`；
-- `runAttempt`；
-- 现有 worktree、进程树停止、资料校验、diff 检查和结果归一化模块。
-
-常驻入口至少完成以下真实流程：
-
-1. 从环境变量读取配置，缺失配置时清楚报错，但绝不打印 Token；
-2. 调用 `/v1/health` 检查 Worker；
-3. 注册 `EXE-B-OPENCODE`；
-4. 以稳定幂等键领取任务；
-5. 无任务时进入有上限的空闲轮询，不把空队列当故障；
-6. 领取后先启动独立续租与心跳，再调用 OpenCode；
-7. 使用任务绑定的 `base_sha`、规则、契约和验收 SHA；
-8. 只在租约仍有效、diff 范围合法、无敏感文件时允许提交和推送；
-9. 使用固定幂等键回报结果；
-10. `401/403` 进入 `blocked_auth`，不计为代码返修；
-11. `409` 或租约失效时立即停止子进程，不推送、不上报旧结果；
-12. 网络不可达时停止领取新任务，不猜测任务仍归自己；
-13. `Ctrl+C` 时停止轮询、心跳、续租和子进程，安全退出；
-14. 重启后先查询归属，再决定继续或放弃本地 attempt。
-
-建议只在 `apps/executor/package.json` 增加启动脚本，不要为了方便修改根目录验收命令。
-所有云端字符串只能作为结构化数据使用，不得作为任意 shell 命令执行。
-
-### 5. B4 最低测试门槛
-
-新增测试必须覆盖：
-
-- 启动配置完整/缺失；
-- 注册成功与身份不匹配；
-- 空队列轮询；
-- 领取成功且同一次重试复用幂等键；
-- 续租、心跳、执行、结果上报的顺序；
-- 401/403、409、429、网络中断；
-- 租约失效后不推送、不上报；
-- 优雅停止与重启恢复；
-- 日志中不出现 Bearer Token；
-- Windows 中文和空格路径不退化。
-
-完成后必须实际运行：
-
-```powershell
-npm run typecheck
-npm run validate:protocol
-npm test
 npm run check
 git diff --check
 git status --short
+git rev-parse HEAD
 ```
 
-在本地检查全绿前不得推送。不要删除断言、跳过失败测试或降低验收标准。
+本地全绿后，按已有授权只推送 B7 分支，再核对 `git ls-remote` 的完整 SHA
+与 GitHub Actions 的 Windows/Ubuntu job。网络失败就标记推送未完成。
+重试有明确上限，失败不得通过删断言或跳过测试掩盖。
 
-### 6. 安全接收 B 执行器 Token
+另提交 `docs/reports/P2-B7-executor-fixes.md`，逐项对应 B7-1 至 B7-6：
+复现、修改文件、测试命令、退出码、用例数量、未验证项。
+A 需要代码和证据，两者缺一不可。
 
-不要让用户复制 Token 到聊天框。使用 Windows 当前用户证书进行加密交接。
+## 6. Token 安全交接：先检查已有证书
 
-#### 6.1 B 电脑生成公钥证书
+旧流程已让 B 生成公钥。先查是否存在且未过期；**不要每次重新生成**。
+证书的 Subject、指纹和有效期需由 B 确认，并与 A 收到的文件核对。
+旧证书设置了 7 天有效期，过期后不能继续用于新交接。
 
-由 agent 在 B 电脑调用 Windows PowerShell 执行；私钥保持不可导出，并留在
-`Cert:\CurrentUser\My`：
+仅缺少有效证书时，按既有测试凭据授权在 B 当前用户证书库创建不可导出的私钥：
 
 ```powershell
-$cert = New-SelfSignedCertificate `
-  -Subject 'CN=DualAgent-B-Token-Handoff' `
-  -Type DocumentEncryptionCert `
-  -KeyExportPolicy NonExportable `
-  -CertStoreLocation 'Cert:\CurrentUser\My' `
-  -NotAfter (Get-Date).AddDays(7)
-
-Export-Certificate `
-  -Cert $cert `
-  -FilePath "$env:USERPROFILE\Desktop\B-token-public.cer"
+$handoffCert = New-SelfSignedCertificate -Subject 'CN=DualAgent-B-Token-Handoff' -Type DocumentEncryptionCert -KeyExportPolicy NonExportable -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddDays(7)
+Export-Certificate -Cert $handoffCert -FilePath "$env:USERPROFILE\Desktop\B-token-public.cer"
 ```
 
-只把 `B-token-public.cer` 交给 A 电脑。**绝对不要导出 PFX 或私钥。**
+不要覆盖已有同名文件；已有文件先验证或选择新文件名。
+只转交 `.cer` 和证书指纹，不导出 PFX、私钥或密码。
 
-#### 6.2 A 电脑生成密文
+A 收到公钥后，在内存中读取已批准的 B 测试 Token，用公钥生成
+`B-executor-token.p7m`。B 在自己的 Windows 用户下解密到内存，再用 DPAPI 保存。
+A 的 DPAPI XML 不能直接给 B 解密。
 
-A 端 agent 收到 `.cer` 后，会从 A 电脑的 Windows DPAPI 加密凭据中只读取
-`EXE-B-OPENCODE` 的 Token，在内存中用该公钥加密，输出：
+不得打印 Token，不落明文临时文件、不写 .env、不写入持久环境变量。
+启动时仅注入受控父进程；依 B7-3 过滤子进程继承。
+密文、公钥和加密副本均不进 Git，不自动删除。
 
-```text
-B-executor-token.p7m
-```
+## 7. 真双机联调的启动条件
 
-A 端不得显示 Token 明文，也不得把明文写入临时文件。
+当前缺失信息一次列出，不反复问用户：
 
-#### 6.3 B 电脑解密并用 DPAPI 保存
+1. B7 通过本地测试、双平台 CI 和 A 独立验收的完整 SHA；
+2. A 修复提交的远端 SHA、测试 Worker 实际部署版本；
+3. 独立业务目标仓库远端 URL，以及双方可访问的基线：
+   `a9434a87f6f2513e7c32185a8f9a6e365162e253`；
+4. B 公钥、密文接收与本机解密状态；
+5. A 提供的 PROJECT_ID 和实际提交的任务图；
+6. B 本机模型标识、登录和配额状态；A 的 Codex 执行循环接入状态。
 
-B 端 agent 收到 `.p7m` 后，将其直接解密到内存，并以 Windows DPAPI `SecureString`
-形式保存到用户本机受限目录。不要把明文写入 `.env`、JSON、Markdown 或注册表环境变量。
-运行时仅注入当前进程的 `COORDINATOR_API_TOKEN`，终端关闭后自动消失。
+目标仓库是小型 user-profile 示例，不能把协调系统当作目标仓库。
+A 端 `P3-demo-task-graph.json` 目前只是候选图，未提交到 Cloudflare。
+目标基线只提供 `npm test`，没有 `npm run check`；
+B 的测试命令配置应准确映射到目标仓库受信任的验收命令。
+不要把任意云端字符串当成 shell 命令。
 
-密文、公钥证书和本地加密副本都不得加入 Git。未经用户批准不要自动删除交接文件。
-
-### 7. 联调时的非敏感运行配置
-
-下面三项可以写入本机启动说明，但不要写 Token：
+基本配置（非敏感）：
 
 ```text
 COORDINATOR_BASE_URL=https://dual-agent-coordinator-test.dual-agent-coordinator.workers.dev
 EXECUTOR_ID=EXE-B-OPENCODE
-PROJECT_ID=<由 A 端在 P3 开始时提供>
+COORDINATOR_AGENT_KIND=opencode
+PROJECT_ID=<A 提供的已创建项目>
+EXECUTOR_REPO_ROOT=<B 本地独立目标仓库>
+OPENCODE_MODEL=<B 本机实际模型标识>
 ```
 
-真实开发任务还需要一个**独立的目标业务仓库**。协调系统仓库不能充当目标业务仓库。
-在 A 端提供 `<PROJECT_ID>`、测试任务图和 `<TARGET_REPO_URL>` 前，可以完成 B4 开发、
-本地测试、Worker 健康检查和执行器注册，但不得伪造真实任务执行成功。
+目标仓库的推送范围另按准确仓库与任务分支核对，不能把协调系统推送授权扩展过去。
+不要在新条件未满足时重建 Worker、数据库或强行领取示例任务。
 
-### 8. 真实双机联调顺序
+## 8. 联调完成的证据
 
-1. B 报告本地 `npm run check` 证据和 B4 提交 SHA；
-2. B 推送且只推送 `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B4`；
-3. A 独立审查并整合 B4，不直接覆盖 `apps/executor/**`；
-4. B 完成安全 Token 接收，健康检查返回 `200`；
-5. B 注册 `EXE-B-OPENCODE`，只报告 HTTP 状态，不报告 Token；
-6. A 创建 P3 项目并提交最小任务图；
-7. B 常驻进程领取任务、续租、心跳、调用 OpenCode、验证、推送任务分支、回报结果；
-8. A 查询最终状态并做固定提交整合和独立验收；
-9. 双方核对 task、attempt、epoch、提交 SHA、测试证据和时间线；
-10. 再执行 P5：断网、租约过期、旧 epoch、认证失效和自动返修。
+P3：两台真实电脑分别启动、领取、真实模型调用、提交、验证、结果回报；
+记录 task_id、attempt_id、epoch、绑定 SHA、实际 head、命令退出码和时间线。
 
-P3 只有在两台真实电脑都留下服务端状态和本地日志证据后才能标记完成。
+P5：实际出现并行重叠；注入组合接口错误；独立验收拒绝；返修后重新验收。
+还须验证断网、过期租约、旧 epoch、认证过期、强杀失败。
+当前 A 的独立 CI 来源回查、批次终结与自动返修派发仍未接完，
+本地 JSON 的通过文案不能作为 P5 证据。
 
-### 9. 每阶段回报格式
+## 9. 回传模板
 
-每次回报必须按下面格式，不写空泛的“已完成”：
+- 阶段与本版交接单日期：
+- B7 分支、基线、HEAD 完整 SHA：
+- B7-1 至 B7-6：逐项修复与测试结果：
+- 本地 Node/OpenCode 版本：
+- 实际命令、退出码、通过/失败/跳过数量：
+- 推送结果及远端 SHA：
+- CI run URL 与两个平台结果：
+- 公钥文件名、证书指纹与有效期（无私钥）：
+- 尚未完成、阻塞与下一步：
+- 真实双机/真实模型调用是否执行：
 
-```markdown
-## B 端阶段回报
-
-- 阶段：B4 / P3 / P5
-- 分支：
-- HEAD SHA：
-- 实际执行命令：
-- 退出码：
-- 测试数量与结果：
-- Cloudflare HTTP 状态（如已执行）：
-- 修改文件：
-- 未完成项：
-- 阻塞项：
-- 下一步：
-```
-
-### 10. 需要一次列出的缺失信息
-
-首次检查后一次性列出以下项目的真实状态，然后继续所有不依赖它们的工作：
-
-- Node.js 22、Git、npm、OpenCode 是否存在及版本；
-- B 自己的 GitHub 与 OpenCode 是否已登录；
-- `B-token-public.cer` 是否已生成；
-- A 是否已返回 `B-executor-token.p7m`；
-- P3 的 `PROJECT_ID`；
-- 独立测试目标仓库 `<TARGET_REPO_URL>`；
-- OpenCode 实际模型标识和配额是否可用。
-
-不得索取或记录用户的 GitHub、Cloudflare、邮箱或模型服务登录密码。
+未执行写“未执行”；网络不通写“网络阻塞”；仅假进程测试通过写“单元测试通过”。

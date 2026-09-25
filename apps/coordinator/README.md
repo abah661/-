@@ -1,56 +1,41 @@
-# apps/coordinator —— Worker API 与 Durable Object（A 负责）
+# 协调器：实现与边界（A 负责）
 
-本目录由 **A 端（Codex）** 负责实现。B 端不得直接修改。
+当前入口是 `src/worker.ts`；路由 DTO 在 `api.ts`，项目事务在 `project-do.ts`，
+存储适配在 `storage.ts`，服务端附加约束在 `policy.ts`。
+冻结协议仍来自 `packages/protocol`，未修改协议包。
 
-依据《项目书》第 7 节与第 P2 节，本目录将包含：
+## 权限
 
-```
-apps/coordinator/
-  src/
-    index.ts              Worker 入口
-    routes/               HTTPS JSON API
-      register-executor.ts   注册执行器
-      submit-requirement.ts  提交需求
-      lease-task.ts          领取任务
-      renew-lease.ts         续约
-      report-result.ts       回报结果
-      get-context.ts         获取上下文
-      contract-proposal.ts   提交契约提案
-      query-status.ts        查询状态
-      github-webhook.ts      接收 GitHub 事件
-    do/
-      project-do.ts       每项目一个 Durable Object，事务处理领取与状态转移
-    auth/
-      executors.ts        执行器身份认证映射（不能靠请求字段冒充）
-      github-app.ts       GitHub App 签名验证与去重
-    idempotency.ts        写请求幂等键
-    batch/
-      queue.ts            自建串行批次队列
-      integration.ts      固定提交整合逻辑
-```
+- 健康检查：公开 GET `/v1/health`。
+- 管理员：管理任务图、整合批次和 GitHub 事件记录。
+- 执行器：注册自身、领取、续租、心跳、归属查询、回报结果，以及读取状态/上下文和提交契约提案。
+- Token 在 Worker 映射到 executor_id，路径、请求体或 query 不能冒充其他执行器。
+- 当前 Token 映射未按 project_id 细分。测试环境只供同一受信任项目组使用；
+  不能宣称多租户项目隔离已经实现。
 
-## 首版数据（第 7 节）
+## 服务端检查
 
-项目、执行器、任务、尝试、租约、契约、消息、事件、整合批次与授权记录。
-每个项目一个 Durable Object，**领取和状态转移在事务中处理**。
+- 新任务图仅接受 ready、未分配、未使用 attempt 的任务。
+- 依赖已通过，注册与当前领取请求均具备所需能力，才可派发。
+- 每执行器最多一个活动租约；可能写同一路径的未整合任务保守串行。
+- 心跳可确认 running，心跳不延长租约；执行器仍须独立续租。
+- 过期租约回收后旧 epoch 和旧领取键失效；查询 status 也会回收过期租约。
+- 重复结果报告的精确幂等重放仅返回历史收据，不重新获得租约。
+- 成功报告检查证据 ID、通过用例、提交列表、身份与四项绑定、声明文件范围。
+  文件列表仍来源于执行器，独立受信任 Git 检查不可省略。
+- 新整合批次只能 pending，候选须对应当前已交付成果，同项目仅一个 pending。
 
-> 此为待实施 schema，不表示已获准初始化或迁移。
+## 尚未实现
 
-## 关键约束
+1. 原始自然语言需求的自动规划：当前 requirements/submit 接收已生成的任务图。
+2. 独立 GitHub CI 来源回查、候选变动后的自动失效及批次终结接口。
+3. 诊断与返修任务派发、返修计数/退避、预算熔断和受控合并。
+4. GitHub 原生 webhook 签名入口：events/github 目前只是管理员认证的事件记录入口，
+   不直接信任 GitHub 回调，也不会根据 payload 自动把任务标为 passed。
+5. 长期运行所需的存储容量管理：当前状态与幂等历史保存在一个 project_state 值中；
+   记录增长需要后续审定拆分存储/保留策略，不能自动删历史。
+6. 跨项目执行器容量限制与 Token 的 project 授权范围。
 
-| 约束 | 来源 |
-| --- | --- |
-| 写请求使用幂等键 | 第 7 节 |
-| 回调验证签名并去重 | 第 7 节 |
-| 身份由认证映射，不能靠请求字段冒充 | 第 11 节 |
-| 测试候选代码的 job 不持有协调器密钥或仓库写凭据 | 第 9 节 |
-| 不接受 agent 自报的 CI 成功，需回查 run 的仓库、工作流、批次和结论 | 第 9 节 |
-
-## 部署授权
-
-Worker 部署、凭据创建、初始数据库 schema 均属第 11 节授权表范围，
-**需明确账号、环境、资源和变更后批准**。参见 `docs/authorization.md`。
-
-## 状态
-
-⬜ 尚未实现。前置条件：协议 v1 冻结（P1 完成）。
+当前无可信 CI 观察结果时，离线 verify-integration 返回失败。
+创建批次不等于运行验收，也不等于可合并。
+本轮检查与测试部署事实见 `docs/reports/A-audit-2026-09-25.md`。

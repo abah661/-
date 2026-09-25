@@ -406,3 +406,167 @@ describe("Worker route", () => {
     ]);
   });
 });
+
+async function post(project: ProjectDurableObject, action: string, body: unknown) {
+  return project.fetch(new Request(`https://internal/internal/${action}`, { method: "POST", body: JSON.stringify(body) }));
+}
+const secondRegistration = { ...registration, executor_id: "EXE-B-TEST", agent_kind: "opencode" as const };
+const leaseRequest = (executor = registration, key = "lease") => ({
+  protocol_version: "1", executor_id: executor.executor_id, agent_kind: executor.agent_kind,
+  capabilities: executor.capabilities, idempotency_key: key,
+});
+async function prepared(tasks: unknown[] = graph.tasks) {
+  const project = makeDo();
+  expect((await post(project, "register_executor", registration)).status).toBe(200);
+  expect((await post(project, "register_executor", secondRegistration)).status).toBe(200);
+  expect((await post(project, "submit_requirement", { ...graph, tasks })).status).toBe(201);
+  return project;
+}
+function reportFor(lease: any, overrides: Record<string, unknown> = {}) {
+  return {
+    protocol_version: "1", ...binding, task_id: lease.task_id, attempt_id: lease.attempt_id,
+    executor_id: lease.executor_id, lease_epoch: lease.lease_epoch, agent_kind: lease.agent_kind,
+    head_sha: "5".repeat(40), status: "ready_for_integration", evidence_id: "EV-1",
+    evidence: { evidence_id: "EV-1", command: ["npm", "test"], exit_code: 0, summary: { passed: 1, failed: 0, skipped: 0 } },
+    commit_shas: ["5".repeat(40)], changed_files: ["src/a.ts"], error_code: null,
+    reported_at: new Date().toISOString(), ...overrides,
+  };
+}
+
+describe("A 审计：调度、恢复和验收边界", () => {
+  it("禁止同一个执行器领取第二个活动任务", async () => {
+    const project = await prepared([graph.tasks[0], { ...graph.tasks[0], task_id: "TASK-0002", write_scope: { allow: ["other/**"], deny: [] } }]);
+    await post(project, "lease_task", leaseRequest());
+    expect((await post(project, "lease_task", leaseRequest(registration, "second"))).status).toBe(409);
+  });
+
+  it.each(["src/**", "SRC/**"])("不同执行器不能并行领取重叠范围 %s", async (allow) => {
+    const project = await prepared([graph.tasks[0], { ...graph.tasks[0], task_id: "TASK-0002", write_scope: { allow: [allow], deny: [] } }]);
+    await post(project, "lease_task", leaseRequest());
+    expect(await json(await post(project, "lease_task", leaseRequest(secondRegistration as any)))).toMatchObject({ task: null });
+  });
+
+  it("互不重叠任务可以并行；不同执行器可使用相同幂等键", async () => {
+    const project = await prepared([graph.tasks[0], { ...graph.tasks[0], task_id: "TASK-0002", write_scope: { allow: ["other/**"], deny: [] } }]);
+    await post(project, "lease_task", leaseRequest());
+    expect(await json(await post(project, "lease_task", leaseRequest(secondRegistration as any)))).toMatchObject({ task: { task_id: "TASK-0002" } });
+  });
+
+  it("重启注册允许新的 registered_at；持有租约时不能改变配置", async () => {
+    const project = await prepared();
+    await post(project, "lease_task", leaseRequest());
+    expect((await post(project, "register_executor", { ...registration, registered_at: "2026-09-25T00:00:00.000Z" })).status).toBe(200);
+    expect((await post(project, "register_executor", { ...registration, project_root: "E:/other" })).status).toBe(409);
+  });
+
+  it("领取请求能力缩减时不使用陈旧注册能力派发", async () => {
+    const project = await prepared();
+    expect(await json(await post(project, "lease_task", { ...leaseRequest(), capabilities: ["code"] }))).toMatchObject({ task: null });
+  });
+
+  it.each(["passed", "merged", "leased"])("新任务图不能预置运行/通过状态 %s", async (status) => {
+    expect((await post(makeDo(), "submit_requirement", { ...graph, tasks: [{ ...graph.tasks[0], status }] })).status).toBe(422);
+  });
+
+  it("拒绝含路径穿越的写入范围", async () => {
+    expect((await post(makeDo(), "submit_requirement", { ...graph, tasks: [{ ...graph.tasks[0], write_scope: { allow: ["src/../private/**"], deny: [] } }] })).status).toBe(422);
+  });
+
+  it("过期的领取/续约/心跳不能通过旧幂等键重新获得成功", async () => {
+    vi.useFakeTimers();
+    try {
+      const project = await prepared();
+      const { lease } = await json(await post(project, "lease_task", leaseRequest()));
+      const renew = { protocol_version: "1", task_id: lease.task_id, attempt_id: lease.attempt_id,
+        executor_id: lease.executor_id, lease_epoch: lease.lease_epoch, idempotency_key: "renew" };
+      const heartbeat = { ...renew, state: "running", sent_at: new Date().toISOString(), idempotency_key: "heartbeat" };
+      expect((await post(project, "renew_lease", renew)).status).toBe(200);
+      expect((await post(project, "executor_heartbeat", heartbeat)).status).toBe(200);
+      vi.advanceTimersByTime(181_000);
+      expect((await post(project, "renew_lease", renew)).status).toBe(409);
+      expect((await post(project, "executor_heartbeat", heartbeat)).status).toBe(409);
+      expect((await post(project, "lease_task", leaseRequest())).status).toBe(409);
+      const status = await json(await project.fetch(new Request("https://internal/internal/status")));
+      expect(status.graph.tasks[0]).toMatchObject({ status: "ready", assigned_executor: null });
+      expect(await json(await post(project, "lease_task", leaseRequest(registration, "new")))).toMatchObject({ lease: { lease_epoch: 2 } });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("续租不会改写之前领取的幂等响应", async () => {
+    vi.useFakeTimers();
+    try {
+      const project = await prepared();
+      const { lease } = await json(await post(project, "lease_task", leaseRequest()));
+      vi.advanceTimersByTime(10_000);
+      await post(project, "renew_lease", { protocol_version: "1", task_id: lease.task_id, attempt_id: lease.attempt_id,
+        executor_id: lease.executor_id, lease_epoch: lease.lease_epoch, idempotency_key: "renew" });
+      expect(await json(await post(project, "lease_task", leaseRequest()))).toMatchObject({ lease: { expires_at: lease.expires_at } });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([
+    ["AUTH_EXPIRED", "blocked_auth"], ["QUOTA_EXHAUSTED", "blocked_quota"],
+    ["UNAUTHORIZED_OPERATION", "blocked_approval"], ["ACCEPTANCE_TAMPERED", "needs_input"],
+    ["INTERNAL_ERROR", "needs_input"], ["RATE_LIMITED", "needs_input"], ["TESTS_FAILED", "repair_pending"],
+  ])("按错误策略处理 %s，不接受任意 failed 分类", async (error_code, status) => {
+    const project = await prepared();
+    const { lease } = await json(await post(project, "lease_task", leaseRequest()));
+    const response = await post(project, "report_result", reportFor(lease, { status: "failed", error_code }));
+    expect(response.status).toBe(200);
+    expect(await json(response)).toMatchObject({ status });
+  });
+
+  it.each([
+    { agent_kind: "opencode" }, { evidence_id: "OTHER" }, { commit_shas: [] },
+    { error_code: "TESTS_FAILED" }, { changed_files: ["../secret"] }, { changed_files: ["src/.env"] },
+  ])("拒绝不一致或越界成功报告 %j", async (overrides) => {
+    const project = await prepared();
+    const { lease } = await json(await post(project, "lease_task", leaseRequest()));
+    expect((await post(project, "report_result", reportFor(lease, overrides))).status).toBeGreaterThanOrEqual(400);
+  });
+
+  it("批次只接受当前项目已交付候选，且一次只能一个 pending", async () => {
+    const project = await prepared();
+    const { lease } = await json(await post(project, "lease_task", leaseRequest()));
+    const batch = { batch_id: "BATCH-0001", project_id: graph.project_id, ...binding, candidate_heads: ["5".repeat(40)],
+      trusted_workflow: `.github/workflows/integration.yml@${"a".repeat(40)}`, created_at: new Date().toISOString(), conclusion: "pending" };
+    expect((await post(project, "integration_batch", batch)).status).toBe(422);
+    expect((await post(project, "report_result", reportFor(lease))).status).toBe(200);
+    expect((await post(project, "integration_batch", { ...batch, conclusion: "passed" })).status).toBe(422);
+    expect((await post(project, "integration_batch", { ...batch, project_id: "OTHER" })).status).toBe(422);
+    expect((await post(project, "integration_batch", batch)).status).toBe(201);
+    expect((await post(project, "integration_batch", { ...batch, batch_id: "BATCH-0002" })).status).toBe(409);
+  });
+
+  it("GitHub 事件入口拒绝跨项目和非 GitHub 事件", async () => {
+    const project = await prepared();
+    const event = { event_id: "event", event_type: "batch.passed", protocol_version: "1", project_id: graph.project_id, occurred_at: new Date().toISOString() };
+    expect((await post(project, "github_event", event)).status).toBe(422);
+    expect((await post(project, "github_event", { ...event, event_type: "github.workflow_run", project_id: "OTHER" })).status).toBe(422);
+  });
+});
+
+describe("A 审计：Worker 权限和路径边界", () => {
+  const makeEnv = (fetch: (request: Request) => Promise<Response>): CoordinatorEnv => ({
+    COORDINATOR_API_TOKEN: "admin", COORDINATOR_EXECUTOR_TOKENS_JSON: JSON.stringify({ "EXE-A-TEST": "executor" }),
+    PROJECTS: { idFromName: () => ({ toString: () => "PROJECT-TEST" }), get: () => ({ fetch }) },
+  });
+  it.each(["requirements/submit", "batches", "events/github"])("执行器不能调用管理路由 %s", async (route) => {
+    const forward = vi.fn(async () => new Response("{}"));
+    const response = await createCoordinatorWorker().fetch(new Request(`https://api/v1/projects/PROJECT-TEST/${route}`, {
+      method: "POST", headers: { authorization: "Bearer executor" }, body: "{}",
+    }), makeEnv(forward));
+    expect(response.status).toBe(403);
+    expect(forward).not.toHaveBeenCalled();
+  });
+  it("畸形百分号编码返回 400 而不抛异常", async () => {
+    const response = await createCoordinatorWorker().fetch(new Request("https://api/v1/projects/%ZZ/status"), makeEnv(async () => new Response()));
+    expect(response.status).toBe(400);
+  });
+  it("嵌套 GET ownership 路径和 query 必须一致", async () => {
+    const response = await createCoordinatorWorker().fetch(new Request("https://api/v1/projects/P/tasks/TASK-0001/ownership?task_id=TASK-0002&executor_id=EXE-A-TEST", {
+      headers: { authorization: "Bearer executor" },
+    }), makeEnv(async () => new Response()));
+    expect(response.status).toBe(409);
+  });
+});

@@ -1,0 +1,72 @@
+{
+  "protocol_version": "1",
+  "project_id": "demo-user-profile-p3",
+  "requirement_ref": "P3-local-target@a9434a87f6f2513e7c32185a8f9a6e365162e253：并行实现数据提供和展示模块",
+  "binding": {
+    "base_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+    "rules_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+    "contract_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+    "acceptance_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253"
+  },
+  "created_at": "2026-09-25T15:35:21.328+08:00",
+  "tasks": [
+    {
+      "task_id": "TASK-1001",
+      "kind": "implement",
+      "title": "实现数据提供模块 getUser(id)",
+      "acceptance_criteria": [
+        "getUser('u-1') 同步返回 { id: 'u-1', name: 'Ada' }",
+        "provider 自测通过，并且只修改 provider 写入范围",
+        "输出严格使用冻结契约中的 id 和 name"
+      ],
+      "depends_on": [],
+      "write_scope": {
+        "allow": ["src/provider/**", "tests/provider/**"],
+        "deny": ["src/display/**", "tests/display/**", "tests/integration/**", "acceptance/**", "contracts/**", "docs/**", "AGENTS.md", "package.json", "package-lock.json", ".github/**"]
+      },
+      "contracts": [
+        {
+          "contract_id": "api.user-profile",
+          "version": "v1",
+          "path": "contracts/user-profile.v1.json",
+          "sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+          "role": "provider"
+        }
+      ],
+      "requires": ["code", "test", "git_push"],
+      "expected_interfaces": ["provider.getUser(id): UserProfile"],
+      "status": "ready",
+      "assigned_executor": null,
+      "attempts_used": 0
+    },
+    {
+      "task_id": "TASK-1002",
+      "kind": "implement",
+      "title": "实现展示模块 renderUser(profile)",
+      "acceptance_criteria": [
+        "renderUser({ id: 'u-1', name: 'Ada' }) 返回 'Ada (u-1)'",
+        "display 自测通过，并且只修改 display 写入范围",
+        "真实组合验收会把 provider 输出交给 display"
+      ],
+      "depends_on": [],
+      "write_scope": {
+        "allow": ["src/display/**", "tests/display/**"],
+        "deny": ["src/provider/**", "tests/provider/**", "tests/integration/**", "acceptance/**", "contracts/**", "docs/**", "AGENTS.md", "package.json", "package-lock.json", ".github/**"]
+      },
+      "contracts": [
+        {
+          "contract_id": "api.user-profile",
+          "version": "v1",
+          "path": "contracts/user-profile.v1.json",
+          "sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+          "role": "consumer"
+        }
+      ],
+      "requires": ["code", "test", "git_push"],
+      "expected_interfaces": ["display.renderUser(profile): string"],
+      "status": "ready",
+      "assigned_executor": null,
+      "attempts_used": 0
+    }
+  ]
+}

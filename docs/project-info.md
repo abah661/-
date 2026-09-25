@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `<PROJECT_NAME_AND_GOAL>` | 双人 Agent 自动并行开发系统 | ✅ 已填 |
 | `<COORDINATOR_REPO_URL>` | `https://github.com/abah661/-.git` | ✅ 已填 |
-| `<TARGET_REPO_URL>` | 待填（首次验收用的小示例仓库） | ⬜ 缺 |
+| `<TARGET_REPO_URL>` | 本地示例仓库已建；独立远端 URL 待填 | 🟡 本地完成、远端缺 |
 | `<A_PROJECT_ROOT>` | `E:\双人agent并行开发\双人Agent自动并行开发系统-A端` | ✅ 已填 |
 | `<B_PROJECT_ROOT>` | `C:\Users\lenovo\Desktop\双端连接` | ✅ 已填 |
 | `<ENVIRONMENT_AND_OWNER>` | 资源所有者：**A 端**（负责计费与部署授权） | ✅ 已填 |
@@ -90,9 +90,10 @@ git push -u origin main
 1. **目标示例仓库地址** — `<TARGET_REPO_URL>` 未提供。
    第 4.2 节建议首次验收建立一个非常小的目标示例仓库；
    验收后再注册真实业务仓库。**协调系统仓库已确定，但目标仓库需另建。**
-2. **A 端本地项目路径** — B 端无法代为确定。
-3. **Syncthing 安装授权** — 目录与规则已就绪，但安装需你批准（第 10.2 节步骤 1）。
-4. **Cloudflare 账号状态** — Wrangler 登录与测试 Worker 配置已完成；部署被 Cloudflare 邮箱验证错误 `10034` 阻塞。
+2. **A 端本地项目路径** — 已填入上表。
+3. **Syncthing 安装** — B 端已按授权安装；双端配对和实际资料验收仍待验证。
+4. **Cloudflare 测试环境** — 邮箱阻塞已解除，测试 Worker 已部署；2026-09-25
+   `/v1/health` 只读复核返回 HTTP `200`。
 5. **数据库外部资源** — 当前不另建 D1；测试环境使用 Worker Durable Object SQLite 初始 migration `v1`。
 
 ---

@@ -14,11 +14,11 @@
 | 只读检查、文档、允许目录中的代码与测试 | 按项目规则执行 | ✅ 无需额外批准 |
 | 任务分支 push | 明确仓库、分支前缀、有效期 | ✅ 已授权并已执行 |
 | CI/CD 配置 | 审核具体文件和权限后批准 | ✅ 已授权测试 CI：`.github/workflows/ci.yml`，只读仓库权限 |
-| Worker 部署 | 明确账号、环境、资源后批准 | 🟡 已授权测试 Worker `dual-agent-coordinator-test`；登录成功，部署被 Cloudflare `10034` 阻塞 |
+| Worker 部署 | 明确账号、环境、资源后批准 | ✅ 测试 Worker `dual-agent-coordinator-test` 已部署；2026-09-25 健康端点返回 `200` |
 | 凭据创建 | 明确账号、环境、资源后批准 | ✅ Wrangler OAuth 已完成；仅由系统凭据管理器保存，不记录凭据内容 |
 | 初始数据库 schema | 明确账号、环境、资源后批准 | ✅ 已授权 Durable Object SQLite migration `v1` |
 | 自动合并 | 单独明确目标分支、门槛、范围 | ⬜ 未授权 |
-| 系统安装 / 自启 | 按准确对象另行批准 | ⬜ 未授权（Syncthing 待批） |
+| 系统安装 / 自启 | 按准确对象另行批准 | 🟡 B 端 Syncthing 安装已授权；自启未授权 |
 | 删除 / 迁移 | 按准确对象另行批准 | ⬜ 未授权 |
 | 生产发布 | 按准确对象另行批准 | ⬜ 未授权 |
 | 同伴项目通知 | 首次确认接收者与消息范围 | ⬜ 未授权 |
@@ -69,13 +69,19 @@
 1. **Syncthing 自启授权** — 程序已装并在运行，但**自启未配置**。
    注册 Windows 服务需管理员权限，属"系统安装、自启"范围。
 2. **Syncthing 与 A 端配对** — 需双方交换设备 ID（第 10.2 节步骤 3）。
-3. **目标示例仓库** — `<TARGET_REPO_URL>` 未确定，
-   首次验收需要一个小小的目标示例仓库（与协调系统仓库分开）。
+3. **目标示例仓库** — 本地夹具已建，见 `docs/handoff/P3-demo-target-preflight.md`；
+   独立远端 `<TARGET_REPO_URL>` 仍未确定，不能开始真实双机任务。
 4. **A 端本地项目路径** — 已填写，见 `docs/project-info.md`。
 5. **预算阈值双签** — `docs/budget-and-limits.md` 由 B 端拟定，
    需双方认可后生效。
-6. **Cloudflare 账号邮箱验证状态** — Wrangler OAuth 登录已完成，测试 Worker 名称为
-   `dual-agent-coordinator-test`；Cloudflare API 仍返回邮箱未验证错误 `10034`，因此部署尚未成功。
+6. **B 执行器 Token 交接** — 测试 Worker 已部署，A 端测试 Token 以 Windows 加密方式
+   本机保存；B 端仍需通过其公钥证书接收独立的加密交接文件。不得发送明文 Token。
+
+## 2026-09-25 状态核对
+
+- 邮箱验证阻塞 `10034` 已解除；测试 Worker 部署和认证闭环见 `docs/reports/P4-A-cloud-ci.md`。
+- 当日对 `/v1/health` 发起只读请求，返回 HTTP `200` 和 `ok:true`。
+- 上述状态更新只记录已经完成的测试环境操作，不扩大自动合并或生产发布授权。
 
 ---
 

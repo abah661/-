@@ -1,6 +1,6 @@
 # 给第二台电脑的交接单：B7 修复与双机联调准备
 
-版本：2026-09-25 A 端审计版。本版取代 2026-09-22 的 B4 接入单。
+版本：2026-09-26 发布验证补充版（基于 2026-09-25 A 端审计）。本版取代 2026-09-22 的 B4 接入单。
 用途：交给第二台 Windows 电脑上的 agent；用户无需手工写代码或传登录密码。
 
 ## 用户现在要做什么
@@ -22,11 +22,15 @@ B7 的修复、本地测试不依赖目标业务仓库或 Token，先完成这�
 | 协调系统远端 | https://github.com/abah661/-.git |
 | A 任务分支 | `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` |
 | A 本轮审计起点 | `c2f5f0247c0f5dc1bdadf77d8177e2281cb22727`，当时尚未推送；不是本轮修复后的 SHA |
+| A 已推送修复代码 | `e7304ad982efbb6ad23d54407139084ba15d7ebc`；后续可能有纯文档提交 |
+| A 修复代码 CI | [36119639710](https://github.com/abah661/-/actions/runs/36119639710)，Windows/Ubuntu success，2026-09-26 已回查 |
 | B6 远端分支 | `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B6` |
 | B7 必须包含的 B6 基线 | `aa2837408cb98f10b0d619d223c9094b096a1fcd` |
 | B7 分支 | `task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B7` |
 | B6 双平台 CI 历史证据 | run `36005891915`；不能冒充 B7 CI |
 | Worker | https://dual-agent-coordinator-test.dual-agent-coordinator.workers.dev |
+| 测试 Worker 已部署版本 | `ec2d6195-93d2-44a6-a6c4-b584d7679656`，包含 A 本轮接口修复 |
+| 部署后接口烟测 | `AUDIT-20260926001014`，21 项 HTTP 检查通过；仅 API 夹具，不是真双机 |
 | B 身份 | `EXE-B-OPENCODE` |
 | 协议 | v1 已冻结；不修改 `packages/protocol/**` |
 | B7 远端状态 | A 在 2026-09-25 本轮检查时尚未发现该分支；执行前再次核实 |
@@ -37,9 +41,9 @@ B4 常驻入口与 B5/B6 修复已经存在。不要照旧说明重新实现常�
 A 接受 B6 的分 attempt 留档、绝对路径原生 `opencode.exe` 无 shell 启动。
 B6 尚未整合：进程终止和检查失败时错误放行等问题仍需修复。
 
-A 本轮也在修复协调器、Codex 适配器和整合检查。
+A 本轮已修复协调器、Codex 适配器和整合检查，并完成上表中的发布验证。
 **本地已修复、远端已推送、测试 Worker 已部署是三个不同状态。**
-先从 A 的最新审计报告确认三个 SHA/版本；不要假定线上 Worker 已包含本版行为。
+先从 A 的最新审计报告确认代码 SHA、CI 和 Worker 版本；未来若有新版本仍需重新核对。
 B7 可以先基于 B6 修复自身代码，A 会在独立验收后进行受控组合。
 
 ## 2. 文件归属和授权

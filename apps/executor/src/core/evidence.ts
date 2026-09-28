@@ -80,6 +80,14 @@ export interface EvidenceResult {
   raw_stderr: string;
   /** 汇总是否成功解析；false 时 summary 记为 0/0/0 且调用方需警惕 */
   summary_parsed: boolean;
+  /**
+   * 进程终止过程的异常说明（B7）。正常为 `null`。
+   *
+   * 覆盖 killer 调用失败/超时、强杀后进程仍未退出、stdio 未在窗口内关闭。
+   * 之所以要一路带出来：`exit_code` 为 null 时上层只看到「测试没通过」，
+   * 却看不出是**进程根本杀不掉**（需要人工介入），还是测试真的失败了。
+   */
+  termination_detail: string | null;
 }
 
 /**
@@ -123,5 +131,6 @@ export async function collectEvidence(
     raw_stdout: result.stdout,
     raw_stderr: result.stderr,
     summary_parsed: parsed !== null,
+    termination_detail: result.kill_detail,
   };
 }

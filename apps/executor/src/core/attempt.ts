@@ -272,6 +272,8 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     const evidenceId = `EVID-${lease.task_id}-${lease.attempt_id}-${input.evidence_seq ?? 1}`;
     let evidence: TestEvidence | null = null;
     let rawTestOutput = "";
+    /** 测试进程终止过程的异常说明（B7）；正常为 null */
+    let terminationDetail: string | null = null;
 
     if (input.test_command) {
       const collected = await collectEvidence({
@@ -282,6 +284,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       });
       evidence = collected.evidence;
       rawTestOutput = `${collected.raw_stdout}\n${collected.raw_stderr}`;
+      terminationDetail = collected.termination_detail;
     }
 
     /* --- 6. 创建提交（B5，评审单 P0-2）------------------------- */
@@ -362,6 +365,15 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
 
     /* --- 7. 归一化 -------------------------------------------- */
     setPhase("reporting");
+    // B7：终止异常必须出现在上报备注里。否则云端只看到 exit_code=1，
+    // 无法区分「测试真的失败」与「进程杀不掉、需要人工介入」。
+    const noteParts: string[] = [];
+    if (trace.lease_lost) {
+      noteParts.push(`租约在运行期间丢失（${trace.lease_lost_reason ?? "unknown"}），已放弃推送`);
+    }
+    if (terminationDetail !== null) {
+      noteParts.push(`测试进程终止异常：${terminationDetail}`);
+    }
     const report = normalizeResult({
       lease,
       adapter: agentResult,
@@ -371,9 +383,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       head_sha: head,
       sensitive_touches: sensitive,
       commit_shas: localCommits,
-      note: trace.lease_lost
-        ? `租约在运行期间丢失（${trace.lease_lost_reason ?? "unknown"}），已放弃推送`
-        : null,
+      note: noteParts.length > 0 ? noteParts.join("；") : null,
       reported_at: new Date(now()).toISOString(),
     });
 

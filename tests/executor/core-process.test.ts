@@ -12,17 +12,75 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+  SystemTreeKiller,
   assertSafeArgv,
   collectStream,
   runProcess,
 } from "../../apps/executor/src/core/process.js";
-import type { ChildProcessHandle, ProcessRunner, TreeKiller } from "../../apps/executor/src/core/process.js";
+import type {
+  ChildProcessHandle,
+  KillCommandHandle,
+  KillCommandRunner,
+  KillOutcome,
+  ProcessRunner,
+  TreeKiller,
+} from "../../apps/executor/src/core/process.js";
+import { collectEvidence } from "../../apps/executor/src/core/evidence.js";
+import { normalizeResult } from "../../apps/executor/src/result/normalize.js";
+import type { OpenCodeAdapterResult } from "../../apps/executor/src/adapters/opencode.js";
+import type { DiffCheckResult } from "../../apps/executor/src/core/diff-check.js";
+import type { Lease } from "@dac/protocol";
 import {
   globToRegExp,
   isPathAllowed,
   findSensitiveTouches,
 } from "../../apps/executor/src/core/diff-check.js";
 import { isInside } from "../../apps/executor/src/core/worktree.js";
+
+/* ------------------------------------------------------------------ *
+ * 有界返回断言工具（B7）
+ *
+ * 「函数一定会返回」是 P0 修复的核心承诺，所以断言不能是「等它返回」——
+ * 那在缺陷复现时会直接把测试挂死到 vitest 超时。这里给出硬上限：
+ * 到期未返回即抛错，失败信息直指「缺少有界返回」。
+ * ------------------------------------------------------------------ */
+
+async function withDeadline<T>(promise: Promise<T>, ms: number, label = "操作"): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label}未在 ${ms}ms 内返回（缺少有界返回）`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** 永不结束的流：证明「不能等流关闭」不是理论问题。 */
+function neverEndingStream(first: string): AsyncIterable<string> {
+  let sent = false;
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<string>> {
+          if (!sent) {
+            sent = true;
+            return Promise.resolve({ value: first, done: false });
+          }
+          return new Promise<IteratorResult<string>>(() => {
+            /* 永不结算 */
+          });
+        },
+      };
+    },
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * 进程控制
@@ -44,11 +102,18 @@ class FakeChild implements ChildProcessHandle {
     code?: number | null;
     /** true 表示不自行退出，需等 kill 才结算（模拟真实长驻进程） */
     hang?: boolean;
+    /**
+     * true 表示 stdout **永不关闭**（B7）：即使进程退出，句柄也可能被
+     * 子进程继承而一直开着。读流会永远收不到 done。
+     */
+    streamHangs?: boolean;
   }) {
     this.pid = options.pid ?? 4321;
-    this.stdout = (async function* () {
-      if (options.out) yield options.out;
-    })();
+    this.stdout = options.streamHangs
+      ? neverEndingStream(options.out ?? "PARTIAL")
+      : (async function* () {
+          if (options.out) yield options.out;
+        })();
     this.stderr = (async function* () {
       if (options.err) yield options.err;
     })();
@@ -81,10 +146,13 @@ class RecordingKiller implements TreeKiller {
   child: FakeChild | null = null;
   /** 是否连强杀也不生效（模拟杀不掉的进程） */
   stubborn = false;
-  async killTree(pid: number, force: boolean): Promise<void> {
+  /** 本次停止动作的返回值（B7：killer 也要能报告自己的失败） */
+  outcome: KillOutcome = { ok: true, detail: null };
+  async killTree(pid: number, force: boolean): Promise<KillOutcome> {
     this.calls.push({ pid, force });
-    if (this.stubborn) return;
+    if (this.stubborn) return this.outcome;
     if (force) this.child?.simulateKilled();
+    return this.outcome;
   }
 }
 
@@ -140,8 +208,9 @@ describe("runProcess", () => {
       async killTree(pid, force) {
         killer.calls.push({ pid, force });
         child.simulateKilled();
+        return { ok: true, detail: null };
       },
-    } as unknown as TreeKiller;
+    };
     const runner = new FakeRunner(child);
     const result = await runProcess(
       { executable: "x", args: [], cwd: "." },
@@ -168,12 +237,17 @@ describe("runProcess", () => {
     expect(result.escalated_to_force).toBe(true);
     // 未取得退出码，但函数**确实返回了**（不卡死）
     expect(result.exit_code).toBeNull();
+    // B7：失败原因必须可观察，不能只留一个布尔值
+    expect(result.kill_detail).toMatch(/强杀后进程仍未退出/);
   }, 10_000);
 
   it("进程树停止使用 taskkill /T 于 Windows（真实 killer）", async () => {
-    // 仅验证调用契约：pid 为数字且不抛错
+    // 只验证契约：调用有界返回，且返回**可判定**的结果对象。
+    // 具体失败分类由注入 runner 的用例确定性覆盖（不依赖机器上真实进程表）。
     const { systemTreeKiller } = await import("../../apps/executor/src/core/process.js");
-    await expect(systemTreeKiller.killTree(2 ** 22, false)).resolves.toBeUndefined();
+    const outcome = await withDeadline(systemTreeKiller.killTree(2 ** 22, false), 15_000, "killTree");
+    expect(typeof outcome.ok).toBe("boolean");
+    expect(outcome.ok === true || typeof outcome.detail === "string").toBe(true);
   });
 
   it("收集 stdout 与 stderr 分别返回", async () => {
@@ -184,6 +258,311 @@ describe("runProcess", () => {
     );
     expect(result.stdout).toBe("OUT");
     expect(result.stderr).toBe("ERR");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B7：终止链必须有界（A 端 B6 评审 P0）
+ *
+ * A 端最小复现：注入不结束的退出承诺与输出流、一个不生效的 TreeKiller，
+ * `timeout_ms=20`、`grace_ms=20`，等待 512ms 仍未返回。
+ * 这里把同一场景固化成确定性回归，并**断言一定有界返回**。
+ * ------------------------------------------------------------------ */
+
+describe("runProcess 有界返回（B7）", () => {
+  it("永不退出的进程 + 不生效的 killer + 永不关闭的流 → 有界返回并如实分类", async () => {
+    const killer = new RecordingKiller();
+    killer.stubborn = true; // killer 成功返回，但进程根本没死
+    const child = new FakeChild({ pid: 8888, hang: true, streamHangs: true, out: "PARTIAL-OUT" });
+
+    const result = await withDeadline(
+      runProcess(
+        { executable: "x", args: [], cwd: "." },
+        {
+          timeout_ms: 20,
+          grace_ms: 20,
+          drain_ms: 20,
+          kill_timeout_ms: 20,
+          runner: new FakeRunner(child),
+          killer,
+        },
+      ),
+      1_500,
+      "runProcess",
+    );
+
+    expect(result.timed_out).toBe(true);
+    expect(result.kill_failed).toBe(true);
+    expect(result.exit_code).toBeNull();
+    expect(result.signal).toBeNull();
+    // 已收到的部分输出不能丢：失败证据仍要能落盘
+    expect(result.stdout).toBe("PARTIAL-OUT");
+    expect(result.kill_detail).toMatch(/强杀后进程仍未退出/);
+  });
+
+  it("killer 调用自身挂住 → 仍然返回，原因写进 kill_detail", async () => {
+    const hangingKiller: TreeKiller = {
+      killTree: () =>
+        new Promise<KillOutcome>(() => {
+          /* 永不结算 */
+        }),
+    };
+    const child = new FakeChild({ pid: 6666, hang: true, streamHangs: true });
+
+    const result = await withDeadline(
+      runProcess(
+        { executable: "x", args: [], cwd: "." },
+        {
+          timeout_ms: 20,
+          grace_ms: 20,
+          drain_ms: 20,
+          kill_timeout_ms: 30,
+          runner: new FakeRunner(child),
+          killer: hangingKiller,
+        },
+      ),
+      2_000,
+      "runProcess",
+    );
+
+    expect(result.timed_out).toBe(true);
+    expect(result.kill_failed).toBe(true);
+    expect(result.kill_detail).toMatch(/killer 未在 30ms 内返回/);
+    expect(result.kill_detail).toMatch(/强杀后进程仍未退出/);
+  });
+
+  it("killer 报告自身失败（taskkill 非零退出）→ 失败原因可观察", async () => {
+    const killer = new RecordingKiller();
+    killer.stubborn = true;
+    killer.outcome = { ok: false, detail: "taskkill 退出码 1：ERROR: Access is denied." };
+    const child = new FakeChild({ pid: 5555, hang: true, streamHangs: true });
+
+    const result = await withDeadline(
+      runProcess(
+        { executable: "x", args: [], cwd: "." },
+        {
+          timeout_ms: 20,
+          grace_ms: 20,
+          drain_ms: 20,
+          kill_timeout_ms: 20,
+          runner: new FakeRunner(child),
+          killer,
+        },
+      ),
+      1_500,
+      "runProcess",
+    );
+
+    expect(result.kill_detail).toMatch(/taskkill 退出码 1/);
+  });
+
+  it("killer 抛异常 → 不掩盖超时分类", async () => {
+    const killer: TreeKiller = {
+      killTree: () => Promise.reject(new Error("boom")),
+    };
+    const child = new FakeChild({ pid: 4444, hang: true, streamHangs: true });
+
+    const result = await withDeadline(
+      runProcess(
+        { executable: "x", args: [], cwd: "." },
+        {
+          timeout_ms: 20,
+          grace_ms: 20,
+          drain_ms: 20,
+          kill_timeout_ms: 20,
+          runner: new FakeRunner(child),
+          killer,
+        },
+      ),
+      1_500,
+      "runProcess",
+    );
+
+    expect(result.timed_out).toBe(true);
+    expect(result.kill_detail).toMatch(/killer 抛出异常：boom/);
+  });
+
+  it("进程已退出但 stdout 永不关闭 → 不等待流，有界返回且保留输出", async () => {
+    const child = new FakeChild({ code: 0, out: "L1\nL2\n", streamHangs: true });
+
+    const result = await withDeadline(
+      runProcess(
+        { executable: "x", args: [], cwd: "." },
+        { timeout_ms: 1_000, grace_ms: 50, drain_ms: 50, runner: new FakeRunner(child) },
+      ),
+      1_500,
+      "runProcess",
+    );
+
+    expect(result.exit_code).toBe(0);
+    expect(result.timed_out).toBe(false);
+    expect(result.stdout).toBe("L1\nL2\n");
+    expect(result.kill_detail).toMatch(/stdio 未在 50ms 内关闭/);
+  });
+});
+
+describe("SystemTreeKiller 有界与可观察（B7）", () => {
+  // 注入平台与 runner：让 Windows 分支（失败模式最集中的地方）在 Linux CI 上也能被验证
+  const windows = { platform: "win32" as NodeJS.Platform, timeoutMs: 30 };
+
+  it("taskkill 卡住 → 有界返回 ok:false，并中断该命令本身", async () => {
+    let aborted = 0;
+    const runner: KillCommandRunner = (): KillCommandHandle => ({
+      done: new Promise(() => {
+        /* 永不结算 */
+      }),
+      output: () => "",
+      abort: () => {
+        aborted += 1;
+      },
+    });
+    const killer = new SystemTreeKiller({ ...windows, runner });
+
+    const outcome = await withDeadline(killer.killTree(4242, true), 1_000, "killTree");
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toMatch(/未在 30ms 内返回/);
+    expect(aborted).toBe(1);
+  });
+
+  it("taskkill 非零退出 → ok:false，附退出码与输出摘要", async () => {
+    const runner: KillCommandRunner = () => ({
+      done: Promise.resolve({ code: 1, error: null }),
+      output: () => "ERROR: Access is denied.",
+      abort: () => undefined,
+    });
+    const outcome = await new SystemTreeKiller({ ...windows, runner }).killTree(1, true);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toMatch(/退出码 1/);
+    expect(outcome.detail).toMatch(/Access is denied/);
+  });
+
+  it("taskkill 报「进程不存在」→ 视为已结束，不算失败", async () => {
+    const runner: KillCommandRunner = () => ({
+      done: Promise.resolve({ code: 128, error: null }),
+      output: () => 'ERROR: The process "1" not found.',
+      abort: () => undefined,
+    });
+    const outcome = await new SystemTreeKiller({ ...windows, runner }).killTree(1, true);
+    expect(outcome).toEqual({ ok: true, detail: null });
+  });
+
+  it("taskkill 未能启动 → ok:false，附启动错误", async () => {
+    const runner: KillCommandRunner = () => ({
+      done: Promise.resolve({ code: null, error: new Error("spawn taskkill ENOENT") }),
+      output: () => "",
+      abort: () => undefined,
+    });
+    const outcome = await new SystemTreeKiller({ ...windows, runner }).killTree(1, false);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toMatch(/未能启动/);
+  });
+
+  it("taskkill 正常结束 → ok:true", async () => {
+    const runner: KillCommandRunner = () => ({
+      done: Promise.resolve({ code: 0, error: null }),
+      output: () => "",
+      abort: () => undefined,
+    });
+    const outcome = await new SystemTreeKiller({ ...windows, runner }).killTree(1, true);
+    expect(outcome).toEqual({ ok: true, detail: null });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B7 端到端：超时不得产生 ready_for_integration
+ * ------------------------------------------------------------------ */
+
+const B7_LEASE: Lease = {
+  task_id: "TASK-0001",
+  attempt_id: "TASK-0001-A1",
+  executor_id: "EXE-B-DESKTOP",
+  lease_epoch: 3,
+  expires_at: "2026-09-21T12:00:00.000Z",
+  binding: {
+    base_sha: "a577d66",
+    rules_sha: "a577d66",
+    contract_sha: "a577d66",
+    acceptance_sha: "a577d66",
+  },
+  agent_kind: "opencode",
+};
+
+function b7Adapter(): OpenCodeAdapterResult {
+  return {
+    status: "completed",
+    error_code: null,
+    exit_code: 0,
+    timed_out: false,
+    session_id: "ses_x",
+    final_message: "done",
+    event_counts: { step_start: 1, text: 1, step_finish: 1 },
+    tokens: { total: 100, input: 80, output: 20, reasoning: 0 },
+    cost: 0,
+    stdout_sha256: "a".repeat(64),
+    stderr_sha256: "b".repeat(64),
+    invalid_json_lines: 0,
+    request_url: null,
+  };
+}
+
+const B7_DIFF: DiffCheckResult = {
+  changed_files: ["apps/executor/src/a.ts"],
+  violations: [],
+  ok: true,
+  has_uncommitted: false,
+};
+
+describe("超时进程不得产生 ready_for_integration（B7 端到端）", () => {
+  it("测试进程永不退出 → 证据按失败处理，归一化降级为 repair_pending", async () => {
+    const child = new FakeChild({
+      pid: 3210,
+      hang: true,
+      streamHangs: true,
+      out: "   Tests  0 passed (0)\n",
+    });
+    // 优雅停止即生效，但**拿不到退出码**：进程被杀，输出流仍开着
+    const killer: TreeKiller = {
+      killTree: () => {
+        child.simulateKilled();
+        return Promise.resolve({ ok: true, detail: null });
+      },
+    };
+
+    const collected = await withDeadline(
+      collectEvidence(
+        { command: ["npm", "test"], cwd: ".", timeout_ms: 20, evidence_id: "EVID-TASK-0001-A1-1" },
+        { runner: new FakeRunner(child), killer },
+      ),
+      3_000,
+      "collectEvidence",
+    );
+
+    // 未取得退出码 → 不得按成功记账，汇总也认不出（0/0/0 且标记未解析）
+    expect(collected.evidence.exit_code).not.toBe(0);
+    expect(collected.summary_parsed).toBe(false);
+    // 终止异常必须一路带出来：否则云端只看到 exit_code=1，看不出是进程杀不掉
+    expect(collected.termination_detail).toMatch(/stdio 未在 1000ms 内关闭/);
+
+    const report = normalizeResult({
+      lease: B7_LEASE,
+      adapter: b7Adapter(),
+      diff: B7_DIFF,
+      evidence: collected.evidence,
+      base_sha: "a577d66",
+      head_sha: "327d311",
+      sensitive_touches: [],
+      commit_shas: ["327d311"],
+      note: `测试进程终止异常：${collected.termination_detail}`,
+      reported_at: "2026-09-21T12:00:00.000Z",
+    });
+
+    expect(report.status).toBe("repair_pending");
+    expect(report.error_code).toBe("TESTS_FAILED");
+    expect(report.status).not.toBe("ready_for_integration");
+    // 上报备注里必须能看到终止异常，否则人工无从判断要不要介入
+    expect(report.note).toMatch(/测试进程终止异常/);
+    expect(report.note).toMatch(/stdio 未在 1000ms 内关闭/);
   });
 });
 

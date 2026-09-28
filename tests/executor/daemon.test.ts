@@ -55,6 +55,7 @@ import {
   clearInFlightRecord,
   fileInFlightStore,
   findBindingProblem,
+  findResidualProcessRecord,
   inFlightDir,
   inFlightRecordPath,
   isActiveInFlightRecord,
@@ -230,6 +231,8 @@ function makeHarness(config: {
   outcome?: AttemptOutcome;
   attemptRunner?: AttemptRunner;
   inFlight?: InFlightRecord | null;
+  /** B9：磁盘上的**全量**在途记录（含终态），供启动门禁检查残留进程标记 */
+  inFlightRecords?: readonly InFlightRecord[];
   recovery?: TaskOwnership;
   reportAck?: ReportAck | { fail: unknown };
   pushResult?: PushResult;
@@ -329,6 +332,7 @@ function makeHarness(config: {
         );
       },
       load_in_flight: () => config.inFlight ?? null,
+      load_in_flight_records: () => config.inFlightRecords ?? [],
       save_in_flight: (record) => {
         saved.push(record);
       },
@@ -664,6 +668,219 @@ describe("B8 §B7-1 残留进程停机门槛", () => {
     expect(report.stop_reason).toBe("idle_limit");
     expect(h.saved.some((record) => record.state === "reported")).toBe(true);
     expect(report.stop_reason).not.toBe("halt_residual_process");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B9 § 残留进程状态：所有退出分支 + 重启门禁（A 端 B8 复验 §3）
+ *
+ * B8 只在「上报成功 + kill_failed」这一条路径上保留了残留标记：
+ *   1. 取消 / 租约失效分支不检查 kill_failed，日志还声称「已终止子进程」；
+ *   2. 上报失败先写成 failed_to_report，401/403/409 在停机门**之前**就 break；
+ *   3. 启动恢复用 `isActiveInFlightRecord` 过滤，而 `halted_residual_process`
+ *      不是活动租约，于是重启后照常注册、照常领取。
+ * 本组逐条覆盖 A 点名的分支，并锁定「标记存在即拒绝开工」。
+ * ------------------------------------------------------------------ */
+
+describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () => {
+  /** 残留标记 = 结果已收尾但进程没被杀掉。构造它只需改 state。 */
+  const residualRecord = (dir: string, attemptId = "TASK-0001-A1"): InFlightRecord => ({
+    ...makeInFlightRecord(dir, attemptId),
+    state: "halted_residual_process",
+  });
+
+  const killFailedOutcome = (extra: Partial<AttemptOutcome["trace"]> = {}): AttemptOutcome =>
+    makeOutcome({ trace: { ...makeOutcome().trace, kill_failed: true, ...extra } });
+
+  /* --- §3.1 取消 / 租约失效 ---------------------------------- */
+
+  it("① 取消 + kill_failed → 不声称「已终止」、保留残留标记、停止领取新任务", async () => {
+    const controller = new AbortController();
+    const h = makeHarness({
+      // 队列里放两个：没有停机门槛时会继续领第二个
+      script: [
+        { kind: "leased", task: TASK, lease: LEASE },
+        { kind: "leased", task: TASK, lease: LEASE },
+      ],
+      attemptRunner: async () => {
+        controller.abort(); // 模拟 agent 运行中被 Ctrl+C 打断
+        return killFailedOutcome();
+      },
+    });
+    const report = await runDaemon(
+      withLog(makeOptions({ signal: controller.signal }), h.logs),
+      h.deps,
+    );
+
+    // attempt 视角：确实没推送、没上报（事实不变）
+    expect(report.attempts[0]!.result).toBe("skipped_aborted");
+    expect(h.events).not.toContain("push");
+    expect(h.events).not.toContain("report");
+    // 但本机不安全 → 停机，且只领了一次
+    expect(report.stop_reason).toBe("halt_residual_process");
+    expect(h.acquireCalls()).toBe(1);
+    expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
+    // 不得声称子进程「已终止」——那句话在 kill_failed 时是假的
+    expect(h.logs.some((line) => line.includes("已终止子进程"))).toBe(false);
+    expect(h.logs.some((line) => line.includes("未被终止"))).toBe(true);
+  });
+
+  it("② 租约失效 + kill_failed → 保留残留标记并停机", async () => {
+    const h = makeHarness({
+      script: [
+        { kind: "leased", task: TASK, lease: LEASE },
+        { kind: "leased", task: TASK, lease: LEASE },
+      ],
+      outcome: killFailedOutcome({
+        lease_lost: true,
+        lease_lost_reason: "lease_epoch_stale",
+        sideEffectsSkipped: true,
+      }),
+    });
+    const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+
+    expect(report.attempts[0]!.result).toBe("skipped_lease_lost");
+    expect(report.stop_reason).toBe("halt_residual_process");
+    expect(h.acquireCalls()).toBe(1);
+    expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
+    expect(h.logs.some((line) => line.includes("未被终止"))).toBe(true);
+  });
+
+  it("③ 取消但进程已正常终止 → 仍是 skipped_aborted / aborted（不误报残留）", async () => {
+    const controller = new AbortController();
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      attemptRunner: async () => {
+        controller.abort();
+        return makeOutcome(); // kill_failed: false
+      },
+    });
+    const report = await runDaemon(
+      withLog(makeOptions({ signal: controller.signal }), h.logs),
+      h.deps,
+    );
+    expect(report.stop_reason).toBe("aborted");
+    expect(h.saved.at(-1)?.state).toBe("skipped_aborted");
+  });
+
+  /* --- §3.2 上报失败（401/403/409/其他）---------------------- */
+
+  for (const [label, status, code, expectedStop] of [
+    ["401", 401, "AUTH_EXPIRED", "halt_residual_process"],
+    ["403", 403, "AUTH_EXPIRED", "halt_residual_process"],
+    ["409", 409, "LEASE_EPOCH_STALE", "halt_residual_process"],
+    ["500", 500, "INTERNAL_ERROR", "halt_residual_process"],
+  ] as const) {
+    it(`④ 上报 ${label} + kill_failed → 残留标记优先，停机（不再被 ${label} 分支抢走）`, async () => {
+      const h = makeHarness({
+        script: [
+          { kind: "leased", task: TASK, lease: LEASE },
+          { kind: "leased", task: TASK, lease: LEASE },
+        ],
+        outcome: killFailedOutcome(),
+        reportAck: { fail: httpError(status, code) },
+      });
+      const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+
+      expect(report.attempts[0]!.result).toBe("failed_to_report");
+      expect(report.stop_reason).toBe(expectedStop);
+      expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
+      expect(h.acquireCalls()).toBe(1);
+      expect(h.logs.some((line) => line.includes("未被终止"))).toBe(true);
+    });
+  }
+
+  it("⑤ 上报 401 且进程已终止 → 仍走 auth_blocked（回归：不误报残留）", async () => {
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      reportAck: { fail: httpError(401, "AUTH_EXPIRED") },
+    });
+    const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+    expect(report.stop_reason).toBe("auth_blocked");
+    expect(h.saved.at(-1)?.state).toBe("failed_to_report");
+  });
+
+  it("⑥ 上报 409 且进程已终止 → 仍走 lease_lost（回归）", async () => {
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      reportAck: { fail: httpError(409, "LEASE_EPOCH_STALE") },
+    });
+    const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+    expect(report.stop_reason).toBe("lease_lost");
+    expect(h.saved.at(-1)?.state).toBe("failed_to_report");
+  });
+
+  /* --- §3.3 重启门禁 ---------------------------------------- */
+
+  it("⑦ 重启发现残留标记 → 拒绝开工（不注册、不领取任何任务）", async () => {
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      inFlightRecords: [residualRecord("C:\\repo")],
+    });
+    const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+
+    expect(report.stop_reason).toBe("halt_residual_process_on_startup");
+    expect(report.registered).toBe(false);
+    // 「拒绝开工」= 连注册都不做（注册是本次第一个云端写操作）
+    expect(h.events).not.toContain("register");
+    expect(h.events).not.toContain("acquire");
+    expect(h.acquireCalls()).toBe(0);
+    expect(h.logs.some((line) => line.includes("残留进程"))).toBe(true);
+  });
+
+  it("⑧ 残留标记不是活动租约（load_in_flight 看不到），但启动门禁能看到", () => {
+    const record = residualRecord("C:\\repo");
+    // 这正是 B8 的盲点：按「活动租约」过滤会把它漏掉
+    expect(isActiveInFlightRecord(record)).toBe(false);
+    expect(findResidualProcessRecord([record])?.attempt_id).toBe("TASK-0001-A1");
+    // 正常记录不触发
+    expect(findResidualProcessRecord([makeInFlightRecord("C:\\repo", "TASK-0002-A1")])).toBeNull();
+    expect(findResidualProcessRecord([])).toBeNull();
+  });
+
+  it("⑨ 集成 fileInFlightStore：标记在 → 拒绝开工；显式清除后可正常开工", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dac-residual-"));
+    try {
+      const store = fileInFlightStore(dir);
+      store.save_in_flight?.(residualRecord(dir, "TASK-0001-A1"));
+
+      // ① 标记存在 → 拒绝开工
+      const blocked = makeHarness({ script: [{ kind: "empty" }] });
+      const first = await runDaemon(
+        withLog(makeOptions({ max_idle_polls: 1 }), blocked.logs),
+        { ...blocked.deps, ...store },
+      );
+      expect(first.stop_reason).toBe("halt_residual_process_on_startup");
+      expect(blocked.events).not.toContain("acquire");
+      // 记录**原样保留**——门禁不是删除许可
+      expect(listInFlightRecords(dir)).toHaveLength(1);
+
+      // ② 人工显式清除这个标记（唯一被允许的解除方式）
+      const cleared = clearInFlightRecord(dir, "TASK-0001-A1");
+      expect(cleared.removed).toBe(true);
+
+      // ③ 清除后重启正常开工
+      const ok = makeHarness({ script: [{ kind: "empty" }] });
+      const second = await runDaemon(
+        withLog(makeOptions({ max_idle_polls: 1 }), ok.logs),
+        { ...ok.deps, ...store },
+      );
+      expect(second.stop_reason).toBe("idle_limit");
+      expect(ok.events).toContain("acquire");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("⑩ 没有标记时启动门禁不干扰正常流程", async () => {
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      inFlightRecords: [makeInFlightRecord("C:\\repo", "TASK-0009-A1")], // 普通终态/活动记录
+    });
+    const report = await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
+    expect(report.stop_reason).toBe("idle_limit");
+    expect(h.events).toContain("register");
+    expect(h.events).toContain("acquire");
   });
 });
 

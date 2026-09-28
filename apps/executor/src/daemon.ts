@@ -217,6 +217,15 @@ export interface DaemonDeps {
   /** 读取在途记录（重启恢复用）；返回 null 表示无在途 */
   load_in_flight?: () => InFlightRecord | null;
   /**
+   * 列出**全部**在途记录（含终态），供启动门禁检查残留进程标记（B9，A 端 B8 复验）。
+   *
+   * 不能复用 `load_in_flight`：那个只返回仍属活动租约的记录，而
+   * `halted_residual_process` **恰恰不是活动租约**——它描述的是一次已经结束、
+   * 但本机可能仍有残留进程的 attempt。只按「活动租约」过滤，正是 B8 漏掉
+   * 重启门禁的原因。
+   */
+  load_in_flight_records?: () => readonly InFlightRecord[];
+  /**
    * 写入在途记录。
    *
    * **不接受 `null`**（B5，评审单 P1-2）。B4 用 `save_in_flight(null)`
@@ -268,7 +277,16 @@ export type DaemonStopReason =
    * 结果已如实上报之后停止领取新任务：继续跑只会让多个残留进程争抢
    * 同一个 worktree 与文件锁，制造更多无法解释的失败。
    */
-  | "halt_residual_process";
+  | "halt_residual_process"
+  /**
+   * 启动时发现**上一次运行留下的**残留进程标记（B9，A 端 B8 复验 §3.3）。
+   *
+   * B8 会把 `halted_residual_process` 写进在途记录，却没有在启动时消费它：
+   * 重启后照常注册、照常领取——而那个杀不掉的进程可能仍占着 worktree 与文件锁。
+   * 现在启动即拒绝开工，直到人工确认残留已清理、并**显式**清除该标记
+   * （`clearInFlightRecord`，常驻入口不会自动调用）。
+   */
+  | "halt_residual_process_on_startup";
 
 export interface DaemonReport {
   stop_reason: DaemonStopReason;
@@ -377,6 +395,22 @@ export function isActiveInFlightRecord(record: InFlightRecord): boolean {
 }
 
 /**
+ * 找出「有残留进程未清理」的终态记录（B9，A 端 B8 复验 §3.3）。
+ *
+ * 这些记录的含义是：结果已经如实上报，但测试/agent 进程**没被杀掉**。
+ * 它们**不是**活动租约（所以 `load_in_flight` 看不见它们），却必须让重启停下——
+ * 残留进程可能仍占着 worktree 与文件锁，继续开工只会制造无法解释的失败。
+ *
+ * 返回第一条即可：只要存在一条未清理的残留标记，本机就处在「需要人工确认」
+ * 的状态，多一条不改变结论。
+ */
+export function findResidualProcessRecord(
+  records: readonly InFlightRecord[],
+): InFlightRecord | null {
+  return records.find((record) => record.state === "halted_residual_process") ?? null;
+}
+
+/**
  * 列出全部在途记录，**含终态**。按文件名排序（attempt_id 近似时间序）。
  *
  * 导出是为了让测试与人工排查能一次看到所有 attempt 的下场，
@@ -415,8 +449,10 @@ export function listInFlightRecords(repoRoot: string): readonly InFlightRecord[]
  */
 export function fileInFlightStore(
   repoRoot: string,
-): Pick<DaemonDeps, "load_in_flight" | "save_in_flight"> {
+): Pick<DaemonDeps, "load_in_flight" | "load_in_flight_records" | "save_in_flight"> {
   return {
+    // B9：启动门禁需要看到**含终态**的全量记录，才能发现残留进程标记。
+    load_in_flight_records: (): readonly InFlightRecord[] => listInFlightRecords(repoRoot),
     load_in_flight: (): InFlightRecord | null => {
       // **只加载仍为 `in_flight` 的记录**：终态记录（reported / failed_* /
       // abandoned_* / halted_still_mine）不得再被当成活动租约去查归属、
@@ -739,6 +775,22 @@ export async function runDaemon(
   report.health_ok = true;
   log(`[health] OK（${options.config.base_url}）`);
 
+  /* --- 2.5 残留进程门禁（B9，A 端 B8 复验 §3.3）--------------- */
+  // 刻意放在**注册之前**：注册是本次运行的第一个云端写操作，
+  // 「拒绝开工」就必须在它之前拦住，不能先注册再后悔。
+  // 也不放在健康检查之前：health 是只读的，留着它让排查多一条有意义的线索。
+  const residual = findResidualProcessRecord(deps.load_in_flight_records?.() ?? []);
+  if (residual) {
+    log(
+      `[halt] 上次运行留下未清理的残留进程标记（attempt=${residual.attempt_id}）：` +
+        "拒绝开工——可能有杀不掉的进程仍占用 worktree 与文件锁。" +
+        "请人工确认残留进程已清理（必要时重启本机）后，" +
+        "用 clearInFlightRecord 显式清除该标记，再重新启动",
+    );
+    report.stop_reason = "halt_residual_process_on_startup";
+    return report;
+  }
+
   /* --- 3. 注册 ------------------------------------------------ */
   const registration: ExecutorRegistration = {
     protocol_version: "1",
@@ -977,21 +1029,38 @@ export async function runDaemon(
     /* --- 11/13. 租约失效或收到取消：不推送、不上报 ----------- */
     if (outcome.trace.sideEffectsSkipped || aborted()) {
       const cancelled = aborted();
+      // B9（A 端 B8 复验 §3.1）：这条分支同样可能「进程没被杀掉」。
+      // B8 在这里只写了 skipped_*，既没保留残留标记，日志还照旧声称
+      // 「已终止子进程」——那句话在 kill_failed 时是**假的**，不能继续说。
+      const residual = outcome.trace.kill_failed === true;
+      // `attemptRecords.result` 仍记 skipped_*：这次 attempt 在 daemon 视角
+      // 确实没推送、没上报，那是事实。**是否安全**由在途记录的 state 表达。
+      const skipState = cancelled ? "skipped_aborted" : "skipped_lease_lost";
       log(
-        cancelled
-          ? "[attempt] 收到取消信号：已终止子进程，不推送、不上报（租约将自然过期）"
-          : `[attempt] 租约在运行期间失效（${outcome.trace.lease_lost_reason ?? "unknown"}）：不推送、不上报`,
+        residual
+          ? `[attempt] ${cancelled ? "收到取消信号" : "租约在运行期间失效"}，` +
+            "但子进程**未被终止**（kill_failed）：保留残留标记并停止领取新任务，" +
+            "不推送、不上报。请人工确认残留进程已清理后再启动"
+          : cancelled
+            ? "[attempt] 收到取消信号：已终止子进程，不推送、不上报（租约将自然过期）"
+            : `[attempt] 租约在运行期间失效（${outcome.trace.lease_lost_reason ?? "unknown"}）：不推送、不上报`,
       );
       attemptRecords.push({
         task_id: task.task_id,
         attempt_id: lease.attempt_id,
         lease_epoch: lease.lease_epoch,
-        result: cancelled ? "skipped_aborted" : "skipped_lease_lost",
+        result: skipState,
         report_status: outcome.report.status,
         pushed: false,
         error_code: cancelled ? null : "LEASE_EPOCH_STALE",
       });
-      markInFlight(flightRecord, cancelled ? "skipped_aborted" : "skipped_lease_lost");
+      markInFlight(flightRecord, residual ? "halted_residual_process" : skipState);
+      if (residual) {
+        // 残留进程优先于「取消 / 租约失效」：本地有杀不掉的进程要处理，
+        // 这件事比云端租约状态更需要人工介入。
+        report.stop_reason = "halt_residual_process";
+        break;
+      }
       if (cancelled) {
         report.stop_reason = "aborted";
         break;
@@ -1088,6 +1157,11 @@ export async function runDaemon(
       markInFlight(flightRecord, outcome.trace.kill_failed ? "halted_residual_process" : "reported");
     } catch (error) {
       const status = httpStatusOf(error);
+      // B9（A 端 B8 复验 §3.2）：上报失败同样要看 kill_failed。
+      // B8 先无条件写成 failed_to_report，于是 401/403/409 会在停机门**之前**
+      // break 掉，记录里再也看不到「本机还有残留进程」这件事；其他错误虽会
+      // 走到停机门，记录却已经是 failed_to_report。
+      const residual = outcome.trace.kill_failed === true;
       attemptRecords.push({
         task_id: task.task_id,
         attempt_id: lease.attempt_id,
@@ -1097,7 +1171,17 @@ export async function runDaemon(
         pushed,
         error_code: errorCodeOf(error),
       });
-      markInFlight(flightRecord, "failed_to_report");
+      markInFlight(flightRecord, residual ? "halted_residual_process" : "failed_to_report");
+      if (residual) {
+        // 优先于 401/403/409：先保证「本机有杀不掉的进程」被记录下来，
+        // 否则重启后没人知道要去清理它。
+        log(
+          `[halt] 上报失败（HTTP ${status ?? "无"} / ${errorCodeOf(error)}）且进程未被终止：` +
+            "保留残留标记并停止领取新任务；请人工确认残留进程已清理后再启动",
+        );
+        report.stop_reason = "halt_residual_process";
+        break;
+      }
       if (status === 401 || status === 403) {
         log(`[report] 认证失效（HTTP ${status}）：转 blocked_auth，停止`);
         report.stop_reason = "auth_blocked";

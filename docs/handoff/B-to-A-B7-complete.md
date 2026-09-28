@@ -18,8 +18,8 @@ A 端 P0 **成立且已修复**；根因就是评审单指出的那处无界 `aw
 | # | 提交 SHA | 内容 |
 | --- | --- | --- |
 | 1 | `205cdf0d3b62d4251069a12f40eb0469db7c44b8` | B7 实现（4 文件，+748/−76）：`process.ts` / `evidence.ts` / `attempt.ts` / `core-process.test.ts` |
-| 2 | 见下（文档提交） | 返修报告 `docs/reports/B7-B-process-termination-bounded.md` + 本交接单 |
-| 3 | 见下（如有） | 补 CI 运行结果 |
+| 2 | `8ea0fb371d74377cebd2e528ab6413d1842a4c37` | 交付报告 `docs/reports/B7-B-process-termination-bounded.md` + 本交接单 |
+| 3 | 本提交（补录 CI 结果） | 仅改本文件 §五 |
 
 **SHA 核对方式**（本文件若随文档提交前进，其顶端 SHA 无法自指，故以实测为准）：
 
@@ -28,7 +28,9 @@ git ls-remote origin refs/heads/task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B7
 git rev-parse HEAD        # 在 B 端 worktree 内
 ```
 
-B 端推送时两者**逐字一致**的结果记在 §五。
+B 端推送 `8ea0fb3` 时实测：`git ls-remote` 返回
+`8ea0fb371d74377cebd2e528ab6413d1842a4c37`，与本地 `git rev-parse HEAD` **逐字一致**。
+补录本文件 §五 后顶端会前进一次（只含本文件的改动），请以 `ls-remote` 为准。
 
 改动范围（`git diff --name-only aa28374..HEAD` 实测）：
 
@@ -103,7 +105,12 @@ A 端原复现「512ms 仍未返回」→ 修复后 **100ms 返回**，分类正
 
 | 运行 | 提交 | `windows-latest` | `ubuntu-latest` |
 | --- | --- | --- | --- |
-| 本次推送后的新运行 | 见 §二 | **结果尚未取得**（B 端取得后由下一次提交补录） | 同左 |
+| **#24** | `8ea0fb3` | **success**（`Run project checks` 27 s，全程 61 s） | **success**（19 s） |
+
+<https://github.com/abah661/-/actions/runs/36367946211> —— 整体结论 `success`，两个 OS 均 `success`。
+
+对照：B6 的 #20 / #21 在 Windows 上也是 success（28 s 量级）且 Ubuntu success；
+本次 #24 与之同量级，**没有出现 #19 那种 182 s 的异常耗时**。
 
 ## 六、B6 中间 run `36004505007` 的 Windows 失败原因：**未查明**
 

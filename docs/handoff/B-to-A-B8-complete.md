@@ -114,7 +114,25 @@ A 端在 2026-09-28 对**自己的基线**（未整合 B7）跑 `npm run check` 
 
 | 运行 | 提交 | `windows-latest` | `ubuntu-latest` |
 | --- | --- | --- | --- |
-| 待推送后补录 | — | — | — |
+| **#26** | `0897984` | **success**（32 s） | ❌ **failure**（19 s） |
+| **#27** | 修正后（见下） | 待补录 | 待补录 |
+
+**#26 的 Ubuntu 失败已定位并修正**，不是未查明项，根因完整记录在
+`docs/reports/B8-B-executor-hardening.md` §6.2：
+
+- 失败的是 B8 新增用例 `daemon.test.ts`「可执行程序可以是绝对路径（含空格也不被拆开）」，
+  它把例子硬编码成 `C:\Program Files\nodejs\node.exe`。
+- B8-6 的新规则要求「含空白的可执行名必须是**绝对路径且盘上存在**」。
+  该字符串在 Windows 上 `isAbsolute()` 为 `true` 且本机确实存在 → 通过；
+  在 Linux 上 `path.isAbsolute()` 对 Windows 盘符路径返回 `false` → 被判成命令行 → 抛错。
+- 也就是说：**规则在两个平台上都按预期工作，错的是用例的平台假设。**
+- 修正：改用本平台真实存在、目录名带空格的绝对路径（`mkdtempSync`），
+  并把「绝对路径夹带参数」拆成独立的拒绝用例。
+- 已核对：`tests/executor/` 内其余 Windows 路径字面量都只经纯字符串辅助函数
+  （`isInside` / `join`），不触碰 `isAbsolute` / `existsSync`，因此不受影响。
+
+对照历史基线（同样跑 11–19 s，说明 Ubuntu 上是**跑完整套**后才失败，不是早期中断）：
+B7 #25 ubuntu 17 s success、#24 ubuntu 19 s success、B6 #21 ubuntu 11 s success。
 
 ### 5.4 B6 中间 run `36004505007` 的 Windows 失败：**仍未查明**
 

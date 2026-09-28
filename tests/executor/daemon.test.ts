@@ -528,9 +528,20 @@ describe("B8 §B7-6 测试命令结构化配置", () => {
     });
   });
 
-  it("可执行程序可以是绝对路径（含空格也不被拆开）", () => {
-    const exe = "C:\\Program Files\\nodejs\\node.exe";
-    expect(parseTestCommandConfig({ [ENV_KEYS.test_executable]: exe }).executable).toBe(exe);
+  it("含空格的绝对路径被接受（等价于 Program Files 形态，用本平台路径）", () => {
+    // 刻意**不**硬编码 `C:\Program Files\nodejs\node.exe`：在 Linux 上
+    // `path.isAbsolute()` 对 Windows 盘符路径返回 false，会被上面的
+    // 「空白词」规则当成命令行拒绝。第一版就是这么在 Ubuntu CI 上挂掉的
+    // （Windows 上因为该文件确实存在而恰好通过 —— 典型的平台假设）。
+    // 改用本平台真实存在、且目录名带空格的绝对路径。
+    const dir = mkdtempSync(join(tmpdir(), "b8 abs path "));
+    try {
+      const exe = join(dir, "node.exe");
+      writeFileSync(exe, "#!/bin/sh\n", "utf8");
+      expect(parseTestCommandConfig({ [ENV_KEYS.test_executable]: exe }).executable).toBe(exe);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("缺可执行程序 → 启动即拒绝（不再有隐式默认）", () => {
@@ -570,19 +581,13 @@ describe("B8 §B7-6 测试命令结构化配置", () => {
     ).toThrowError(/shell 元字符/);
   });
 
-  it("含空白的**真实绝对路径**仍被接受（不误伤 Program Files 这类安装位置）", () => {
-    // 前缀里带空格 → 生成的临时目录路径含空格，等价于
-    // `C:\Program Files\nodejs\...` 这种本机常见形态。
-    const dir = mkdtempSync(join(tmpdir(), "b8 test cmd "));
+  it("绝对路径后夹带参数仍被拒（整串不是盘上存在的文件）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "b8 abs path "));
     try {
       const exe = join(dir, "npm.cmd");
-      writeFileSync(exe, "@echo off\r\n", "utf8");
-      expect(parseTestCommandConfig({ [ENV_KEYS.test_executable]: exe })).toEqual({
-        executable: exe,
-        args: [],
-      });
-      // 但「绝对路径 + 尾巴参数」仍要拒：整体不是盘上存在的文件，
-      // 说明有人把命令行塞进了这一个变量。
+      writeFileSync(exe, "#!/bin/sh\n", "utf8");
+      // 存在的绝对路径 + 尾巴参数 → 整串不是文件，
+      // 说明有人把一整条命令行塞进了这一个变量。
       expect(() =>
         parseTestCommandConfig({ [ENV_KEYS.test_executable]: `${exe} test` }),
       ).toThrowError(/shell 元字符/);

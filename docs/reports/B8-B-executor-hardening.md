@@ -222,7 +222,8 @@ Windows，Node `v22.22.2`（managed，仓库 `engines` 要求 `>=22 <23`），`C
 > 因此 `npm run check` 是以 managed Node 直接调用 npm 自身（`npm-cli.js run check`）
 > 执行的：同一 node、同一 `package.json` 脚本、同一二进制，不是手抄命令。
 
-CI（Windows / Ubuntu）：见交接单第五节，推送后补录。
+CI（Windows / Ubuntu）：见交接单第五节。第一版 `0897984` 的 Ubuntu 失败
+（Windows 同版本 success）已在 §6.2 定位并修正。
 
 ## 五、A 端原复现场景的等价验证
 
@@ -234,7 +235,11 @@ A 端对 B7-2 的原始复现是「在不存在的仓库路径调用 `checkDiffS
 - 仅 `git status` 失败 → `ok:false` + `error`（这正是原来被当成「工作区干净」的那条）
 - worktree 被父仓库顶替 → `ok:false`（防「核对对象不对却通过」）
 
-## 六、本轮暴露的**测试自身缺陷**（值得记录）
+## 六、本轮暴露的两类**测试自身缺陷**（值得记录）
+
+两类都属于「CI/用例没有在检验它声称在检验的东西」，比被测代码失败更危险。
+
+### 6.1 假绿：用例自己没生效，却显示通过
 
 第一次跑全量时，B7-2 的端到端用例失败：期望 `commit_skipped_reason` 含「Git 核对失败」，
 实际是「与基线无差异」。原因**不在被测代码**，而在用例：
@@ -248,12 +253,35 @@ A 端对 B7-2 的原始复现是「在不存在的仓库路径调用 `checkDiffS
 
 修法：新增 `overwriteExistingForce()`（`open(..., "r+")` 就地覆写 + `ftruncate`，
 不依赖 `cmd`），只在 `EPERM` 且目标已存在时启用，其余错误照旧抛出。
-修好后该用例耗时 7.6 s 并要求 **7.6 s 内真实发生 git 失败**。
+修好后该用例耗时 7.6 s，且要求真实发生 git 失败时才通过。
 
-**为什么写进报告**：这类「用例自己没生效、却显示通过」的假绿，比被测代码失败更危险，
-因为它会让返修看起来已完成。本项已独立列为一类需自查的问题。
+### 6.2 平台假设：用例硬编码 Windows 绝对路径 → Ubuntu CI 失败
+
+**已推送的第一版（`0897984`）CI 结果：`windows-latest` success（32 s）、
+`ubuntu-latest` **failure**（19 s）。** 本地之所以没发现，是因为该用例在 Windows 上
+**恰好**通过：
+
+```ts
+const exe = "C:\\Program Files\\nodejs\\node.exe";   // ← 硬编码
+expect(parseTestCommandConfig({ [ENV_KEYS.test_executable]: exe }).executable).toBe(exe);
+```
+
+B8-6 新增的规则是「可执行名含空白时，必须是**绝对路径且盘上存在**」。
+`C:\Program Files\nodejs\node.exe` 在 Windows 上 `isAbsolute() === true` 且本机确实存在
+→ 通过；在 Linux 上 `path.isAbsolute()` 对 Windows 盘符路径返回 `false`
+→ 被「空白词」规则判成命令行 → 抛错 → 失败。
+
+**这条失败恰好证明新规则在两个平台上都按预期工作**，错的是用例的平台假设。
+
+修法：改用**本平台**真实存在、且目录名带空格的绝对路径
+（`mkdtempSync(join(tmpdir(), "b8 abs path "))`），维持「含空格的绝对路径被接受」的语义；
+把「绝对路径夹带参数」单独拆成一条拒绝用例，避免两条用例重复断言同一件事。
+
+**教训**：跨平台仓库里，任何「绝对路径」的判定都不能用硬编码的外平台路径做例子，
+否则用例在开发者本机会绿、在另一个 OS 的 CI 上才红。
 
 ## 七、未执行（不得写成成功）
+
 
 - 真实 OpenCode 模型调用、真实任务领取/上报、P3 双机验收、P5 自动返修：**均未执行**。
 - 对真实测试 Worker 的 HTTP 实跑仅到**注册**一步（假凭据，零副作用）；401 之外的

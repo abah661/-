@@ -92,7 +92,14 @@ export function normalizeResult(input: NormalizeInput): ResultReport {
 
   // —— 降级判定：只有在 adapter 自称完成时才需要复核 ——
   if (status === "ready_for_integration") {
-    if (sensitiveTouchesPresent(input.sensitive_touches)) {
+    if (diff.error !== null) {
+      // B8（A 端 B7-2）：**无法核对 diff** 与「核对通过」是两回事。
+      // 这条必须排在最前面：读不出 Git 状态时，后面每一项判定都不可信。
+      // 用 `failed` + INTERNAL_ERROR（fatal）而不是 repair_pending：
+      // 这不是 agent 的代码缺陷，返修解决不了，需要人工判断环境。
+      status = "failed";
+      errorCode = "INTERNAL_ERROR";
+    } else if (sensitiveTouchesPresent(input.sensitive_touches)) {
       status = "blocked_approval";
       errorCode = "SENSITIVE_FILE_DETECTED";
     } else if (!diff.ok) {
@@ -151,7 +158,11 @@ function sensitiveTouchesPresent(touches: readonly string[] | undefined): boolea
 function buildNote(input: NormalizeInput, status: ResultStatus): string | null {
   const parts: string[] = [];
 
-  if (!input.diff.ok) {
+  if (input.diff.error !== null) {
+    // B8：把失败原因写进备注，否则云端只看到 INTERNAL_ERROR 而不知为何。
+    parts.push(`Git 核对失败，无法确认写入范围：${input.diff.error}`);
+  }
+  if (!input.diff.ok && input.diff.violations.length > 0) {
     parts.push(`越界文件：${input.diff.violations.join(", ")}`);
   }
   if (input.sensitive_touches && input.sensitive_touches.length > 0) {

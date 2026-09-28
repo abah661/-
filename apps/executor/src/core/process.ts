@@ -24,6 +24,8 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 
+import { scrubbedChildEnv } from "./child-env.js";
+
 /** 一次调用的完整描述。`args` 必须是数组，不接受整串命令。 */
 export interface SpawnSpec {
   /** 可执行文件路径或名称；不含参数 */
@@ -32,7 +34,13 @@ export interface SpawnSpec {
   args: readonly string[];
   /** 工作目录；执行器必须校验它落在允许的 worktree 内 */
   cwd: string;
-  /** 追加或覆盖环境变量；凭据经此注入，不写入仓库与日志 */
+  /**
+   * 追加或覆盖环境变量。
+   *
+   * **会先经过 {@link scrubbedChildEnv} 过滤**（B8）：无论来自 `process.env`
+   * 还是这里的显式注入，凭据名（协调器 Token、Cloudflare/GitHub 写入凭据等）
+   * 一律不进子进程。因此这里**不能**用来给子进程发凭据。
+   */
   env?: Readonly<Record<string, string>>;
   /** 标准输入内容；不给则 stdin 关闭 */
   stdin?: string;
@@ -96,7 +104,10 @@ class NodeProcessRunner implements ProcessRunner {
       shell: false,
       windowsHide: true,
       stdio: [spec.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-      env: spec.env ? { ...process.env, ...spec.env } : process.env,
+      // B8（A 端 B7-3）：**不**原样继承 process.env。
+      // 执行器环境里有 COORDINATOR_API_TOKEN，原样继承等于把协调器凭据
+      // 交给测试子进程与它拉起的一切后代进程。
+      env: scrubbedChildEnv(process.env, spec.env),
     });
     if (spec.stdin !== undefined && child.stdin) {
       child.stdin.end(spec.stdin);

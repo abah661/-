@@ -88,6 +88,14 @@ export interface EvidenceResult {
    * 却看不出是**进程根本杀不掉**（需要人工介入），还是测试真的失败了。
    */
   termination_detail: string | null;
+  /**
+   * 是否**未能终止**测试进程（连强杀都不生效，B8）。
+   *
+   * 与 `termination_detail` 的区别：后者是给人看的说明，本字段是给
+   * 常驻入口做**停机判定**用的信号——为 true 时可能有残留进程仍在占用
+   * worktree 与文件锁，继续领取新任务只会制造更多冲突（A 端 B7-1）。
+   */
+  kill_failed: boolean;
 }
 
 /**
@@ -132,5 +140,6 @@ export async function collectEvidence(
     raw_stderr: result.stderr,
     summary_parsed: parsed !== null,
     termination_detail: result.kill_detail,
+    kill_failed: result.kill_failed,
   };
 }

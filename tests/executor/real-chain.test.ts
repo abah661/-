@@ -68,7 +68,18 @@
 
 import { execFileSync } from "node:child_process";
 import { dirname, isAbsolute, join } from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  ftruncateSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -223,6 +234,30 @@ function makeTask(writeScope: WriteScope): TaskNode {
 }
 
 /**
+ * 覆写一个**已存在但带隐藏属性**的文件。
+ *
+ * Windows 上 `git worktree add` 生成的 `.git` 指针文件带 `A H` 属性，
+ * 普通 `writeFileSync`（即 `open(..., "w")`）会得到 `EPERM`。
+ * 实测过：`chmodSync(0o666)` 不能解锁，`open(..., "r+")` 可以。
+ * 本函数用 `r+` 就地覆写并 **truncate**，保证内容就是给定内容，
+ * 不残留原 gitdir 路径的尾巴。
+ *
+ * 为什么需要它：B8 的「Git 核对失败 → 不提交」用例必须**真的**破坏
+ * worktree 的 git 元数据。若覆写静默失败，diff 会诚实地报告「无差异」，
+ * 用例就退化成一句空断言（这正是本轮第一次跑出来的结果）。
+ */
+function overwriteExistingForce(target: string, content: string): void {
+  const payload = Buffer.from(content, "utf8");
+  const fd = openSync(target, "r+");
+  try {
+    writeSync(fd, payload);
+    ftruncateSync(fd, payload.byteLength);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * 假 OpenCode 进程：只做一件事——**在真实 worktree 里写文件**。
  *
  * 这是「agent 产生了未提交改动」这一真实场景的最小复现；
@@ -234,7 +269,15 @@ function writingAgent(files: Readonly<Record<string, string>>): OpenCodeProcessR
       for (const [relative, content] of Object.entries(files)) {
         const target = join(cwd, relative);
         mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, content, "utf8");
+        try {
+          writeFileSync(target, content, "utf8");
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          // 只对「已存在的隐藏文件」走强制覆写；其它错误照旧抛出，
+          // 免得把真正的写盘失败伪装成「文件已写」。
+          if (code !== "EPERM" || !existsSync(target)) throw error;
+          overwriteExistingForce(target, content);
+        }
       }
       return {
         stdout: (async function* empty() {})(),
@@ -574,6 +617,85 @@ describe("B5 §2 真实链路不得绕过既有检查", () => {
       expect(show(outcome.worktree_path, ["rev-parse", "HEAD"])).toBe(repo.base_sha);
       // 敏感内容必须**没有被提交**
       expect(show(outcome.worktree_path, ["log", "-1", "--format=%s"])).not.toContain("触碰敏感文件");
+    },
+    60_000,
+  );
+
+  it(
+    "敏感边界（.ENV / 公钥证书 / .codex 会话目录）→ 全部拦截（B8 · B7-3）",
+    async () => {
+      const repo = makeRealRepo();
+      const lease = makeLease(repo);
+      const outcome = await runAttempt(
+        {
+          lease,
+          repo_root: repo.root,
+          worktree_root: join(repo.root, ...WORKTREE_ROOT_SEGMENTS),
+          prompt: "触碰多种凭据载体",
+          model: "myapi/test-model",
+          write_scope: { allow: ["**"], deny: [] },
+          test_command: TEST_COMMAND,
+          heartbeat_interval_ms: 50,
+          commit_spec: { summary: "触碰多种凭据载体" },
+        },
+        // A 端复现的四个样例里，原先**只有** .env 命中；这里真实写入其中三个
+        // （大小写变体、证书容器、agent 本地会话目录）验证修复后的行为。
+        makeAttemptDeps(
+          writingAgent({
+            ".ENV": "TOKEN=leaked-upper\n",
+            "B-token-public.cer": "-----BEGIN CERTIFICATE-----\n",
+            ".codex/config.toml": 'model = "x"\n',
+          }),
+        ),
+      );
+
+      expect(outcome.commit).toBeNull();
+      expect(outcome.trace.commit_skipped_reason).toContain("敏感");
+      expect(outcome.trace.commit_skipped_reason).toContain(".ENV");
+      expect(outcome.trace.commit_skipped_reason).toContain("B-token-public.cer");
+      expect(outcome.report.status).toBe("blocked_approval");
+      expect(outcome.report.error_code).toBe("SENSITIVE_FILE_DETECTED");
+      // 三者都不得进入任何提交
+      expect(show(outcome.worktree_path, ["rev-parse", "HEAD"])).toBe(repo.base_sha);
+      expect(outcome.local_commits).toEqual([]);
+    },
+    60_000,
+  );
+
+  it(
+    "Git 核对失败（worktree 元数据被破坏）→ **不创建提交**，报告降级 failed / INTERNAL_ERROR（B8 · B7-2）",
+    async () => {
+      const repo = makeRealRepo();
+      const lease = makeLease(repo);
+      const outcome = await runAttempt(
+        {
+          lease,
+          repo_root: repo.root,
+          worktree_root: join(repo.root, ...WORKTREE_ROOT_SEGMENTS),
+          prompt: "破坏 git 元数据",
+          model: "myapi/test-model",
+          // allow 覆盖全仓，确保拦截来自**核对失败**而不是范围检查
+          write_scope: { allow: ["**"], deny: [] },
+          test_command: TEST_COMMAND,
+          heartbeat_interval_ms: 50,
+          commit_spec: { summary: "破坏 git 元数据" },
+        },
+        // 在 worktree 里 `.git` 是一个**文件**（指向主仓库的 gitdir）。
+        // 把它写成垃圾内容后，该目录无法再确定自己的仓库，
+        // 这正是 A 端「无效仓库却返回 ok:true」缺陷的触发条件。
+        makeAttemptDeps(writingAgent({ ".git": "not-a-gitdir\n" })),
+      );
+
+      // 核对失败必须**当成未通过**：既不创建提交……
+      expect(outcome.commit).toBeNull();
+      expect(outcome.trace.commit_skipped_reason).toContain("Git 核对失败");
+      expect(outcome.trace.git_error).not.toBeNull();
+      // ……也绝不声称可供整合（这是提交流程的最后一道门）
+      expect(outcome.report.status).toBe("failed");
+      expect(outcome.report.status).not.toBe("ready_for_integration");
+      expect(outcome.report.error_code).toBe("INTERNAL_ERROR");
+      expect(outcome.report.note).toContain("Git 核对失败");
+      expect(outcome.local_commits).toEqual([]);
     },
     60_000,
   );

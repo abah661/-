@@ -54,7 +54,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import type { Capability, ErrorCode, ExecutorRegistration, Lease, ResultStatus, TaskNode, WriteScope } from "@dac/protocol";
@@ -69,6 +69,7 @@ import {
 } from "./adapters/opencode-launcher.js";
 import type { OpenCodeLaunchConfig } from "./adapters/opencode-launcher.js";
 import { readHeadSha } from "./core/commit.js";
+import { droppedEnvNames } from "./core/child-env.js";
 import { systemClock } from "./core/lease.js";
 import type { LeaseClock, LeaseTransport } from "./core/lease.js";
 import type { HeartbeatTransport } from "./core/heartbeat.js";
@@ -126,7 +127,14 @@ export interface DaemonOptions {
    * 这里只允许放本地路径，**不得硬编码任何用户目录**。
    */
   agent_launcher?: OpenCodeLaunchConfig;
-  /** 测试命令（固定程序 + 参数数组，不经 shell） */
+  /**
+   * 测试命令（固定程序 + 参数数组，不经 shell）。
+   *
+   * B8（A 端 B7-6）：`loadDaemonOptions` 现在**必须**能装配出它——
+   * 本机没显式选择程序与参数就拒绝启动，不再有「随便给个值」的默认行为。
+   * 类型仍为可选，是为了让直接调用 `runDaemon` 的测试与工具可以构造
+   * 「无测试命令」的场景（那种情况下结果会因缺证据降级）。
+   */
   test_command?: TestCommand;
   /** 提示词构造；默认 `buildTaskPrompt` */
   prompt_for_task?: (task: TaskNode, lease: Lease) => string;
@@ -246,7 +254,21 @@ export type DaemonStopReason =
   | "max_attempts_reached"
   | "halt_offline_on_recovery"
   /** 重启后发现旧租约仍归本机，安全停止并保留记录（评审单 P1-1） */
-  | "halt_still_mine";
+  | "halt_still_mine"
+  /**
+   * 注册身份不是本执行器真正实现的适配器（B8，A 端 B7-4）。
+   *
+   * 在**任何**云端写操作之前就停止：以错误身份注册会让 `agent_kind`
+   * 与实际执行者不符，而那时已经产生了服务端状态。
+   */
+  | "agent_kind_unsupported"
+  /**
+   * 测试/agent 进程**杀不掉**，可能有残留进程占用 worktree（B8，A 端 B7-1）。
+   *
+   * 结果已如实上报之后停止领取新任务：继续跑只会让多个残留进程争抢
+   * 同一个 worktree 与文件锁，制造更多无法解释的失败。
+   */
+  | "halt_residual_process";
 
 export interface DaemonReport {
   stop_reason: DaemonStopReason;
@@ -693,6 +715,19 @@ export async function runDaemon(
     );
   };
 
+  /* --- 0. 身份守卫（B8，A 端 B7-4）--------------------------- */
+  // 必须在健康检查**之前**：以不被支持的身份开工，等于用 OpenCode 冒充
+  // 别的 agent，上报里的 agent_kind 与实际执行者不一致。
+  // 这一层对「绕过 loadDaemonOptions 直接调 runDaemon」的调用同样有效。
+  if (!isSupportedAgentKind(options.registration.agent_kind)) {
+    log(
+      `[identity] 不支持的身份 ${options.registration.agent_kind}：` +
+        `本执行器只实现了 ${SUPPORTED_AGENT_KIND} 适配器，停止（未做任何云端写操作）`,
+    );
+    report.stop_reason = "agent_kind_unsupported";
+    return report;
+  }
+
   /* --- 2. 健康检查 ------------------------------------------- */
   const health = await deps.health();
   if (!health.ok) {
@@ -975,7 +1010,18 @@ export async function runDaemon(
     const wouldPush = options.enable_push === true && hasPushCapability;
 
     if (reportToSend.status === "ready_for_integration") {
-      if (!wouldPush) {
+      if (outcome.trace.kill_failed) {
+        // B8（A 端 B7-1）：进程没被终止时，工作区可能仍在被残留进程改写，
+        // 此刻推上去的提交无法保证对应代码的真实状态。宁可不推并如实降级，
+        // 也不要让远端多一个来源不明的提交。
+        log("[push] 进程未被终止，工作区状态不可信：拒绝推送并降级");
+        reportToSend = {
+          ...reportToSend,
+          status: "failed",
+          error_code: "INTERNAL_ERROR",
+          note: "测试/agent 进程未被终止，无法确认提交对应的实际工作区状态，故不推送",
+        };
+      } else if (!wouldPush) {
         // 评审单 P0-4：**未推送不得声称可整合**。
         // B4 在这里直接跳过推送、原样上报 ready_for_integration，协调器于是
         // 以为有个提交可供整合——而那个提交只存在于本机，A 端根本取不到。
@@ -1037,7 +1083,9 @@ export async function runDaemon(
         error_code: null,
       });
       log(`[report] 已上报 ${task.task_id} / ${lease.attempt_id}：${reportToSend.status}`);
-      markInFlight(flightRecord, "reported");
+      // B8（A 端 B7-1）：终态标记要能区分「正常收尾」与「有残留进程」——
+      // 下次启动时这两种记录的处置不同。
+      markInFlight(flightRecord, outcome.trace.kill_failed ? "halted_residual_process" : "reported");
     } catch (error) {
       const status = httpStatusOf(error);
       attemptRecords.push({
@@ -1062,6 +1110,23 @@ export async function runDaemon(
         break;
       }
       log(`[report] 上报失败（HTTP ${status ?? "无"} / ${errorCodeOf(error)}）：记录并继续`);
+    }
+
+    /* --- B8：残留进程 → 停止接新任务（A 端 B7-1）-------------- */
+    // 顺序刻意放在上报之后：**结果必须如实上报**，否则协调器永远等不到
+    // 这个 attempt 的下落，而租约要等到自然过期才回收。
+    // 但上报完成后必须停：杀不掉的进程还在占用 worktree 与文件锁，
+    // 继续领取新任务只会制造更多无法解释的失败。
+    if (outcome.trace.kill_failed) {
+      log(
+        "[halt] 测试/agent 进程未被终止，可能有残留进程占用 worktree 与文件锁：" +
+          "停止领取新任务；请人工确认残留进程已清理（必要时重启本机）后再启动执行器。" +
+          `残留详情：${outcome.report.note ?? "见上报备注"}`,
+      );
+      // 刻意**不**在这里清理 worktree：清理动作可能被残留进程的文件锁挡住，
+      // 而「清理失败」会把「需要人工处理」这件事伪装成一次普通的清理告警。
+      report.stop_reason = "halt_residual_process";
+      break;
     }
 
     // 清理点固定在链路最末端：提交、推送、远端核对、上报都已结束。
@@ -1093,7 +1158,104 @@ export const ENV_KEYS = {
   opencode_js_entry: "EXECUTOR_OPENCODE_JS_ENTRY",
   opencode_node: "EXECUTOR_OPENCODE_NODE",
   opencode_search_dirs: "EXECUTOR_OPENCODE_SEARCH_DIRS",
+  /**
+   * 受信任本地的测试命令（B8，A 端 B7-6）。
+   *
+   * `EXECUTOR_TEST_EXECUTABLE` 是**可执行程序名或路径**（必填），
+   * `EXECUTOR_TEST_ARGS` 是 **JSON 字符串数组**（可选，缺省空数组）。
+   *
+   * 刻意不再使用「任意非空字符串 = 有测试命令」的写法：那种写法既无法
+   * 选择程序与参数，又会把「随便设了一个值」当成「测试命令已配置」。
+   */
+  test_executable: "EXECUTOR_TEST_EXECUTABLE",
+  test_args: "EXECUTOR_TEST_ARGS",
 } as const;
+
+/**
+ * 判定一个「可执行名」是否更像**一整条命令行**（B8，A 端 B7-6）。
+ *
+ * 两种形态：
+ * 1. **含 shell 元字符**（`& | ; < > \` $ ( ) { } [ ]` 及换行）——
+ *    进程 API 不解释它们，出现即说明来源是命令行文本；
+ * 2. **含空白分隔的多个词**。`"npm run check"` 是最典型的退化写法：
+ *    它既不是程序名、也不是路径，而原实现正是把这种值当成「测试命令已配置」。
+ *
+ * 例外：**真实存在的绝对路径允许含空白**，例如
+ * `C:\Program Files\nodejs\npm.cmd` —— 这是本机常见且合法的情形，
+ * 一律拒绝只会逼用户去改安装目录。判定按「绝对 + 盘上确实存在」双重条件，
+ * 因此 `"C:\Program Files\node.exe test"` 这类夹带参数的写法仍会被拒。
+ *
+ * @returns `null` 表示可接受；否则返回给用户看的原因短语。
+ */
+function commandLineProblem(executable: string): string | null {
+  if (/[&|;<>`$(){}[\]\n\r]/.test(executable)) return "shell 元字符";
+  if (/\s/.test(executable) && !(isAbsolute(executable) && existsSync(executable))) {
+    return "空白分隔的多个词，效果等同 shell 元字符";
+  }
+  return null;
+}
+
+/**
+ * 解析结构化测试命令配置（B8，A 端 B7-6）。
+ *
+ * ## 为什么必须结构化
+ * 原实现把**任何**非空的 `EXECUTOR_TEST_COMMAND` 都映射为
+ * `npm run check`，于是：
+ * - 目标示例仓库只有 `npm test`，现场无法选到它；
+ * - 不设该变量则**完全没有测试命令**，结果只能因缺证据降级；
+ * - 「设为任意值」与「设对的值」在行为上无法区分，配置错误不会被发现。
+ *
+ * 现在的语义：
+ * - `EXECUTOR_TEST_EXECUTABLE` **必填**，缺失即**启动失败**（缺配置不许开工）；
+ * - `EXECUTOR_TEST_ARGS` 走 `JSON.parse`，必须是字符串数组，
+ *   解析失败或类型不符同样启动失败——**不猜、不忽略**；
+ * - 程序与参数以**数组**交给进程 API，永不经 shell。
+ *   因此云端下发的字符串仍是数据，不是命令（第 8 节）。
+ *
+ * 关于「不运行任意云端 shell 字符串」：本配置来自**本机环境变量**，
+ * 属于受信任来源；即便如此仍额外拒绝可执行名里出现 shell 元字符，
+ * 避免把「一串命令」误当成「一个程序」。
+ */
+export function parseTestCommandConfig(
+  env: Readonly<Record<string, string | undefined>>,
+): TestCommand {
+  const executable = env[ENV_KEYS.test_executable]?.trim();
+  if (!executable) {
+    throw new Error(
+      `缺少必需的环境变量：${ENV_KEYS.test_executable}。` +
+        `测试命令必须由本机显式选择可执行程序（例如 npm），` +
+        `不接受任意字符串，也不提供默认值。` +
+        `参数用 ${ENV_KEYS.test_args} 以 JSON 数组给出，例如 ["test"]。`,
+    );
+  }
+  // 可执行名里不该出现 shell 元字符或空白词：进程 API 不解释它们，
+  // 出现即说明有人把「一整条命令行」当成了程序名。
+  const problem = commandLineProblem(executable);
+  if (problem !== null) {
+    throw new Error(
+      `${ENV_KEYS.test_executable} 含可疑内容（${problem}），` +
+        `疑似传入的是整条命令行而非程序名：` +
+        `请只填可执行程序（如 npm / node），参数放 ${ENV_KEYS.test_args}。`,
+    );
+  }
+
+  const rawArgs = env[ENV_KEYS.test_args]?.trim();
+  if (!rawArgs) return { executable, args: [] };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawArgs);
+  } catch {
+    throw new Error(
+      `${ENV_KEYS.test_args} 不是合法 JSON：期望字符串数组，例如 ["test"]。` +
+        `为避免猜错参数，此处不做任何容错解析。`,
+    );
+  }
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error(`${ENV_KEYS.test_args} 必须是字符串数组，例如 ["test"]。`);
+  }
+  return { executable, args: parsed as string[] };
+}
 
 /**
  * 从环境变量装配 OpenCode 启动方式（B6-2）。
@@ -1130,6 +1292,41 @@ function buildLauncherConfig(
   return Object.keys(config).length > 0 ? config : undefined;
 }
 
+/**
+ * 本执行器**实际实现**的 agent 身份（B8，A 端 B7-4）。
+ *
+ * ## 为什么必须收窄
+ * 协议与注册体允许 `codex` / `opencode` / `mock` 三种身份，但
+ * `core/attempt.ts` 的编排**无条件调用 `runOpenCodeTask()`**。
+ * 于是只要注册成 `codex`，执行器就会一边以 Codex 身份领取任务、
+ * 一边用 OpenCode 去跑——上报里的 `agent_kind` 与实际执行者不一致，
+ * 验收时无法解释，也会让 A 端的 Codex 适配器与 B 端重复。
+ *
+ * 因此 B 的入口**只接受 `opencode`**。
+ * `mock` 也不行：它不是「实现了一部分」，而是「假装跑过」——
+ * 用 mock 身份领取真实任务等于伪造执行证据。
+ * A 的 Codex 适配器由 A 负责，不在 B 的入口暴露。
+ */
+export const SUPPORTED_AGENT_KIND = "opencode" as const;
+
+/** 解析并校验 agent 身份；不受支持时抛错（**启动即拒绝**）。 */
+export function resolveAgentKind(raw: string | undefined): DaemonRegistration["agent_kind"] {
+  const value = raw?.trim();
+  if (!value) return SUPPORTED_AGENT_KIND;
+  if (value === SUPPORTED_AGENT_KIND) return SUPPORTED_AGENT_KIND;
+  throw new Error(
+    `不支持的 agent 身份：${value}。` +
+      `B 端执行器的实际适配器只有 OpenCode（core/attempt.ts 调用 runOpenCodeTask），` +
+      `因此只接受 ${SUPPORTED_AGENT_KIND}。` +
+      `codex 适配器由 A 端负责；mock 身份会导致「未真实执行却上报结果」。`,
+  );
+}
+
+/** 该身份是否可被本执行器真正执行。 */
+export function isSupportedAgentKind(kind: string): boolean {
+  return kind === SUPPORTED_AGENT_KIND;
+}
+
 /** 从环境变量装配运行参数。缺失配置抛 `MissingConfigError`，**不回退到占位值**。 */
 export function loadDaemonOptions(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -1146,12 +1343,14 @@ export function loadDaemonOptions(
     );
   }
 
-  const rawKind = env[ENV_KEYS.agent]?.trim();
-  const agentKind: DaemonRegistration["agent_kind"] =
-    rawKind === "codex" || rawKind === "mock" ? rawKind : "opencode";
+  // B8（A 端 B7-4）：身份与真实适配器必须一致，不支持的身份启动即拒绝。
+  const agentKind = resolveAgentKind(env[ENV_KEYS.agent]);
 
   // B6-2：启动方式优先取显式配置，缺省由适配器从本机环境解析。
   const launcher = buildLauncherConfig(env);
+
+  // B8（A 端 B7-6）：测试命令必须由本机显式选择程序与参数，缺失即拒绝启动。
+  const testCommand = parseTestCommandConfig(env);
 
   // 能力按「本机真正具备什么」声明，不夸大：
   // 推送能力取决于是否显式开启，dry 模式声明 dry_run 而不声明 git_push。
@@ -1171,9 +1370,7 @@ export function loadDaemonOptions(
     worktree_root: env["EXECUTOR_WORKTREE_ROOT"]?.trim() || join(repoRoot, ".local", "worktrees"),
     model,
     enable_push: enablePush,
-    ...(env["EXECUTOR_TEST_COMMAND"]?.trim()
-      ? { test_command: { executable: "npm", args: ["run", "check"] as const as string[] } }
-      : {}),
+    test_command: testCommand,
     ...(env["EXECUTOR_MAX_IDLE_POLLS"]?.trim()
       ? { max_idle_polls: Number(env["EXECUTOR_MAX_IDLE_POLLS"]) }
       : {}),
@@ -1203,6 +1400,20 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   );
   process.stdout.write(`[launch] ${describeLaunchResolution(launch)}\n`);
 
+  /*
+   * B8（A 端 B7-3）：把「哪些凭据变量被挡在子进程之外」显式打出来。
+   * 只列**变量名**，不含值——这样排查「agent 为什么读不到某个变量」时
+   * 有据可查，同时不会把凭据写进日志。
+   */
+  const dropped = droppedEnvNames(process.env);
+  if (dropped.length > 0) {
+    process.stdout.write(
+      `[env] 已从子进程环境中过滤 ${dropped.length} 个凭据变量：${dropped.join(", ")}\n`,
+    );
+  } else {
+    process.stdout.write("[env] 未检测到需要过滤的凭据变量\n");
+  }
+
   const controller = new AbortController();
   const onSignal = (): void => controller.abort();
   process.on("SIGINT", onSignal);
@@ -1222,7 +1433,11 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     }
     return report.stop_reason === "health_failed" ||
-      report.stop_reason === "registration_rejected"
+      report.stop_reason === "registration_rejected" ||
+      // B8：身份不支持与残留进程都属「必须人工介入」，以非零码退出，
+      // 让调用方（脚本 / CI）不会把它当成一次正常收工。
+      report.stop_reason === "agent_kind_unsupported" ||
+      report.stop_reason === "halt_residual_process"
       ? 1
       : 0;
   } finally {

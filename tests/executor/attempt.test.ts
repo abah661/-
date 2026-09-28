@@ -264,6 +264,9 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
         // 归一化层判定用的是 `ok`（有 violations 即为 false）
         ok: overrides.ok ?? true,
         has_uncommitted: false,
+        // B8（B7-2）：核对成功的夹具必须显式写 null —— 缺字段会被
+        // fail-closed 的判定当成「无法核对」，从而盖过越界结论。
+        error: null,
       },
       evidence: overrides.evidence === undefined ? null : overrides.evidence,
       base_sha: "a577d66",
@@ -311,7 +314,13 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
         invalid_json_lines: 0,
         request_url: null,
       },
-      diff: { changed_files: [".github/workflows/ci.yml"], violations: [], ok: true, has_uncommitted: false },
+      diff: {
+        changed_files: [".github/workflows/ci.yml"],
+        violations: [],
+        ok: true,
+        has_uncommitted: false,
+        error: null,
+      },
       evidence: null,
       base_sha: "a577d66",
       head_sha: "b123456",

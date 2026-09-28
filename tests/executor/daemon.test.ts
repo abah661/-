@@ -28,7 +28,7 @@
  * `tests/executor/real-chain.test.ts` 覆盖（评审单「B5 必须增加的真实测试」）。
  */
 
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -51,6 +51,7 @@ import { CoordinatorClient, CoordinatorHttpError, MissingConfigError } from "../
 import type { ExecutorConfig } from "../../apps/executor/src/transport/http.js";
 import {
   ENV_KEYS,
+  SUPPORTED_AGENT_KIND,
   clearInFlightRecord,
   fileInFlightStore,
   findBindingProblem,
@@ -58,8 +59,11 @@ import {
   inFlightRecordPath,
   isActiveInFlightRecord,
   isBlockedCode,
+  isSupportedAgentKind,
   listInFlightRecords,
   loadDaemonOptions,
+  parseTestCommandConfig,
+  resolveAgentKind,
   runDaemon,
 } from "../../apps/executor/src/daemon.js";
 import type { DaemonDeps, DaemonOptions, PushResult } from "../../apps/executor/src/daemon.js";
@@ -164,6 +168,9 @@ function makeOutcome(overrides: Partial<AttemptOutcome> = {}): AttemptOutcome {
       worktree_ready: true,
       commit: { committed: true, sha: SHA_B, error_code: null, message: null },
       commit_skipped_reason: null,
+      // B8：默认「进程正常终止、Git 核对成功」
+      kill_failed: false,
+      git_error: null,
     },
     worktree_removed: true,
     worktree_path: "/repo/.local/worktrees/TASK-0001-A1",
@@ -383,6 +390,9 @@ describe("B4 §1 启动配置", () => {
     [ENV_KEYS.token]: TOKEN,
     [ENV_KEYS.model]: "myapi/gpt-5.6-sol",
     [ENV_KEYS.repo_root]: "C:\\repo",
+    // B8（B7-6）：测试命令必须由本机显式选择程序与参数。
+    [ENV_KEYS.test_executable]: "npm",
+    [ENV_KEYS.test_args]: '["test"]',
   };
 
   it("齐全时装配成功，且默认不声明 git_push（推送需显式开启）", () => {
@@ -427,6 +437,228 @@ describe("B4 §1 启动配置", () => {
     // 注册与领取都不得发生
     expect(h.events).not.toContain("register");
     expect(h.events).not.toContain("acquire");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 §1b 身份守卫（A 端 B7-4）
+ *
+ * 缺陷：`daemon.ts` 接受 codex / mock 身份，但 `core/attempt.ts` 无条件
+ * 调 `runOpenCodeTask()`。于是注册身份与实际执行者可以不一致。
+ * 要求：只接受 opencode，其他身份**启动即拒绝**。
+ * ------------------------------------------------------------------ */
+
+describe("B8 §B7-4 身份与实际适配器一致", () => {
+  it("只支持 opencode 身份", () => {
+    expect(SUPPORTED_AGENT_KIND).toBe("opencode");
+    expect(isSupportedAgentKind("opencode")).toBe(true);
+    expect(isSupportedAgentKind("codex")).toBe(false);
+    expect(isSupportedAgentKind("mock")).toBe(false);
+  });
+
+  it("未设置身份时默认 opencode（且不因缺省而放宽）", () => {
+    expect(resolveAgentKind(undefined)).toBe("opencode");
+    expect(resolveAgentKind("")).toBe("opencode");
+    expect(resolveAgentKind("opencode")).toBe("opencode");
+  });
+
+  it("codex / mock 身份被明确拒绝，错误信息说明为什么", () => {
+    expect(() => resolveAgentKind("codex")).toThrowError(/不支持的 agent 身份/);
+    expect(() => resolveAgentKind("codex")).toThrowError(/runOpenCodeTask|适配器只有 OpenCode/);
+    expect(() => resolveAgentKind("mock")).toThrowError(/不支持的 agent 身份/);
+    // 拒绝理由必须点出「mock 会伪造执行证据」，不能只说「不支持」
+    expect(() => resolveAgentKind("mock")).toThrowError(/未真实执行|伪造/);
+  });
+
+  it("从环境变量装配时，codex 身份启动即失败（不会带着错误身份连云端）", () => {
+    const env = {
+      [ENV_KEYS.base_url]: "https://coordinator.example.invalid",
+      [ENV_KEYS.project_id]: "PROJECT-TEST",
+      [ENV_KEYS.executor_id]: "EXE-B-OPENCODE",
+      [ENV_KEYS.token]: TOKEN,
+      [ENV_KEYS.model]: "myapi/gpt-5.6-sol",
+      [ENV_KEYS.test_executable]: "npm",
+      [ENV_KEYS.test_args]: '["test"]',
+      [ENV_KEYS.agent]: "codex",
+    };
+    expect(() => loadDaemonOptions(env)).toThrowError(/不支持的 agent 身份/);
+  });
+
+  it("绕过配置层直接调 runDaemon 时同样被挡住，且**不做任何云端操作**", async () => {
+    const h = makeHarness();
+    const options = makeOptions({
+      registration: {
+        host_label: "b-desktop",
+        agent_kind: "codex" as unknown as "opencode",
+        capabilities: ["code", "test", "git_push"],
+      },
+    });
+    const report = await runDaemon(withLog(options, h.logs), h.deps);
+
+    expect(report.stop_reason).toBe("agent_kind_unsupported");
+    // 关键：连健康检查都不做，更不能注册/领取
+    expect(report.health_ok).toBe(false);
+    expect(report.registered).toBe(false);
+    expect(h.events).toEqual([]);
+    expect(h.acquireCalls()).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 §1c 测试命令结构化配置（A 端 B7-6）
+ *
+ * 缺陷：任何非空 `EXECUTOR_TEST_COMMAND` 都被映射为 `npm run check`，
+ * 不设则完全没有测试命令；且「设了任意值」与「设对的值」行为相同。
+ * ------------------------------------------------------------------ */
+
+describe("B8 §B7-6 测试命令结构化配置", () => {
+  it("显式给出程序与参数时被原样采用（不经过 shell）", () => {
+    const command = parseTestCommandConfig({
+      [ENV_KEYS.test_executable]: "npm",
+      [ENV_KEYS.test_args]: '["test"]',
+    });
+    // 目标示例仓库只有 npm test —— 现在真的能选到它
+    expect(command).toEqual({ executable: "npm", args: ["test"] });
+  });
+
+  it("参数可省略（缺省空数组）", () => {
+    expect(parseTestCommandConfig({ [ENV_KEYS.test_executable]: "npm" })).toEqual({
+      executable: "npm",
+      args: [],
+    });
+  });
+
+  it("可执行程序可以是绝对路径（含空格也不被拆开）", () => {
+    const exe = "C:\\Program Files\\nodejs\\node.exe";
+    expect(parseTestCommandConfig({ [ENV_KEYS.test_executable]: exe }).executable).toBe(exe);
+  });
+
+  it("缺可执行程序 → 启动即拒绝（不再有隐式默认）", () => {
+    expect(() => parseTestCommandConfig({})).toThrowError(/EXECUTOR_TEST_EXECUTABLE/);
+    expect(() => parseTestCommandConfig({ [ENV_KEYS.test_executable]: "   " })).toThrowError(
+      /EXECUTOR_TEST_EXECUTABLE/,
+    );
+  });
+
+  it("参数不是合法 JSON 数组 → 拒绝，不做容错解析", () => {
+    expect(() =>
+      parseTestCommandConfig({
+        [ENV_KEYS.test_executable]: "npm",
+        [ENV_KEYS.test_args]: "test",
+      }),
+    ).toThrowError(/不是合法 JSON/);
+    expect(() =>
+      parseTestCommandConfig({
+        [ENV_KEYS.test_executable]: "npm",
+        [ENV_KEYS.test_args]: '{"run":"test"}',
+      }),
+    ).toThrowError(/必须是字符串数组/);
+    expect(() =>
+      parseTestCommandConfig({
+        [ENV_KEYS.test_executable]: "npm",
+        [ENV_KEYS.test_args]: '["test", 1]',
+      }),
+    ).toThrowError(/必须是字符串数组/);
+  });
+
+  it("可执行名含 shell 元字符 → 拒绝（疑似整条命令行）", () => {
+    expect(() =>
+      parseTestCommandConfig({ [ENV_KEYS.test_executable]: "npm run check" }),
+    ).toThrowError(/shell 元字符/);
+    expect(() =>
+      parseTestCommandConfig({ [ENV_KEYS.test_executable]: "npm && rm -rf /" }),
+    ).toThrowError(/shell 元字符/);
+  });
+
+  it("含空白的**真实绝对路径**仍被接受（不误伤 Program Files 这类安装位置）", () => {
+    // 前缀里带空格 → 生成的临时目录路径含空格，等价于
+    // `C:\Program Files\nodejs\...` 这种本机常见形态。
+    const dir = mkdtempSync(join(tmpdir(), "b8 test cmd "));
+    try {
+      const exe = join(dir, "npm.cmd");
+      writeFileSync(exe, "@echo off\r\n", "utf8");
+      expect(parseTestCommandConfig({ [ENV_KEYS.test_executable]: exe })).toEqual({
+        executable: exe,
+        args: [],
+      });
+      // 但「绝对路径 + 尾巴参数」仍要拒：整体不是盘上存在的文件，
+      // 说明有人把命令行塞进了这一个变量。
+      expect(() =>
+        parseTestCommandConfig({ [ENV_KEYS.test_executable]: `${exe} test` }),
+      ).toThrowError(/shell 元字符/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("装配后的 options.test_command 与配置一致", () => {
+    const options = loadDaemonOptions({
+      [ENV_KEYS.base_url]: "https://coordinator.example.invalid",
+      [ENV_KEYS.project_id]: "PROJECT-TEST",
+      [ENV_KEYS.executor_id]: "EXE-B-OPENCODE",
+      [ENV_KEYS.token]: TOKEN,
+      [ENV_KEYS.model]: "myapi/gpt-5.6-sol",
+      [ENV_KEYS.test_executable]: "npm",
+      [ENV_KEYS.test_args]: '["test"]',
+    });
+    expect(options.test_command).toEqual({ executable: "npm", args: ["test"] });
+    // 必须真的走进 runAttempt（否则配置只是在启动时不报错而已）
+    expect(options.registration.agent_kind).toBe("opencode");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 §1d 停机门槛（A 端 B7-1）
+ *
+ * 缺陷：强杀失败时 `attempt.ts` 只把原因写进 `report.note`，`daemon.ts`
+ * 上报后仍继续轮询。残留进程会占着 worktree 与文件锁，下一个任务
+ * 的失败将无法解释。
+ * ------------------------------------------------------------------ */
+
+describe("B8 §B7-1 残留进程停机门槛", () => {
+  it("kill_failed → 上报后停止，不再领取新任务/不再推送/不清理 worktree", async () => {
+    const h = makeHarness({
+      // 队列里给两个任务：若没有停机门槛，会继续领第二个
+      script: [
+        { kind: "leased", task: TASK, lease: LEASE },
+        { kind: "leased", task: TASK, lease: LEASE },
+      ],
+      // 刻意让结果「看似可整合」，用来证明停机门槛会**压过**推送资格：
+      // 进程没被杀掉时，提交对应的工作区状态不可信。
+      outcome: makeOutcome({ trace: { ...makeOutcome().trace, kill_failed: true } }),
+    });
+
+    const report = await runDaemon(withLog(makeOptions({ enable_push: true }), h.logs), h.deps);
+
+    expect(report.stop_reason).toBe("halt_residual_process");
+    // 只领了**一次**：停机门槛生效
+    expect(h.acquireCalls()).toBe(1);
+    expect(report.attempts).toHaveLength(1);
+    // 结果必须**如实上报**（否则协调器永远等不到这个 attempt 的下落）
+    expect(h.events).toContain("report");
+    expect(h.reports).toHaveLength(1);
+    // 但不得推送：工作区状态不可信 → 如实降级为 failed
+    expect(h.events).not.toContain("push");
+    expect(h.pushes).toHaveLength(0);
+    expect(h.reports[0]!.status).toBe("failed");
+    // 在途记录终态可区分于「正常上报」
+    expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
+    // 日志必须点明「需要人工处理」
+    expect(h.logs.some((line) => line.includes("残留进程"))).toBe(true);
+  });
+
+  it("kill_failed=false 时不触发停机，循环照常继续", async () => {
+    const h = makeHarness({
+      script: [
+        { kind: "leased", task: TASK, lease: LEASE },
+        { kind: "empty" },
+        { kind: "empty" },
+      ],
+    });
+    const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+    expect(report.stop_reason).toBe("idle_limit");
+    expect(h.saved.some((record) => record.state === "reported")).toBe(true);
+    expect(report.stop_reason).not.toBe("halt_residual_process");
   });
 });
 

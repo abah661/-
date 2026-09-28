@@ -70,6 +70,8 @@ function diff(overrides: Partial<DiffCheckResult> = {}): DiffCheckResult {
     violations: [],
     ok: true,
     has_uncommitted: false,
+    // B8：核对本身失败时才非 null。此处代表一次**成功**的核对。
+    error: null,
     ...overrides,
   };
 }

@@ -20,6 +20,7 @@
  */
 
 import type { ErrorCode } from "@dac/protocol";
+import { parseNameStatusZ } from "./diff-check.js";
 import { git } from "./worktree.js";
 
 /* ------------------------------------------------------------------ *
@@ -44,16 +45,36 @@ export function stageAllChanges(worktreePath: string): StageResult {
  * 这是评审单「提交前再次检查实际 diff」的输入：查的是**即将进入这次提交的
  * 内容**，而不是工作区里可能尚未暂存的东西。两者在 `git add -A` 之后本应
  * 一致，但重查一次才能覆盖「两次查询之间文件又被改动」的窗口。
+ *
+ * ## B8：失败必须可分辨（A 端 B7 评审 B7-2）
+ * 原实现失败时返回**空数组** —— 而空数组的语义是「没有待提交内容」，
+ * 于是「读不到暂存区」被当成了「没有东西要提交」，检查被静默跳过。
+ * 现在返回 `error`，调用方必须据此**阻止提交**。
+ *
+ * 用 `--name-status -z -M` 而非 `--name-only`：重命名的**两侧**都要进入
+ * 越界与敏感判定（同 `diff-check.ts` 的理由）。
  */
-export function listStagedFiles(worktreePath: string): readonly string[] {
-  const result = git(worktreePath, ["diff", "--cached", "--name-only"]);
-  if (result.exit_code !== 0) return [];
-  return result.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => line.replace(/\\/g, "/"))
-    .sort();
+export interface StagedListResult {
+  files: readonly string[];
+  /** 非空表示读取失败，**不代表「没有改动」** */
+  error: string | null;
+}
+
+export function listStagedFiles(worktreePath: string): StagedListResult {
+  const result = git(worktreePath, ["diff", "--cached", "--name-status", "-z", "-M", "HEAD"]);
+  if (result.exit_code !== 0) {
+    const detail = result.stderr.trim().split(/\r?\n/)[0] ?? "";
+    return {
+      files: [],
+      error: detail.slice(0, 200) || `git diff --cached 退出码 ${result.exit_code}`,
+    };
+  }
+  return {
+    files: parseNameStatusZ(result.stdout)
+      .map((path) => path.replace(/\\/g, "/"))
+      .sort(),
+    error: null,
+  };
 }
 
 /* ------------------------------------------------------------------ *

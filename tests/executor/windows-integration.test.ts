@@ -49,6 +49,7 @@ import {
   collectEvidence,
   parseTestSummary,
 } from "../../apps/executor/src/core/evidence.js";
+import { checkDiffScope } from "../../apps/executor/src/core/diff-check.js";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -477,6 +478,111 @@ describe("真实 Git worktree（中文与空格路径）", () => {
     expect(isInside("C:/x/双端连接", "C:/x/双端连接2")).toBe(false);
     expect(isInside("C:/x/双端连接", "C:/x/双端连接")).toBe(true);
     expect(isInside("C:/x/双端连接", "C:/x/其他")).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 二·补、真实 Git 核对失败必须 fail-closed（B8 · A 端 B7-2）
+ *
+ * A 端复现：在不存在的仓库路径调用 `checkDiffScope()` 得到 `ok: true`
+ * 与空违规列表。下面用**真实 Git**证明修复后的行为，而不是靠假体。
+ * ------------------------------------------------------------------ */
+
+describe("真实 Git fail-closed（B8 · B7-2）", () => {
+  let failCloseRoot: string;
+  const SCOPE = { allow: ["apps/executor/**"], deny: [] };
+
+  beforeAll(() => {
+    resolveGitExecutable();
+    failCloseRoot = mkdtempSync(join(tmpdir(), "dac-failclose-"));
+    const must = (args: string[]): void => {
+      const r = git(failCloseRoot, args);
+      if (r.exit_code !== 0) throw new Error(`git ${args.join(" ")} 失败：${r.stderr.trim()}`);
+    };
+    must(["init", "-q"]);
+    must(["config", "user.email", "b@example.invalid"]);
+    must(["config", "user.name", "B Test"]);
+    must(["config", "commit.gpgsign", "false"]);
+    mkdirSync(join(failCloseRoot, "apps", "coordinator", "src"), { recursive: true });
+    mkdirSync(join(failCloseRoot, "apps", "executor", "src"), { recursive: true });
+    writeFileSync(
+      join(failCloseRoot, "apps", "coordinator", "src", "api.ts"),
+      "export const a = 1;\n",
+      "utf8",
+    );
+    must(["add", "-A"]);
+    must(["commit", "-q", "-m", "init"]);
+  });
+
+  afterAll(() => {
+    if (failCloseRoot) rmSync(failCloseRoot, { recursive: true, force: true });
+  });
+
+  it("真实无效路径 → ok:false 且带 error（缺陷已修复）", () => {
+    const result = checkDiffScope({
+      worktree_path: join(failCloseRoot, "no-such-dir"),
+      base_sha: "0".repeat(40),
+      scope: SCOPE,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).not.toBeNull();
+    // 关键：不是「没有变更」，而是「没法核对」
+    expect(result.changed_files).toEqual([]);
+  });
+
+  it("真实基线提交不存在 → ok:false", () => {
+    const result = checkDiffScope({
+      worktree_path: failCloseRoot,
+      base_sha: "0".repeat(40),
+      scope: SCOPE,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).not.toBeNull();
+  });
+
+  it("真实跨范围重命名被查出来：源的越界不会被改名掩盖", () => {
+    const base = git(failCloseRoot, ["rev-parse", "HEAD"]).stdout.trim();
+    expect(base).toMatch(/^[0-9a-f]{40}$/);
+
+    const moved = git(failCloseRoot, [
+      "mv",
+      "apps/coordinator/src/api.ts",
+      "apps/executor/src/api.ts",
+    ]);
+    expect(moved.exit_code).toBe(0);
+    expect(git(failCloseRoot, ["commit", "-q", "-m", "rename across scope"]).exit_code).toBe(0);
+
+    const result = checkDiffScope({
+      worktree_path: failCloseRoot,
+      base_sha: base,
+      scope: SCOPE,
+    });
+    // 核对本身成功……
+    expect(result.error).toBeNull();
+    // ……结论是越界：`apps/coordinator/**` 不在允许范围内
+    expect(result.changed_files).toContain("apps/coordinator/src/api.ts");
+    expect(result.violations).toContain("apps/coordinator/src/api.ts");
+    expect(result.ok).toBe(false);
+  });
+
+  it("真实正常改动 → ok:true 且 error 为 null（fail-closed 没有把正常路径也判失败）", () => {
+    const base = git(failCloseRoot, ["rev-parse", "HEAD"]).stdout.trim();
+    writeFileSync(
+      join(failCloseRoot, "apps", "executor", "src", "new.ts"),
+      "export const b = 2;\n",
+      "utf8",
+    );
+    expect(git(failCloseRoot, ["add", "-A"]).exit_code).toBe(0);
+    expect(git(failCloseRoot, ["commit", "-q", "-m", "in scope"]).exit_code).toBe(0);
+
+    const result = checkDiffScope({
+      worktree_path: failCloseRoot,
+      base_sha: base,
+      scope: SCOPE,
+    });
+    expect(result.error).toBeNull();
+    expect(result.violations).toEqual([]);
+    expect(result.ok).toBe(true);
   });
 });
 

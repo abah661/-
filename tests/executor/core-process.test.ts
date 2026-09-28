@@ -26,14 +26,21 @@ import type {
   TreeKiller,
 } from "../../apps/executor/src/core/process.js";
 import { collectEvidence } from "../../apps/executor/src/core/evidence.js";
-import { normalizeResult } from "../../apps/executor/src/result/normalize.js";
+import { countsAsRepair, normalizeResult } from "../../apps/executor/src/result/normalize.js";
+import {
+  droppedEnvNames,
+  isSensitiveEnvName,
+  scrubbedChildEnv,
+} from "../../apps/executor/src/core/child-env.js";
 import type { OpenCodeAdapterResult } from "../../apps/executor/src/adapters/opencode.js";
 import type { DiffCheckResult } from "../../apps/executor/src/core/diff-check.js";
 import type { Lease } from "@dac/protocol";
 import {
+  checkDiffScope,
+  findSensitiveTouches,
   globToRegExp,
   isPathAllowed,
-  findSensitiveTouches,
+  parseNameStatusZ,
 } from "../../apps/executor/src/core/diff-check.js";
 import { isInside } from "../../apps/executor/src/core/worktree.js";
 
@@ -511,6 +518,8 @@ const B7_DIFF: DiffCheckResult = {
   violations: [],
   ok: true,
   has_uncommitted: false,
+  // B8：显式 null = 核对成功
+  error: null,
 };
 
 describe("超时进程不得产生 ready_for_integration（B7 端到端）", () => {
@@ -684,5 +693,428 @@ describe("isInside", () => {
 
   it("中文与空格路径正确判定", () => {
     expect(isInside("C:/我的 项目", "C:/我的 项目/wt/a1")).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 · B7-3 子进程不得继承协调器凭据
+ *
+ * 缺陷：`process.ts` 原样把 `process.env` 交给子进程，于是测试子进程
+ * 与 agent 拉起的任何进程都能读到 COORDINATOR_API_TOKEN。
+ * 判据（A 端要求）：用**假 Token** 证明子进程与输出里都读不到它。
+ * ------------------------------------------------------------------ */
+
+describe("子进程环境过滤（B8 · B7-3）", () => {
+  it("只挡凭据，不动必需变量与业务变量", () => {
+    // 必须挡
+    for (const name of [
+      "COORDINATOR_API_TOKEN",
+      "CLOUDFLARE_API_TOKEN",
+      "CLOUDFLARE_API_KEY",
+      "CF_API_TOKEN",
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "GH_PAT",
+      "GITHUB_ENTERPRISE_TOKEN",
+      "NPM_TOKEN",
+      "NODE_AUTH_TOKEN",
+      "AWS_SECRET_ACCESS_KEY",
+      "AZURE_CLIENT_SECRET",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+    ]) {
+      expect(isSensitiveEnvName(name), name).toBe(true);
+    }
+    // 必须留：系统与工具链必需项
+    for (const name of [
+      "PATH",
+      "Path",
+      "SystemRoot",
+      "TEMP",
+      "HOME",
+      "APPDATA",
+      "OPENCODE_MODEL",
+      "EXECUTOR_ID",
+      "COORDINATOR_BASE_URL",
+    ]) {
+      expect(isSensitiveEnvName(name), name).toBe(false);
+    }
+    // 刻意**不**做全量屏蔽：agent 自己连模型服务要用的变量不能删，
+    // 否则就是「用新故障换旧漏洞」。
+    expect(isSensitiveEnvName("MY_PROVIDER_API_KEY")).toBe(false);
+    expect(isSensitiveEnvName("ANTHROPIC_API_KEY")).toBe(false);
+  });
+
+  it("scrubbedChildEnv 同时过滤『继承』与『显式注入』两路", () => {
+    const env = scrubbedChildEnv(
+      {
+        PATH: "/usr/bin",
+        COORDINATOR_API_TOKEN: "must-not-pass",
+        GH_TOKEN: "must-not-pass",
+      },
+      {
+        CUSTOM_FLAG: "ok",
+        CLOUDFLARE_API_TOKEN: "must-not-pass-either",
+      },
+    );
+    expect(env["PATH"]).toBe("/usr/bin");
+    expect(env["CUSTOM_FLAG"]).toBe("ok");
+    expect(env["COORDINATOR_API_TOKEN"]).toBeUndefined();
+    expect(env["GH_TOKEN"]).toBeUndefined();
+    // 显式注入不是旁路
+    expect(env["CLOUDFLARE_API_TOKEN"]).toBeUndefined();
+  });
+
+  it("droppedEnvNames 只报名字，不报值", () => {
+    const dropped = droppedEnvNames({
+      PATH: "/usr/bin",
+      COORDINATOR_API_TOKEN: "super-secret-value",
+      GITHUB_TOKEN: "another-secret",
+    });
+    expect(dropped).toEqual(["COORDINATOR_API_TOKEN", "GITHUB_TOKEN"]);
+    expect(dropped.join(",")).not.toContain("super-secret-value");
+  });
+
+  it("**真实子进程**读不到假 Token，输出的任何位置都不出现它", async () => {
+    const FAKE = "fake-coordinator-token-b8-never-leak";
+    const FAKE_GH = "fake-gh-token-b8-never-leak";
+    const savedToken = process.env["COORDINATOR_API_TOKEN"];
+    const savedGh = process.env["GH_TOKEN"];
+    process.env["COORDINATOR_API_TOKEN"] = FAKE;
+    process.env["GH_TOKEN"] = FAKE_GH;
+
+    try {
+      const result = await runProcess(
+        {
+          executable: process.execPath,
+          args: [
+            "-e",
+            [
+              'process.stdout.write("token=" + String(process.env.COORDINATOR_API_TOKEN));',
+              'process.stderr.write("gh=" + String(process.env.GH_TOKEN));',
+            ].join(""),
+          ],
+          cwd: process.cwd(),
+        },
+        { timeout_ms: 20_000 },
+      );
+
+      expect(result.exit_code).toBe(0);
+      // 子进程读到的必须是 undefined
+      expect(result.stdout).toContain("token=undefined");
+      expect(result.stderr).toContain("gh=undefined");
+      // 假 Token 不得出现在任何输出里（这正是「进入 artifact 与上报」的入口）
+      const combined = `${result.stdout}\n${result.stderr}`;
+      expect(combined).not.toContain(FAKE);
+      expect(combined).not.toContain(FAKE_GH);
+    } finally {
+      if (savedToken === undefined) delete process.env["COORDINATOR_API_TOKEN"];
+      else process.env["COORDINATOR_API_TOKEN"] = savedToken;
+      if (savedGh === undefined) delete process.env["GH_TOKEN"];
+      else process.env["GH_TOKEN"] = savedGh;
+    }
+  }, 60_000);
+
+  it("过滤没有把必需变量一起删掉（真实子进程仍能跑起来读到 PATH）", async () => {
+    const result = await runProcess(
+      {
+        executable: process.execPath,
+        args: ["-e", 'process.stdout.write(process.env.PATH || process.env.Path ? "PATH_OK" : "PATH_MISSING")'],
+        cwd: process.cwd(),
+      },
+      { timeout_ms: 20_000 },
+    );
+    expect(result.exit_code).toBe(0);
+    expect(result.stdout).toContain("PATH_OK");
+  }, 60_000);
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 · B7-3 敏感文件边界（A 端给的四个样例必须全部命中）
+ * ------------------------------------------------------------------ */
+
+describe("敏感文件边界（B8 · B7-3）", () => {
+  it("A 端复现的四个样例全部命中（原先只有 .env 命中）", () => {
+    const cases = [
+      "apps/executor/.env",
+      "apps/executor/.ENV",
+      "B-token-public.cer",
+      "apps/executor/.codex/config.toml",
+    ];
+    const hits = findSensitiveTouches(cases);
+    // 逐个断言，失败时能看出是哪一个漏了
+    expect(hits).toContain("apps/executor/.env");
+    expect(hits).toContain("apps/executor/.ENV");
+    expect(hits).toContain("B-token-public.cer");
+    expect(hits).toContain("apps/executor/.codex/config.toml");
+    expect(hits).toHaveLength(cases.length);
+  });
+
+  it("大小写变体与非 ASCII 路径同样命中", () => {
+    expect(findSensitiveTouches(["AUTH.JSON"])).toContain("AUTH.JSON");
+    expect(findSensitiveTouches(["keys/Server.KEY"])).toContain("keys/Server.KEY");
+    expect(findSensitiveTouches(["凭据/B-token-public.CER"])).toContain("凭据/B-token-public.CER");
+  });
+
+  it("凭据容器与本地凭据目录全部命中", () => {
+    for (const path of [
+      "x/B-executor-token.p7m",
+      "x/client.pfx",
+      "x/cert.p12",
+      "x/store.jks",
+      ".ssh/id_ed25519",
+      ".aws/credentials",
+      ".npmrc",
+      ".netrc",
+      "conf/secrets.json",
+    ]) {
+      expect(findSensitiveTouches([path]), path).toContain(path);
+    }
+  });
+
+  it("正常源文件不被误判（避免把正常任务卡住）", () => {
+    expect(
+      findSensitiveTouches([
+        "apps/executor/src/child-env.ts",
+        "tests/executor/redact-secret.test.ts",
+        "docs/reports/B8-B-executor-hardening.md",
+      ]),
+    ).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 · B7-2 变更列表解析（NUL 分隔、重命名两侧）
+ * ------------------------------------------------------------------ */
+
+describe("parseNameStatusZ（B8 · B7-2）", () => {
+  it("普通变更与重命名都解析出路径", () => {
+    expect(parseNameStatusZ("M\0a.ts\0")).toEqual(["a.ts"]);
+    expect(parseNameStatusZ("A\0new.ts\0")).toEqual(["new.ts"]);
+    // 重命名：**源与目标都要**
+    expect(parseNameStatusZ("R100\0old.ts\0new.ts\0")).toEqual(["old.ts", "new.ts"]);
+    expect(parseNameStatusZ("C075\0src.ts\0copy.ts\0")).toEqual(["src.ts", "copy.ts"]);
+  });
+
+  it("多条记录连续解析互不串位", () => {
+    expect(parseNameStatusZ("M\0a.ts\0R100\0b.ts\0c.ts\0D\0d.ts\0")).toEqual([
+      "a.ts",
+      "b.ts",
+      "c.ts",
+      "d.ts",
+    ]);
+  });
+
+  it("含空格与非 ASCII 的路径不被拆开（这正是 -z 的目的）", () => {
+    expect(parseNameStatusZ("M\0双端 连接/a.ts\0")).toEqual(["双端 连接/a.ts"]);
+    expect(parseNameStatusZ("R100\0旧 目录/a.ts\0新 目录/a.ts\0")).toEqual([
+      "旧 目录/a.ts",
+      "新 目录/a.ts",
+    ]);
+  });
+
+  it("空输出返回空数组", () => {
+    expect(parseNameStatusZ("")).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 · B7-2 核对失败必须 fail-closed
+ *
+ * A 端复现：在不存在的仓库路径调用 `checkDiffScope()` 得到
+ * `ok: true` + 空违规列表 —— 那不是「通过」，而是「根本没检查」。
+ * ------------------------------------------------------------------ */
+
+type FakeGitScript = (
+  args: readonly string[],
+) => { exit_code: number; stdout: string; stderr: string } | null;
+
+const SCOPE_B8 = { allow: ["apps/executor/**"], deny: [] } as const;
+const WORKTREE_B8 = "C:/repo";
+
+/**
+ * 构造一个假 Git：未命中的命令默认「成功且无输出」，
+ * 但 `rev-parse --show-toplevel` 必须如实回答 —— 否则会先被
+ * 「工作区根校验」拦下，测不到后面那些分支。
+ */
+function fakeGit(script: FakeGitScript) {
+  return (_repoPath: string, args: readonly string[]) => {
+    const custom = script(args);
+    if (custom !== null) return custom;
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+      return { exit_code: 0, stdout: `${WORKTREE_B8}\n`, stderr: "" };
+    }
+    return { exit_code: 0, stdout: "", stderr: "" };
+  };
+}
+
+describe("checkDiffScope fail-closed（B8 · B7-2）", () => {
+  it("仓库路径无效 → ok:false 且带 error（原先返回 ok:true）", () => {
+    const result = checkDiffScope(
+      { worktree_path: "C:/does/not/exist", base_sha: "a".repeat(40), scope: SCOPE_B8 },
+      fakeGit(() => ({
+        exit_code: 128,
+        stdout: "",
+        stderr: "fatal: not a git repository (or any of the parent directories): .git",
+      })),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not a git repository");
+    // 不能把「没检查成」伪装成「没有变更」
+    expect(result.changed_files).toEqual([]);
+    expect(result.violations).toEqual([]);
+  });
+
+  it("worktree 不是自己的工作区根（被父仓库顶替）→ ok:false", () => {
+    const result = checkDiffScope(
+      { worktree_path: WORKTREE_B8, base_sha: "a".repeat(40), scope: SCOPE_B8 },
+      fakeGit((args) =>
+        args[0] === "rev-parse" && args[1] === "--show-toplevel"
+          ? { exit_code: 0, stdout: "C:/parent-repo\n", stderr: "" }
+          : null,
+      ),
+    );
+    expect(result.ok).toBe(false);
+    // 这种「错的对象给出了看似合理的结论」比直接失败更危险，必须拦住
+    expect(result.error).toContain("不一致");
+  });
+
+  it("基线不存在 → ok:false + error", () => {
+    const base = "0".repeat(40);
+    const result = checkDiffScope(
+      { worktree_path: WORKTREE_B8, base_sha: base, scope: SCOPE_B8 },
+      fakeGit((args) =>
+        args[0] === "diff" && args.includes(`${base}..HEAD`)
+          ? { exit_code: 128, stdout: "", stderr: `fatal: bad object ${base}` }
+          : null,
+      ),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("bad object");
+  });
+
+  it("仅 git status 失败也必须 fail-closed（不得当成工作区干净）", () => {
+    const result = checkDiffScope(
+      { worktree_path: WORKTREE_B8, base_sha: "a".repeat(40), scope: SCOPE_B8 },
+      fakeGit((args) =>
+        args[0] === "status"
+          ? { exit_code: 128, stdout: "", stderr: "fatal: index file corrupt" }
+          : null,
+      ),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("git status");
+    expect(result.has_uncommitted).toBe(false);
+  });
+
+  it("全部成功且无越界 → ok:true、error:null", () => {
+    const base = "a".repeat(40);
+    const result = checkDiffScope(
+      { worktree_path: WORKTREE_B8, base_sha: base, scope: SCOPE_B8 },
+      fakeGit((args) =>
+        args[0] === "diff" && args.includes(`${base}..HEAD`)
+          ? { exit_code: 0, stdout: "M\0apps/executor/src/a.ts\0", stderr: "" }
+          : null,
+      ),
+    );
+    expect(result.changed_files).toEqual(["apps/executor/src/a.ts"]);
+    expect(result.ok).toBe(true);
+    expect(result.error).toBeNull();
+  });
+
+  it("跨范围重命名被判越界（源路径也要查）", () => {
+    const base = "a".repeat(40);
+    const result = checkDiffScope(
+      { worktree_path: WORKTREE_B8, base_sha: base, scope: SCOPE_B8 },
+      fakeGit((args) =>
+        args[0] === "diff" && args.includes(`${base}..HEAD`)
+          ? {
+              exit_code: 0,
+              stdout: "R100\0apps/coordinator/src/x.ts\0apps/executor/src/x.ts\0",
+              stderr: "",
+            }
+          : null,
+      ),
+    );
+    expect(result.changed_files).toEqual([
+      "apps/coordinator/src/x.ts",
+      "apps/executor/src/x.ts",
+    ]);
+    expect(result.violations).toContain("apps/coordinator/src/x.ts");
+    expect(result.ok).toBe(false);
+    // 这次核对本身是成功的：越界是结论，不是核对失败
+    expect(result.error).toBeNull();
+  });
+
+  it("未跟踪文件也计入变更（ls-files 失败同样 fail-closed）", () => {
+    const base = "a".repeat(40);
+    const withUntracked = checkDiffScope(
+      { worktree_path: WORKTREE_B8, base_sha: base, scope: SCOPE_B8 },
+      fakeGit((args) =>
+        args[0] === "ls-files"
+          ? { exit_code: 0, stdout: "apps/coordinator/src/sneaky.ts\0", stderr: "" }
+          : null,
+      ),
+    );
+    expect(withUntracked.changed_files).toContain("apps/coordinator/src/sneaky.ts");
+    expect(withUntracked.violations).toContain("apps/coordinator/src/sneaky.ts");
+
+    const lsFails = checkDiffScope(
+      { worktree_path: WORKTREE_B8, base_sha: base, scope: SCOPE_B8 },
+      fakeGit((args) =>
+        args[0] === "ls-files"
+          ? { exit_code: 1, stdout: "", stderr: "fatal: ls-files exploded" }
+          : null,
+      ),
+    );
+    expect(lsFails.ok).toBe(false);
+    expect(lsFails.error).toContain("ls-files");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B8 · B7-2 归一化层：核对失败不得声称可整合
+ * ------------------------------------------------------------------ */
+
+describe("归一化层对 Git 核对失败的处置（B8 · B7-2）", () => {
+  const LEASE_B8: Lease = {
+    task_id: "TASK-0001",
+    attempt_id: "TASK-0001-A1",
+    executor_id: "EXE-B-OPENCODE",
+    lease_epoch: 1,
+    expires_at: "2030-01-01T00:00:00.000Z",
+    binding: {
+      base_sha: "a".repeat(40),
+      rules_sha: "b".repeat(40),
+      contract_sha: "c".repeat(40),
+      acceptance_sha: "d".repeat(40),
+    },
+    agent_kind: "opencode",
+  };
+
+  it("diff.error 非空 → failed + INTERNAL_ERROR（不进入返修计数）", () => {
+    const report = normalizeResult({
+      lease: LEASE_B8,
+      adapter: b7Adapter(),
+      diff: {
+        changed_files: [],
+        violations: [],
+        ok: false,
+        has_uncommitted: false,
+        error: "fatal: not a git repository",
+      },
+      evidence: null,
+      base_sha: LEASE_B8.binding.base_sha,
+      head_sha: "e".repeat(40),
+      sensitive_touches: [],
+      commit_shas: ["e".repeat(40)],
+      note: null,
+      reported_at: "2026-09-28T00:00:00.000Z",
+    });
+    expect(report.status).toBe("failed");
+    expect(report.error_code).toBe("INTERNAL_ERROR");
+    // 备注要说明「为什么无法核对」，否则云端只看到一个泛化的错误码
+    expect(report.note).toContain("Git 核对失败");
+    // INTERNAL_ERROR 是 fatal：不得计为代码返修
+    expect(countsAsRepair(report)).toBe(false);
   });
 });

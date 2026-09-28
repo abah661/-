@@ -141,6 +141,20 @@ export interface AttemptTrace {
   commit: CommitResult | null;
   /** 未创建提交时的具体原因。**排障用**：能看出是四道门里的哪一道没过 */
   commit_skipped_reason: string | null;
+  /**
+   * 测试/agent 进程**未能被终止**（B8，A 端 B7-1）。
+   *
+   * 为 true 时有残留进程可能仍占用 worktree 与文件锁。常驻入口据此
+   * **停止领取新任务**并要求人工处理，而不是继续下一轮轮询。
+   */
+  kill_failed: boolean;
+  /**
+   * Git 核对是否失败（B8，A 端 B7-2）。
+   *
+   * 非 null 表示「无法确认是否越界」——不是「确认没有越界」。
+   * 调用方**不得**据此提交或推送。
+   */
+  git_error: string | null;
 }
 
 export interface AttemptOutcome {
@@ -186,6 +200,8 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     worktree_ready: false,
     commit: null,
     commit_skipped_reason: null,
+    kill_failed: false,
+    git_error: null,
   };
 
   const { lease } = input;
@@ -264,6 +280,8 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       base_sha: lease.binding.base_sha,
       scope: input.write_scope,
     });
+    // B8（A 端 B7-2）：核对本身失败也要暴露，且**一律不提交**。
+    if (diff.error !== null) trace.git_error = diff.error;
     const changedFiles = diff.changed_files;
     const sensitive = findSensitiveTouches(changedFiles);
 
@@ -285,6 +303,9 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       evidence = collected.evidence;
       rawTestOutput = `${collected.raw_stdout}\n${collected.raw_stderr}`;
       terminationDetail = collected.termination_detail;
+      // B8（A 端 B7-1）：杀不掉的进程必须成为**显式信号**，
+      // 而不是只留一句备注。常驻入口据此停机。
+      trace.kill_failed = collected.kill_failed;
     }
 
     /* --- 6. 创建提交（B5，评审单 P0-2）------------------------- */
@@ -299,6 +320,10 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     let commitBlockedReason: string | null = null;
     if (commitSpec === null) {
       commitBlockedReason = "调用方未提供 commit_spec";
+    } else if (diff.error !== null) {
+      // B8（A 端 B7-2）：**核对失败即未通过**。
+      // 「读不出 git 状态」绝不能被当成「没有越界」而放行提交。
+      commitBlockedReason = `Git 核对失败，无法确认写入范围：${diff.error}`;
     } else if (sensitive.length > 0) {
       commitBlockedReason = `触碰敏感文件：${sensitive.join(", ")}`;
     } else if (!diff.ok) {
@@ -324,13 +349,18 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       } else {
         // 提交前**对暂存内容再查一次**（评审单要求）：
         // 这次查的是即将进入提交的东西，而不是工作区里可能尚未暂存的。
-        const stagedFiles = listStagedFiles(worktreePath);
+        const stagedList = listStagedFiles(worktreePath);
+        const stagedFiles = stagedList.files;
         const stagedViolations = stagedFiles.filter((path) =>
           !isPathAllowed(path, input.write_scope),
         );
         const stagedSensitive = findSensitiveTouches(stagedFiles);
 
-        if (stagedViolations.length > 0) {
+        if (stagedList.error !== null) {
+          // B8（A 端 B7-2）：读不出暂存内容 ≠ 没有待提交内容。一律不提交。
+          trace.commit_skipped_reason = `暂存内容核对失败：${stagedList.error}`;
+          trace.git_error = stagedList.error;
+        } else if (stagedViolations.length > 0) {
           trace.commit_skipped_reason = `暂存内容越界：${stagedViolations.join(", ")}`;
         } else if (stagedSensitive.length > 0) {
           trace.commit_skipped_reason = `暂存内容含敏感文件：${stagedSensitive.join(", ")}`;

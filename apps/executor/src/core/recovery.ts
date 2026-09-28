@@ -51,7 +51,14 @@ export type InFlightState =
    * 重启后发现旧租约**仍归本机**，而本执行器不具备断点续跑能力。
    * 安全停止并保留记录，等待租约自然到期或人工处理（评审单 P1-1）。
    */
-  | "halted_still_mine";
+  | "halted_still_mine"
+  /**
+   * 结果已上报，但测试/agent 进程**未能被终止**（B8，A 端 B7-1）。
+   *
+   * 与 `reported` 分开记的理由：这两种情况下「下次启动该不该照常开工」
+   * 的答案不同——有残留进程时必须先人工确认 worktree 已释放。
+   */
+  | "halted_residual_process";
 
 /** 本地持久化的在途任务记录（存于 .local/，忽略提交）。 */
 export interface InFlightRecord {

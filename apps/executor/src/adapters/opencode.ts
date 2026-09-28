@@ -33,6 +33,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import type { ErrorCode } from "@dac/protocol";
+import { scrubbedChildEnv } from "../core/child-env.js";
 import { describeLaunchResolution, resolveOpenCodeLaunch } from "./opencode-launcher.js";
 import type {
   OpenCodeLaunchConfig,
@@ -141,6 +142,10 @@ export class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
       shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
+      // B8（A 端 B7-3）：agent 进程同样**不得**继承协调器凭据。
+      // 原实现不传 env，等于把 COORDINATOR_API_TOKEN 交给 agent 与它
+      // 拉起的每一个子进程；agent 的输出又会进 artifact 与上报链路。
+      env: scrubbedChildEnv(process.env),
     });
 
     // 必须**立刻**挂上 error 监听：spawn 失败是异步抛出的，

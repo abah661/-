@@ -51,6 +51,7 @@ import type {
   OpenCodeProcessRunner,
 } from "../adapters/opencode.js";
 import { OpenCodePreStartError, runOpenCodeTask } from "../adapters/opencode.js";
+import type { OpenCodeProcessState } from "../adapters/opencode.js";
 
 /* ------------------------------------------------------------------ *
  * 编排输入
@@ -155,6 +156,15 @@ export interface AttemptTrace {
    * 调用方**不得**据此提交或推送。
    */
   git_error: string | null;
+  /**
+   * 本次 attempt 结束时，本机**可证明的进程状态**（B11，A 端 B10 复验 §a）。
+   *
+   * 常驻入口据此决定「能不能继续领任务」：`residual` / `unknown` 都必须停机
+   * 并保留门禁记录。之所以要放进 trace：**正常返回**也可能带着状态未知的进程
+   * （例如 agent 超时且始终未观察到关闭）。异常分支之外的那条路径过去完全
+   * 没有被检查过 —— 只覆盖异常分支，等于只覆盖了一半。
+   */
+  process_state: AttemptProcessState;
 }
 
 /* ------------------------------------------------------------------ *
@@ -214,6 +224,81 @@ export function describeProcessState(state: AttemptProcessState): string {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 进程状态判定辅助（B11，A 端 B10 复验 §a）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 适配器进程状态 → 编排层进程状态。
+ *
+ * `spawn_failed` 是「可证明进程从未存在」，等价于 `not_started`；
+ * 其余三种同名直传。**不要**在这里做任何「看起来差不多」的合并：
+ * 合并的代价正是这次返修要修掉的那类错误。
+ */
+export function mapAdapterProcessState(state: OpenCodeProcessState): AttemptProcessState {
+  switch (state) {
+    case "spawn_failed":
+      return "not_started";
+    case "stopped":
+      return "stopped";
+    case "residual":
+      return "residual";
+    case "unknown":
+      return "unknown";
+  }
+}
+
+/**
+ * 该进程状态是否**不允许**继续开工（B11，A 端 B10 复验 §a）。
+ *
+ * `residual`（确认杀不掉）与 `unknown`（无法证明已退出）都必须停机：
+ * 两者都可能仍有进程占用 worktree 与文件锁，继续领任务只会制造更多
+ * 无法解释的失败。`not_started` / `stopped` 才是可以安全继续的两种。
+ */
+export function isUnsafeProcessState(state: AttemptProcessState): boolean {
+  return state === "residual" || state === "unknown";
+}
+
+/**
+ * 不安全进程状态对应的在途记录状态（B11，A 端 B10 复验 §a）。
+ *
+ * 两种状态**命名分立**：`residual` 是「已确认杀不掉」，`unknown` 是
+ * 「无法证明已退出」。两者都要人工介入，但把后者说成前者就是伪造证据。
+ * 只应在 {@link isUnsafeProcessState} 为真时调用。
+ */
+export function haltedStateFor(
+  state: AttemptProcessState,
+): "halted_residual_process" | "halted_process_unknown" {
+  return state === "residual" ? "halted_residual_process" : "halted_process_unknown";
+}
+
+/** 不安全进程状态对应的停机原因，与 {@link haltedStateFor} 一一对应。 */
+export function haltStopReasonFor(
+  state: AttemptProcessState,
+): "halt_residual_process" | "halt_process_unknown" {
+  return state === "residual" ? "halt_residual_process" : "halt_process_unknown";
+}
+
+/**
+ * 从 trace 汇总出「是否需要停机」（B11，A 端 B10 复验 §a）。
+ *
+ * 输入刻意取**两个**信号：`process_state` 是主判据，`kill_failed` 是它对应的
+ * 旧信号。二者本应一致（attempt 层在 `kill_failed` 时把状态置为 `residual`），
+ * 真出现不一致时这里**取更严的一档**：停机判据宁愿多停一次（代价是一次人工
+ * 确认），也不能漏停（代价是残留进程与新任务并行抢同一个 worktree）。
+ *
+ * `not_started` / `stopped` 且未 `kill_failed` 时返回 `unsafe: false`。
+ */
+export function haltSignalOf(trace: {
+  kill_failed: boolean;
+  process_state: AttemptProcessState;
+}): { unsafe: boolean; state: AttemptProcessState } {
+  if (trace.process_state === "residual") return { unsafe: true, state: "residual" };
+  if (trace.process_state === "unknown") return { unsafe: true, state: "unknown" };
+  if (trace.kill_failed) return { unsafe: true, state: "residual" };
+  return { unsafe: false, state: trace.process_state };
+}
+
 export interface AttemptOutcome {
   report: ResultReport;
   trace: AttemptTrace;
@@ -259,6 +344,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     commit_skipped_reason: null,
     kill_failed: false,
     git_error: null,
+    process_state: "not_started",
   };
 
   /**
@@ -344,9 +430,16 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       deps.agent_runner as OpenCodeProcessRunner,
     );
 
-    // B10：**退出码才是证据**。拿到 → 进程确实结束了（stopped）；
-    // 拿不到（例如 SIGKILL 之后仍未退出）→ 只能是「未知」，不能算「已停止」。
-    processState = agentResult.exit_code !== null ? "stopped" : "unknown";
+    // B11（A 端 B10 复验 §a）：进程状态**由适配器给出**，不再由退出码反推。
+    //
+    // 旧写法 `exit_code !== null ? "stopped" : "unknown"` 两个方向都错：
+    //  - 进程被信号终止时「确实已退出」却拿不到数字退出码 → 被误判 unknown，
+    //    于是执行器为一个其实干净的结束停在人工门禁上；
+    //  - `spawn_failed` 时进程「根本没启动」，退出码同样兑现成 null → 一并
+    //    落进 unknown，把「没起来」说成「去向不明」。
+    // 现在三种事实分别记账（关闭事件 / 主动探测 / 启动失败），见适配器。
+    processState = mapAdapterProcessState(agentResult.process_state);
+    trace.process_state = processState;
 
     /* --- 4. 核对写入范围 -------------------------------------- */
     setPhase("checking_diff");
@@ -386,6 +479,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       // 只在 kill_failed 时改写：agent 那次若本来就「未知」，
       // 不能因为这次测试进程干净退出就被洗白。
       if (collected.kill_failed) processState = "residual";
+      trace.process_state = processState;
     }
 
     /* --- 6. 创建提交（B5，评审单 P0-2）------------------------- */
@@ -498,6 +592,9 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     });
 
     if (guard.lost) trace.sideEffectsSkipped = true;
+
+    // 兜底同步：常驻入口在**正常返回**路径上读的就是这个字段（B11）。
+    trace.process_state = processState;
 
     return {
       report,

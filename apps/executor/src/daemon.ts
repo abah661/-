@@ -60,7 +60,15 @@ import { pathToFileURL } from "node:url";
 import type { Capability, ErrorCode, ExecutorRegistration, Lease, ResultStatus, TaskNode, WriteScope } from "@dac/protocol";
 import { ERROR_POLICY, blockedStatusFor } from "@dac/protocol";
 
-import { AttemptOrchestrationError, describeProcessState, runAttempt } from "./core/attempt.js";
+import {
+  AttemptOrchestrationError,
+  describeProcessState,
+  haltSignalOf,
+  haltStopReasonFor,
+  haltedStateFor,
+  isUnsafeProcessState,
+  runAttempt,
+} from "./core/attempt.js";
 import type {
   AttemptDeps,
   AttemptInput,
@@ -316,6 +324,23 @@ export type DaemonStopReason =
    * 残留，重启同样必须拒绝开工——「不知道」不能当成「可以开工」。
    */
   | "halt_process_unknown_on_startup";
+
+/**
+ * 「进程需人工介入」的停机原因集合（B11，A 端 B10 复验 §a）。
+ *
+ * 这些原因的**共同后果**是：本机可能仍有进程占用 worktree 与文件锁，
+ * 必须以非零退出码收工，否则脚本 / CI 会把「需要人工清理」当成一次正常收工。
+ *
+ * 汇总成集合而不是散在一串 `||` 里：原先手工串联时，后加的
+ * `halt_process_unknown` 与两条 `*_on_startup` 就被漏在判断之外，
+ * 非零退出码静默失效。集合让「新增停机原因」只需在一处维护。
+ */
+const HALT_STOP_REASONS: ReadonlySet<DaemonStopReason> = new Set<DaemonStopReason>([
+  "halt_residual_process",
+  "halt_process_unknown",
+  "halt_residual_process_on_startup",
+  "halt_process_unknown_on_startup",
+]);
 
 export interface DaemonReport {
   stop_reason: DaemonStopReason;
@@ -1082,8 +1107,7 @@ export async function runDaemon(
       // 成「已停止」正是 A 点名的那个错误。
       const processState: AttemptProcessState =
         error instanceof AttemptOrchestrationError ? error.process_state : "unknown";
-      const residualConfirmed = processState === "residual";
-      const unsafe = residualConfirmed || processState === "unknown";
+      const unsafe = isUnsafeProcessState(processState);
       const stateText = describeProcessState(processState);
 
       attemptRecords.push({
@@ -1097,7 +1121,7 @@ export async function runDaemon(
       });
 
       if (unsafe) {
-        const haltState = residualConfirmed ? "halted_residual_process" : "halted_process_unknown";
+        const haltState = haltedStateFor(processState);
         markInFlight(flightRecord, haltState);
         log(
           `[halt] 编排异常（${stateText}）：保留停机标记 ${haltState} 并停止领取新任务。` +
@@ -1105,7 +1129,7 @@ export async function runDaemon(
             "而「清理失败」会把「需要人工处理」伪装成一次普通告警。" +
             "请人工确认进程已清理后，用 clearInFlightRecord 显式清除该标记再启动",
         );
-        report.stop_reason = residualConfirmed ? "halt_residual_process" : "halt_process_unknown";
+        report.stop_reason = haltStopReasonFor(processState);
         break;
       }
 
@@ -1120,15 +1144,22 @@ export async function runDaemon(
       // B9（A 端 B8 复验 §3.1）：这条分支同样可能「进程没被杀掉」。
       // B8 在这里只写了 skipped_*，既没保留残留标记，日志还照旧声称
       // 「已终止子进程」——那句话在 kill_failed 时是**假的**，不能继续说。
-      const residual = outcome.trace.kill_failed === true;
+      //
+      // B11（A 端 B10 复验 §a）：判据从 `kill_failed` 扩为**整个进程状态**。
+      // 取消路径本来是「超时/取消后进程不理会终止信号」的高发场景，
+      // 只认 `kill_failed` 会漏掉「已发终止信号但未观察到关闭」的 `unknown`。
+      const halt = haltSignalOf(outcome.trace);
+      const processState = halt.state;
+      const unsafe = halt.unsafe;
       // `attemptRecords.result` 仍记 skipped_*：这次 attempt 在 daemon 视角
       // 确实没推送、没上报，那是事实。**是否安全**由在途记录的 state 表达。
       const skipState = cancelled ? "skipped_aborted" : "skipped_lease_lost";
       log(
-        residual
+        unsafe
           ? `[attempt] ${cancelled ? "收到取消信号" : "租约在运行期间失效"}，` +
-            "但子进程**未被终止**（kill_failed）：保留残留标记并停止领取新任务，" +
-            "不推送、不上报。请人工确认残留进程已清理后再启动"
+            `但${describeProcessState(processState)}：保留停机标记并停止领取新任务，` +
+            "不推送、不上报，worktree 刻意不清理（可能仍被占用）。" +
+            "请人工确认进程已清理后再启动"
           : cancelled
             ? "[attempt] 收到取消信号：已终止子进程，不推送、不上报（租约将自然过期）"
             : `[attempt] 租约在运行期间失效（${outcome.trace.lease_lost_reason ?? "unknown"}）：不推送、不上报`,
@@ -1142,11 +1173,11 @@ export async function runDaemon(
         pushed: false,
         error_code: cancelled ? null : "LEASE_EPOCH_STALE",
       });
-      markInFlight(flightRecord, residual ? "halted_residual_process" : skipState);
-      if (residual) {
-        // 残留进程优先于「取消 / 租约失效」：本地有杀不掉的进程要处理，
-        // 这件事比云端租约状态更需要人工介入。
-        report.stop_reason = "halt_residual_process";
+      markInFlight(flightRecord, unsafe ? haltedStateFor(processState) : skipState);
+      if (unsafe) {
+        // 进程状态优先于「取消 / 租约失效」：本地有去向不明或杀不掉的进程
+        // 要处理，这件事比云端租约状态更需要人工介入。
+        report.stop_reason = haltStopReasonFor(processState);
         break;
       }
       if (cancelled) {
@@ -1167,16 +1198,23 @@ export async function runDaemon(
     const wouldPush = options.enable_push === true && hasPushCapability;
 
     if (reportToSend.status === "ready_for_integration") {
-      if (outcome.trace.kill_failed) {
+      const halt = haltSignalOf(outcome.trace);
+      if (halt.unsafe) {
         // B8（A 端 B7-1）：进程没被终止时，工作区可能仍在被残留进程改写，
         // 此刻推上去的提交无法保证对应代码的真实状态。宁可不推并如实降级，
         // 也不要让远端多一个来源不明的提交。
-        log("[push] 进程未被终止，工作区状态不可信：拒绝推送并降级");
+        //
+        // B11（A 端 B10 复验 §a）：判据扩为整个进程状态。`unknown` 与
+        // `residual` 在这一点上是同一类威胁——都可能有活着的进程正在改写
+        // 工作区，只是证据强度不同；推送门没有理由只挡后者。
+        log(
+          `[push] 进程状态不可信（${describeProcessState(halt.state)}）：拒绝推送并降级`,
+        );
         reportToSend = {
           ...reportToSend,
           status: "failed",
           error_code: "INTERNAL_ERROR",
-          note: "测试/agent 进程未被终止，无法确认提交对应的实际工作区状态，故不推送",
+          note: "测试/agent 进程状态无法证明已结束，无法确认提交对应的实际工作区状态，故不推送",
         };
       } else if (!wouldPush) {
         // 评审单 P0-4：**未推送不得声称可整合**。
@@ -1242,14 +1280,23 @@ export async function runDaemon(
       log(`[report] 已上报 ${task.task_id} / ${lease.attempt_id}：${reportToSend.status}`);
       // B8（A 端 B7-1）：终态标记要能区分「正常收尾」与「有残留进程」——
       // 下次启动时这两种记录的处置不同。
-      markInFlight(flightRecord, outcome.trace.kill_failed ? "halted_residual_process" : "reported");
+      // B11（A 端 B10 复验 §a）：判据扩为整个进程状态。**正常返回**也可能
+      // 带着 `unknown`（agent 超时且始终未观察到关闭）；若这里仍只认
+      // kill_failed，那条路径的停机标记就落不了盘，重启门禁也就看不见它。
+      const halt = haltSignalOf(outcome.trace);
+      markInFlight(
+        flightRecord,
+        halt.unsafe ? haltedStateFor(halt.state) : "reported",
+      );
     } catch (error) {
       const status = httpStatusOf(error);
-      // B9（A 端 B8 复验 §3.2）：上报失败同样要看 kill_failed。
+      // B9（A 端 B8 复验 §3.2）：上报失败同样要看进程状态。
       // B8 先无条件写成 failed_to_report，于是 401/403/409 会在停机门**之前**
       // break 掉，记录里再也看不到「本机还有残留进程」这件事；其他错误虽会
       // 走到停机门，记录却已经是 failed_to_report。
-      const residual = outcome.trace.kill_failed === true;
+      // B11（A 端 B10 复验 §a）：判据从 kill_failed 扩为整个进程状态。
+      const halt = haltSignalOf(outcome.trace);
+      const unsafe = halt.unsafe;
       attemptRecords.push({
         task_id: task.task_id,
         attempt_id: lease.attempt_id,
@@ -1259,15 +1306,16 @@ export async function runDaemon(
         pushed,
         error_code: errorCodeOf(error),
       });
-      markInFlight(flightRecord, residual ? "halted_residual_process" : "failed_to_report");
-      if (residual) {
-        // 优先于 401/403/409：先保证「本机有杀不掉的进程」被记录下来，
+      markInFlight(flightRecord, unsafe ? haltedStateFor(halt.state) : "failed_to_report");
+      if (unsafe) {
+        // 优先于 401/403/409：先保证「本机有去向不明或杀不掉的进程」被记录下来，
         // 否则重启后没人知道要去清理它。
         log(
-          `[halt] 上报失败（HTTP ${status ?? "无"} / ${errorCodeOf(error)}）且进程未被终止：` +
-            "保留残留标记并停止领取新任务；请人工确认残留进程已清理后再启动",
+          `[halt] 上报失败（HTTP ${status ?? "无"} / ${errorCodeOf(error)}）且` +
+            `${describeProcessState(halt.state)}：` +
+            "保留停机标记并停止领取新任务；请人工确认进程已清理后再启动",
         );
-        report.stop_reason = "halt_residual_process";
+        report.stop_reason = haltStopReasonFor(halt.state);
         break;
       }
       if (status === 401 || status === 403) {
@@ -1284,20 +1332,32 @@ export async function runDaemon(
       log(`[report] 上报失败（HTTP ${status ?? "无"} / ${errorCodeOf(error)}）：记录并继续`);
     }
 
-    /* --- B8：残留进程 → 停止接新任务（A 端 B7-1）-------------- */
+    /* --- B8/B11：进程状态不干净 → 停止接新任务（A 端 B7-1 / B10 复验 §a）--- */
     // 顺序刻意放在上报之后：**结果必须如实上报**，否则协调器永远等不到
     // 这个 attempt 的下落，而租约要等到自然过期才回收。
-    // 但上报完成后必须停：杀不掉的进程还在占用 worktree 与文件锁，
-    // 继续领取新任务只会制造更多无法解释的失败。
-    if (outcome.trace.kill_failed) {
+    // 但上报完成后必须停：状态未知或杀不掉的进程都可能还在占用 worktree
+    // 与文件锁，继续领取新任务只会制造更多无法解释的失败。
+    //
+    // B11 之前这里只认 `kill_failed`，于是**正常返回**却带着 `unknown`
+    // 的那条路径（agent 超时后始终没观察到关闭）直接漏到下一轮轮询。
+    const halt = haltSignalOf(outcome.trace);
+    if (halt.unsafe) {
+      const haltState = haltedStateFor(halt.state);
+      // 措辞按证据强度分开：`residual` 是「已确认有杀不掉的进程」，
+      // `unknown` 是「不知道进程还在不在」。两者都要人工介入，
+      // 但把后者说成前者会伪造证据，也会把排查引向错误方向。
+      const what =
+        haltState === "halted_residual_process" ? "残留进程" : "状态未知的进程";
       log(
-        "[halt] 测试/agent 进程未被终止，可能有残留进程占用 worktree 与文件锁：" +
-          "停止领取新任务；请人工确认残留进程已清理（必要时重启本机）后再启动执行器。" +
-          `残留详情：${outcome.report.note ?? "见上报备注"}`,
+        `[halt] ${describeProcessState(halt.state)}：可能有${what}` +
+          `仍占用 worktree 与文件锁。停止领取新任务并保留停机标记 ${haltState}；` +
+          "请人工确认进程已清理（必要时重启本机）后再启动执行器。" +
+          `详情：${outcome.report.note ?? "见上报备注"}`,
       );
       // 刻意**不**在这里清理 worktree：清理动作可能被残留进程的文件锁挡住，
       // 而「清理失败」会把「需要人工处理」这件事伪装成一次普通的清理告警。
-      report.stop_reason = "halt_residual_process";
+      markInFlight(flightRecord, haltState);
+      report.stop_reason = haltStopReasonFor(halt.state);
       break;
     }
 
@@ -1606,10 +1666,12 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     }
     return report.stop_reason === "health_failed" ||
       report.stop_reason === "registration_rejected" ||
-      // B8：身份不支持与残留进程都属「必须人工介入」，以非零码退出，
+      // B8：身份不支持属「必须人工介入」，以非零码退出，
       // 让调用方（脚本 / CI）不会把它当成一次正常收工。
       report.stop_reason === "agent_kind_unsupported" ||
-      report.stop_reason === "halt_residual_process"
+      // B11（A 端 B10 复验 §a）：**所有**「进程需人工介入」的停机原因都
+      // 应以非零码退出，见 HALT_STOP_REASONS 的说明。
+      HALT_STOP_REASONS.has(report.stop_reason)
       ? 1
       : 0;
   } finally {

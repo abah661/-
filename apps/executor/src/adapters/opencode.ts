@@ -30,6 +30,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { setImmediate as drainMicrotasks } from "node:timers/promises";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import type { ErrorCode } from "@dac/protocol";
@@ -122,6 +123,26 @@ export interface OpenCodeProcess {
    * 显式的、可等待的通道，而不是靠「等 close」来碰运气。
    */
   spawn_error?: Promise<Error | null>;
+  /**
+   * **观察到进程关闭**（`close` / `exit` 事件）——与 `exit_code` 是两个不同事实。
+   *
+   * 为什么不能只看 `exit_code`（B11，A 端 B10 复验 §a）：
+   *  - 进程**被信号终止**时可能永远拿不到数字退出码，但它确实已经退出；
+   *  - **启动失败**时 `exit_code` 也会兑现成一个 `null`，而那次进程从未存在。
+   * 两种情况在 `exit_code` 上长得一模一样，凭它反推必然出错。
+   *
+   * 缺省（未提供）时调用方按「`exit_code` 已兑现且无启动失败」近似判断：
+   * 兼容既有注入式 runner，同时**不会**把启动失败当成观察到关闭。
+   */
+  closed?: Promise<void>;
+  /**
+   * 主动探测进程是否仍存活，返回三态（B11，A 端 B10 复验 §a）。
+   *
+   * 只在「已启动、已发终止信号、却始终没观察到关闭」时才被调用：
+   * 那时只有**问到「还活着」**才敢记 `residual`；问不到一律 `unknown`。
+   * 缺省时视为无法探测（等价于 `unknown`）。
+   */
+  probe_alive?: () => ProcessLiveness;
 }
 
 export interface OpenCodeProcessRunner {
@@ -154,6 +175,16 @@ export class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
       child.once("error", (error: Error) => resolve(error));
     });
 
+    // B11（A 端 B10 复验 §a）：**关闭事件**与**退出码**分别记账。
+    // 被信号终止的进程没有数字退出码，但关闭事件确实发生过；
+    // 启动失败会把 `exit_code` 也兑现成 null，却根本没有进程。
+    let close_observed = false;
+    const close_event = new Promise<void>((resolve) => {
+      child.once("close", () => {
+        close_observed = true;
+        resolve();
+      });
+    });
     const closed = new Promise<number | null>((resolve) =>
       child.once("close", (code) => resolve(code)),
     );
@@ -164,6 +195,14 @@ export class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
       // 启动失败时没有进程可等，退出码按「未取得」返回 null。
       // 绝不在这里伪造 0 —— 那会让上层把「没跑起来」当成正常结束。
       exit_code: Promise.race([closed, spawn_error.then(() => null)]),
+      closed: close_event,
+      probe_alive: (): ProcessLiveness => {
+        // 已经观察到关闭 → 确定不在运行，不必再问 pid（pid 可能已被复用）。
+        if (close_observed) return "gone";
+        const pid = child.pid;
+        if (pid === undefined) return "gone";
+        return probeProcessAlive(pid);
+      },
       kill: (signal = "SIGTERM") => {
         try {
           child.kill(signal);
@@ -412,6 +451,14 @@ export interface OpenCodeAdapterResult {
   launch_source: OpenCodeLaunchSource | "bare_name";
   /** 启动方式的解析依据；解析失败时是搜索过的路径清单 */
   launch_detail: string;
+  /**
+   * 本次 agent 进程的生命周期状态（B11，A 端 B10 复验 §a）。
+   *
+   * 调用方**必须**用它判断「能不能安全继续」，不得用 `exit_code` 反推：
+   * 被信号终止的进程可能拿不到数字退出码，而启动失败也会把 `exit_code`
+   * 兑现成 `null` —— 两者在退出码上无法区分，而它们的处置完全不同。
+   */
+  process_state: OpenCodeProcessState;
 }
 
 function sha256(value: string): string {
@@ -420,6 +467,72 @@ function sha256(value: string): string {
 
 /** 超时后再等这么久就放弃等待退出码（避免被不响应的进程永久阻塞）。 */
 const KILL_GRACE_MS = 5_000;
+
+/**
+ * 发出 SIGKILL 后，再给这么久去观察关闭事件（B11，A 端 B10 复验 §a）。
+ *
+ * 这个窗口必须**存在**：否则一个刚被强杀的进程会被判成「状态未知」，
+ * 白白触发人工门禁；也必须**有限**：否则一个不响应的进程会把执行器拖死。
+ */
+const POST_KILL_GRACE_MS = 2_000;
+
+/** 进程存活性的三态探测结果（B11，A 端 B10 复验 §a）。 */
+export type ProcessLiveness = "alive" | "gone" | "unknown";
+
+/**
+ * 进程生命周期状态（B11，A 端 B10 复验 §a）。
+ *
+ * 刻意不是布尔：`spawn_failed`（连进程都没有）与 `unknown`（有过进程、
+ * 去向不明）在「要不要继续开工」上的答案完全不同 —— 前者可以安全继续，
+ * 后者必须停机。把它们压成一个 `boolean` 正是被点名的那种丢信息。
+ */
+export type OpenCodeProcessState = "spawn_failed" | "stopped" | "unknown" | "residual";
+
+/**
+ * 用 pid 主动探测进程是否仍存在（B11，A 端 B10 复验 §a）。
+ *
+ * `process.kill(pid, 0)` 只做存在性检查、不发信号：
+ *  - 不抛错 → 进程存在（此刻确实能「确认它活着」）；
+ *  - `ESRCH` → 进程不存在；
+ *  - `EPERM` → 进程存在但拿不到权限（Windows 上常见），仍算活着；
+ *  - 其他错误 / 拿不到有效 pid → 无法判断。
+ *
+ * 返回 `unknown` 时调用方**不得**当作 `gone`：这三态是刻意分开的，
+ * 「探不到」与「已经退出」是两件事。
+ */
+export function probeProcessAlive(pid: number): ProcessLiveness {
+  if (!Number.isInteger(pid) || pid <= 0) return "unknown";
+  try {
+    process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "gone";
+    if (code === "EPERM") return "alive";
+    return "unknown";
+  }
+}
+
+/**
+ * 由**可观测事实**判定进程状态（B11，A 端 B10 复验 §a）。
+ *
+ * 顺序即优先级，全程**不**看 `exit_code`：
+ *  1. `spawn_failed`   —— 连进程都没创建（可证明安全）；
+ *  2. `close_observed` —— 真的观察到关闭（**唯一**直接的「已停止」证据；
+ *     即使退出码是 null 也算，因为进程可能是被信号终止的）；
+ *  3. 走到这里意味着「已启动、已发终止信号、却始终没看到关闭」：
+ *     只有主动探测答「还活着」才记 `residual`，否则一律 `unknown`。
+ */
+export function determineProcessState(input: {
+  spawn_failed: boolean;
+  close_observed: boolean;
+  probe?: (() => ProcessLiveness) | undefined;
+}): OpenCodeProcessState {
+  if (input.spawn_failed) return "spawn_failed";
+  if (input.close_observed) return "stopped";
+  const probed = input.probe !== undefined ? input.probe() : "unknown";
+  return probed === "alive" ? "residual" : "unknown";
+}
 
 async function collect(stream: AsyncIterable<Uint8Array | string>): Promise<string> {
   const chunks: string[] = [];
@@ -535,6 +648,9 @@ export async function runOpenCodeTask(
       request_url: null,
       launch_source,
       launch_detail,
+      // B11（A 端 B10 复验 §a）：`runner.start()` 同步抛错 = 进程**从未创建**，
+      // 这是可证明的安全失败，不能被记成「去向不明」。
+      process_state: "spawn_failed",
     };
   }
 
@@ -549,6 +665,21 @@ export async function runOpenCodeTask(
   const stdoutPromise = collect(handle.stdout).catch(() => "");
   const stderrPromise = collect(handle.stderr).catch(() => "");
   const exitPromise = handle.exit_code;
+
+  // B11（A 端 B10 复验 §a）：**单独**记「是否观察到关闭」。
+  // 它不能用 `exit_code` 代替：退出码可能永远不来（被信号终止），
+  // 也可能因为启动失败而兑现成 null（进程压根没存在过）。
+  let close_observed = false;
+  if (handle.closed !== undefined) {
+    void handle.closed.then(
+      () => {
+        close_observed = true;
+      },
+      () => {
+        // 关闭通道不应失败；真失败时保持「未观察到」，按保守方向处理。
+      },
+    );
+  }
 
   let exited = false;
   const exitedPromise = exitPromise.then(() => {
@@ -586,11 +717,27 @@ export async function runOpenCodeTask(
   clearTimeout(killTimer);
   input.signal?.removeEventListener("abort", onAbort);
 
+  // B11（A 端 B10 复验 §a）：两条通道（`exit_code` 与 `spawn_error`）可能在
+  // 同一轮微任务里竞速落定 —— 真实 runner 的启动失败会**先**把 `exit_code`
+  // 兑现成 null，再走 `error` 通道。先排空一次微任务队列再判定，读到的才是
+  // 稳定值。**不是**无界等待：一个 macrotask 边界即可。
+  await drainMicrotasks();
+
   const failure = spawn_error as Error | null;
   if (failure === null && !exited) {
     // 仍未退出：认定超时，并在放弃前再补一次强杀。
     timed_out = true;
     handle.kill("SIGKILL");
+    // 交出强杀信号后再给一个**有界**窗口观察关闭事件：SIGKILL 之后进程通常
+    // 很快被回收，若此刻立刻判定，会把「刚被杀掉的进程」说成「状态未知」，
+    // 白白让执行器停在人工门禁上。窗口是有限的，不能为等一个不响应的进程
+    // 而无界阻塞。
+    if (handle.closed !== undefined) {
+      await Promise.race([
+        handle.closed,
+        new Promise<void>((resolve) => setTimeout(resolve, POST_KILL_GRACE_MS)),
+      ]);
+    }
   }
 
   // 启动失败时 stdout / stderr 可能永远不结束，**不能**等它们，
@@ -600,6 +747,22 @@ export async function runOpenCodeTask(
       ? (["", `子进程启动失败：${failure.message}`] as const)
       : await Promise.all([stdoutPromise, stderrPromise]);
   const exit_code = exited ? await exitPromise : null;
+
+  /*
+   * B11（A 端 B10 复验 §a）：进程状态由**可观测事实**判定，不由退出码反推。
+   *
+   * 走到这里仍「没观察到关闭」只剩一种情形：进程已启动、发过终止信号、
+   * 却迟迟不退出（超时/取消路径）。此时只有主动探测明确答「还活着」才记
+   * `residual`；问不到、或探到已不存在，一律 `unknown` —— 「探不到」与
+   * 「已经退出」刻意分开，不能互相冒充。两种状态在常驻入口都会停机。
+   */
+  const process_state = determineProcessState({
+    spawn_failed: failure !== null,
+    // 缺省 `closed` 通道的注入式 runner：以「退出码已兑现且非启动失败」近似。
+    close_observed:
+      handle.closed !== undefined ? close_observed : exited && failure === null,
+    probe: handle.probe_alive,
+  });
 
   const parsed = parseOpenCodeEvents(stdout);
   const classified = classifyOpenCodeFailure({
@@ -649,5 +812,6 @@ export async function runOpenCodeTask(
     request_url: parsed.error?.url ?? null,
     launch_source,
     launch_detail,
+    process_state,
   };
 }

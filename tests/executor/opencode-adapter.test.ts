@@ -17,7 +17,7 @@ import {
   parseOpenCodeEvents,
   runOpenCodeTask,
 } from "../../apps/executor/src/adapters/opencode.js";
-import type { OpenCodeProcess, OpenCodeProcessRunner } from "../../apps/executor/src/adapters/opencode.js";
+import type { OpenCodeProcess, OpenCodeProcessRunner, ProcessLiveness } from "../../apps/executor/src/adapters/opencode.js";
 
 /* ------------------------------------------------------------------ *
  * 测试替身
@@ -327,5 +327,157 @@ describe("runOpenCodeTask", () => {
     expect(result.stdout_sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(result.stderr_sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(result.stdout_sha256).not.toBe(result.stderr_sha256);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 进程状态判定（B11，A 端 B10 复验 §a）
+ *
+ * A 端的原话：**不要单靠 `exit_code !== null` 判断进程是否退出**。
+ * 理由有两面，恰好让这个判据两个方向都错：
+ *   - 进程**被信号终止**时可能永远拿不到数字退出码，但它确实已退出；
+ *   - **启动失败**时 `exit_code` 也会兑现成一个 `null`，而进程从未存在。
+ * 本组用三条可观测事实（启动失败 / 观察到关闭 / 主动探测）分别驱动，
+ * 逐条锁定四种状态。`LifecycleProcess` 是必需的假体：既有 `FakeProcess`
+ * 只有 `exit_code`，表达不了「启动了、但始终没观察到关闭」这件事。
+ * ------------------------------------------------------------------ */
+
+/** 空的异步流（本组不关心输出）。 */
+function emptyStream(): AsyncIterable<string> {
+  return (async function* () {})();
+}
+
+/** 轮询等待一个条件成立（用于「等超时先发出终止信号」）。 */
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error("waitFor 超时");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** 可分别控制「关闭事件」与「退出码」的假进程（B11）。 */
+class LifecycleProcess implements OpenCodeProcess {
+  readonly stdout: AsyncIterable<string> = emptyStream();
+  readonly stderr: AsyncIterable<string> = emptyStream();
+  readonly exit_code: Promise<number | null>;
+  readonly closed: Promise<void>;
+  readonly signals: NodeJS.Signals[] = [];
+  /** 默认「无法探测」：只有显式设置才可能判成 residual。 */
+  probe_alive: () => ProcessLiveness = () => "unknown";
+
+  private resolveExit!: (code: number | null) => void;
+  private resolveClose!: () => void;
+
+  constructor() {
+    this.exit_code = new Promise<number | null>((resolve) => {
+      this.resolveExit = resolve;
+    });
+    this.closed = new Promise<void>((resolve) => {
+      this.resolveClose = resolve;
+    });
+  }
+
+  /** 观察到进程关闭。被信号终止时退出码就是 `null`——这正是判据的盲区。 */
+  emitClose(code: number | null): void {
+    this.resolveExit(code);
+    this.resolveClose();
+  }
+
+  /** 只记录信号，不兑现任何生命周期事实（等价于「杀不掉」）。 */
+  kill(signal: NodeJS.Signals = "SIGTERM"): void {
+    this.signals.push(signal);
+  }
+}
+
+describe("进程状态判定（B11 §B10复验 §a）", () => {
+  it("runner.start 同步抛错 → spawn_failed（进程从未创建）", async () => {
+    const broken: OpenCodeProcessRunner = {
+      start() {
+        throw new Error("spawn opencode ENOENT");
+      },
+    };
+    const result = await runOpenCodeTask({ prompt: "hi", cwd: ".", model: "m/x" }, {}, broken);
+    expect(result.process_state).toBe("spawn_failed");
+    expect(result.exit_code).toBeNull();
+  });
+
+  it("异步 spawn 失败 → spawn_failed（不被「退出码兑现成 null」带偏）", async () => {
+    const proc: OpenCodeProcess = {
+      stdout: emptyStream(),
+      stderr: emptyStream(),
+      // 真实 runner 在启动失败时也把 exit_code 兑现成 null，这里如实复刻。
+      exit_code: Promise.resolve(null),
+      spawn_error: Promise.resolve(new Error("spawn ENOENT")),
+      kill: () => undefined,
+    };
+    const result = await runOpenCodeTask(
+      { prompt: "hi", cwd: ".", model: "m/x" },
+      {},
+      new FakeRunner(proc),
+    );
+    expect(result.process_state).toBe("spawn_failed");
+    expect(result.exit_code).toBeNull();
+  });
+
+  it("被信号终止、exit_code 为 null，但观察到关闭 → stopped", async () => {
+    const proc = new LifecycleProcess();
+    const promise = runOpenCodeTask(
+      { prompt: "hi", cwd: ".", model: "m/x", timeout_ms: 10 },
+      {},
+      new FakeRunner(proc),
+    );
+    // 等超时先发出终止信号，再兑现「关闭」——顺序与真实进程一致
+    await waitFor(() => proc.signals.length > 0);
+    proc.emitClose(null);
+    const result = await promise;
+
+    expect(result.timed_out).toBe(true);
+    // 关键：退出码是 null（被信号终止），但这**不等于**状态未知
+    expect(result.exit_code).toBeNull();
+    expect(result.process_state).toBe("stopped");
+  });
+
+  it("超时、已发终止信号、始终未观察到关闭 → unknown（放弃前补过强杀）", async () => {
+    const proc = new LifecycleProcess();
+    proc.probe_alive = () => "unknown";
+    const result = await runOpenCodeTask(
+      { prompt: "hi", cwd: ".", model: "m/x", timeout_ms: 10 },
+      {},
+      new FakeRunner(proc),
+    );
+    expect(result.timed_out).toBe(true);
+    expect(result.exit_code).toBeNull();
+    expect(result.process_state).toBe("unknown");
+    expect(proc.signals).toContain("SIGKILL");
+  }, 30_000);
+
+  it("未观察到关闭，但主动探测确认仍存活 → residual", async () => {
+    const proc = new LifecycleProcess();
+    proc.probe_alive = () => "alive";
+    const result = await runOpenCodeTask(
+      { prompt: "hi", cwd: ".", model: "m/x", timeout_ms: 10 },
+      {},
+      new FakeRunner(proc),
+    );
+    expect(result.process_state).toBe("residual");
+  }, 30_000);
+
+  it("探测答「已不存在」但从未观察到关闭 → unknown（不冒充 stopped）", async () => {
+    const proc = new LifecycleProcess();
+    proc.probe_alive = () => "gone";
+    const result = await runOpenCodeTask(
+      { prompt: "hi", cwd: ".", model: "m/x", timeout_ms: 10 },
+      {},
+      new FakeRunner(proc),
+    );
+    // 「探不到」与「已退出」是两件事：没有关闭事件就只能记 unknown
+    expect(result.process_state).toBe("unknown");
+  }, 30_000);
+
+  it("无 closed/probe 通道的注入式 runner：以「退出码已兑现」近似为 stopped（向后兼容）", async () => {
+    const runner = new FakeRunner(new FakeProcess(REAL_SUCCESS_STREAM, "", 0));
+    const result = await runOpenCodeTask({ prompt: "hi", cwd: ".", model: "m/x" }, {}, runner);
+    expect(result.process_state).toBe("stopped");
   });
 });

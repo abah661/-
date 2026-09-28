@@ -428,7 +428,9 @@ function makeRealHarness(
     result_reporter: {
       async report(report: ResultReport): Promise<ReportAck> {
         reports.push(report);
-        return { accepted: true, task_id: report.task_id, status: report.status };
+        // `ReportAck` 只有 accepted / state；上报的下落由服务端按
+        // task+attempt+epoch 的幂等键确定，本地不需要回传 task_id。
+        return { accepted: true, state: "validating" };
       },
     } satisfies ResultReporter,
     // —— 真实实现（这两行是本文件存在的意义）——
@@ -1352,5 +1354,143 @@ describe("B10 §4 编排异常后的进程状态与 fail-closed 停机（真实�
       expect(third.acquireCalls()).toBe(1);
     },
     120_000,
+  );
+});
+
+/* ================================================================== *
+ * §9 B11：**正常返回**路径上的进程状态（A 端 B10 复验 §a）
+ *
+ * A 端的裁定：超时**不是异常** —— `runOpenCodeTask` 会正常返回一个结果
+ * （`timed_out: true`），而进程仍可能活着。所以判据不能只接在异常分支上，
+ * 也不能用 `exit_code !== null` 反推：被信号终止的进程可能没有数字退出码。
+ *
+ *   已启动 + 观察到关闭              → stopped（**即使 `exit_code` 是 null**）
+ *   已启动 + 终止信号已发 + 未见关闭  → unknown；能确认仍存活才是 residual
+ *
+ * 两条方向相反的结论都用**真实子进程**驱动：既证明「不该停时不误停」，
+ * 也证明「该停时确实停」。
+ * ================================================================== */
+
+describe("B11 §B10复验 正常返回路径的进程状态（真实子进程）", () => {
+  /** 真实存在的休眠脚本：忽略 SIGTERM，只能被强杀。 */
+  function makeSleepScript(): string {
+    const dir = track(mkdtempSync(join(tmpdir(), "dac-b11-agent-")));
+    const script = join(dir, "sleep-agent.js");
+    writeFileSync(
+      script,
+      "process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);\n",
+      "utf8",
+    );
+    return script;
+  }
+
+  /**
+   * 用 node 当「agent」：信号、超时、退出的行为与真实 agent 完全一致，
+   * 只是不调用模型（本用例验证的是**进程生命周期**，不是模型）。
+   */
+  const nodeLauncher = (script: string) => ({ js_entry: script, node_path: process.execPath });
+
+  /**
+   * 真实子进程，但**观察不到关闭事件**。
+   *
+   * 终止信号照常发给真实进程（不留孤儿），而 `closed` 永不兑现、
+   * 存活探测答「未知」——这正是「已发终止信号、仍未见关闭」的等价物，
+   * 也是 `exit_code` 判据彻底失效的场景。
+   */
+  function opaqueCloseAgent(): OpenCodeProcessRunner {
+    const real = new NodeOpenCodeProcessRunner();
+    return {
+      start(command, args, cwd): OpenCodeProcess {
+        const inner = real.start(command, args, cwd);
+        return {
+          stdout: inner.stdout,
+          stderr: inner.stderr,
+          exit_code: inner.exit_code,
+          kill: (signal) => inner.kill(signal ?? "SIGKILL"),
+          closed: new Promise<void>(() => undefined),
+          probe_alive: () => "unknown",
+        };
+      },
+    };
+  }
+
+  it(
+    "真实子进程：超时 → 强杀 → 观察到关闭 → stopped（不因「退出码可能为 null」误停）",
+    async () => {
+      const script = makeSleepScript();
+      const result = await runOpenCodeTask(
+        {
+          prompt: "只验证进程生命周期",
+          cwd: tmpdir(),
+          model: "myapi/test-model",
+          timeout_ms: 500,
+        },
+        { launcher: nodeLauncher(script) },
+        new NodeOpenCodeProcessRunner(),
+      );
+
+      expect(result.timed_out).toBe(true);
+      // 进程**确实已退出** → 这就是 `stopped`。
+      expect(result.process_state).toBe("stopped");
+      // `exit_code` 在这里刻意不断言：被信号终止时它可能是 null（Linux），
+      // 也可能是 1（Windows 的 TerminateProcess）。**它不能当判据**——
+      // 这正是 A 端点名的那一点。
+    },
+    60_000,
+  );
+
+  it(
+    "端到端：正常返回但观察不到关闭 → 停机、如实上报、标记落盘、worktree 保留、重启被拦、显式解除后复工",
+    async () => {
+      const repo = makeRealRepo();
+      const task = makeTask({ allow: ["apps/demo/**"], deny: [] });
+      const store = fileInFlightStore(repo.root);
+      const launcher = nodeLauncher(makeSleepScript());
+
+      // 队列里放**两个**任务：没有停机门时一定会去领第二个
+      const first = makeRealHarness(
+        repo,
+        [
+          { kind: "leased", task, lease: makeLease(repo) },
+          { kind: "leased", task, lease: makeLease(repo) },
+        ],
+        {},
+        { agent_launcher: launcher, agent_timeout_ms: 500, max_idle_polls: 1 },
+        opaqueCloseAgent(),
+      );
+      const haltedRun = await runDaemon(first.options, first.deps);
+
+      // ① 这次 attempt 走的是**正常收尾**（不是 B10 的异常分支）
+      expect(haltedRun.attempts).toHaveLength(1);
+      expect(haltedRun.attempts[0]!.result).toBe("reported");
+      expect(first.reports).toHaveLength(1);
+      // ② 但进程状态未知 → 停机，且**只领过一次**
+      expect(haltedRun.stop_reason).toBe("halt_process_unknown");
+      expect(first.acquireCalls()).toBe(1);
+      // ③ 不推送：超时的 agent 可能仍在写工作区
+      expect(first.pushes).toHaveLength(0);
+      // ④ worktree **刻意保留**：可能仍被去向不明的进程占用
+      const worktreePath = join(repo.root, ...WORKTREE_ROOT_SEGMENTS, "TASK-0001-A1");
+      expect(existsSync(worktreePath)).toBe(true);
+      // ⑤ 标记落盘为「未知」，不冒称「已确认残留」
+      const records = listInFlightRecords(repo.root);
+      expect(records).toHaveLength(1);
+      expect(records[0]!.state).toBe("halted_process_unknown");
+
+      // ⑥ 重启：门禁在**注册之前**拦住
+      const second = makeRealHarness(repo, [{ kind: "empty" }], {}, {}, opaqueCloseAgent());
+      const restart = await runDaemon(second.options, { ...second.deps, ...store });
+      expect(restart.stop_reason).toBe("halt_process_unknown_on_startup");
+      expect(restart.registered).toBe(false);
+      expect(second.acquireCalls()).toBe(0);
+
+      // ⑦ 只有显式人工解除，重启才能重新开工
+      expect(clearInFlightRecord(repo.root, "TASK-0001-A1").removed).toBe(true);
+      const third = makeRealHarness(repo, [{ kind: "empty" }], {}, {}, opaqueCloseAgent());
+      const resumed = await runDaemon(third.options, { ...third.deps, ...store });
+      expect(resumed.stop_reason).toBe("idle_limit");
+      expect(third.acquireCalls()).toBe(1);
+    },
+    180_000,
   );
 });

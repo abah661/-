@@ -34,7 +34,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { Lease, ResultReport, TaskNode } from "@dac/protocol";
-import type { AttemptDeps, AttemptInput, AttemptOutcome } from "../../apps/executor/src/core/attempt.js";
+import type { AttemptDeps, AttemptInput, AttemptOutcome, AttemptProcessState } from "../../apps/executor/src/core/attempt.js";
 import { AttemptOrchestrationError } from "../../apps/executor/src/core/attempt.js";
 import type { HeartbeatRequest, HeartbeatTransport } from "../../apps/executor/src/core/heartbeat.js";
 import type { LeaseClock, LeaseTransport, RenewOutcome } from "../../apps/executor/src/core/lease.js";
@@ -179,6 +179,10 @@ function makeOutcome(overrides: Partial<AttemptOutcome> = {}): AttemptOutcome {
       // B8：默认「进程正常终止、Git 核对成功」
       kill_failed: false,
       git_error: null,
+      // B11：默认「进程已观察到关闭」——可安全继续的两种状态之一。
+      // 需要「状态未知 / 已确认残留」的用例必须显式覆盖它，
+      // 否则会悄悄退回「默认安全」这条被点名过的老路。
+      process_state: "stopped",
     },
     worktree_removed: true,
     worktree_path: "/repo/.local/worktrees/TASK-0001-A1",
@@ -1059,6 +1063,148 @@ describe("B10 §B9复验 编排异常后的进程状态与 fail-closed 停机", 
 });
 
 /* ------------------------------------------------------------------ *
+ * B11 § 正常返回路径的进程状态门禁（A 端 B10 复验 §a）
+ *
+ * B10 的四种状态只接在**异常分支**上。但超时并不抛异常：
+ * `runOpenCodeTask` 会正常返回一个结果（`timed_out: true`），而进程可能
+ * 始终没有被观察到退出。A 端复验 §a 点名的正是这条路径：
+ * 「超时可以正常返回一个结果，但进程仍可能活着」，判据不能只看异常分支，
+ * 也不能用 `exit_code !== null` 反推（被信号终止也可能没有数字退出码）。
+ *
+ * 本组锁定：**正常返回**同样按 `trace.process_state` 分流，
+ * `unknown` / `residual` → 停机 + 门禁标记持久化 + 不清理 worktree。
+ * ------------------------------------------------------------------ */
+
+describe("B11 §B10复验 正常返回路径的进程状态门禁", () => {
+  /** 队列里塞两个任务：没有停机门时**一定**会去领第二个。 */
+  const twoLeased = [
+    { kind: "leased" as const, task: TASK, lease: LEASE },
+    { kind: "leased" as const, task: TASK, lease: LEASE },
+  ];
+
+  /** 正常返回（不是异常），但带着一个不安全的进程状态。 */
+  const outcomeWithState = (
+    state: AttemptProcessState,
+    extra: Partial<AttemptOutcome> = {},
+  ): AttemptOutcome =>
+    makeOutcome({
+      trace: { ...makeOutcome().trace, process_state: state },
+      ...extra,
+    });
+
+  it("① 正常返回但状态未知 → 上报后停机、不领第二个任务、标记为「未知」", async () => {
+    const h = makeHarness({
+      script: twoLeased,
+      outcome: outcomeWithState("unknown"),
+    });
+    const report = await runDaemon(
+      withLog(makeOptions({ enable_push: true, max_idle_polls: 1 }), h.logs),
+      h.deps,
+    );
+
+    // 本机不安全 → 停机，且**只领过一次**
+    expect(report.stop_reason).toBe("halt_process_unknown");
+    expect(h.acquireCalls()).toBe(1);
+    expect(report.attempts).toHaveLength(1);
+    // 结果仍必须**如实上报**：协调器要拿到这个 attempt 的下落
+    expect(h.events).toContain("report");
+    expect(h.reports).toHaveLength(1);
+    // 门禁标记要落盘，且**不得**冒称「已确认残留」
+    expect(h.saved.at(-1)?.state).toBe("halted_process_unknown");
+    expect(h.saved.some((record) => record.state === "halted_residual_process")).toBe(false);
+    // 措辞必须说「无法证明」，不能把「不知道」说成「已确认杀不掉」
+    expect(h.logs.some((line) => line.includes("无法证明"))).toBe(true);
+  });
+
+  it("② 正常返回但确认残留 → 停机、标记为「已确认残留」", async () => {
+    const h = makeHarness({
+      script: twoLeased,
+      outcome: outcomeWithState("residual"),
+    });
+    const report = await runDaemon(
+      withLog(makeOptions({ max_idle_polls: 1 }), h.logs),
+      h.deps,
+    );
+
+    expect(report.stop_reason).toBe("halt_residual_process");
+    expect(h.acquireCalls()).toBe(1);
+    expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
+    expect(h.logs.some((line) => line.includes("已确认未被终止"))).toBe(true);
+  });
+
+  it("③ 未观察到关闭但结果看似可整合 → 拒绝推送并降级（推送门同样扩到 unknown）", async () => {
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      outcome: outcomeWithState("unknown"),
+    });
+    const report = await runDaemon(
+      withLog(makeOptions({ enable_push: true, max_idle_polls: 1 }), h.logs),
+      h.deps,
+    );
+
+    // 结果默认是 ready_for_integration；进程状态不可信 → 不得推送
+    expect(h.events).not.toContain("push");
+    expect(h.pushes).toHaveLength(0);
+    expect(h.reports[0]!.status).toBe("failed");
+    expect(h.reports[0]!.error_code).toBe("INTERNAL_ERROR");
+    expect(report.stop_reason).toBe("halt_process_unknown");
+  });
+
+  it("④ 显式开启 cleanup_worktree 时，停机路径仍**不清理** worktree", async () => {
+    // 清理点固定在链路最末端（推送与上报之后）；停机必须在它之前 break。
+    // 用真实临时目录做 worktree_path：若停机分支被执行到，目录会被动过。
+    const worktreePath = mkdtempSync(join(tmpdir(), "dac-b11-wt-"));
+    try {
+      const halted = makeHarness({
+        script: twoLeased,
+        outcome: outcomeWithState("unknown", { worktree_path: worktreePath }),
+      });
+      const haltedReport = await runDaemon(
+        withLog(makeOptions({ cleanup_worktree: true, max_idle_polls: 1 }), halted.logs),
+        halted.deps,
+      );
+      expect(haltedReport.stop_reason).toBe("halt_process_unknown");
+      // 目录原样保留，且清理动作从未被尝试
+      expect(existsSync(worktreePath)).toBe(true);
+      expect(halted.logs.some((line) => line.startsWith("[worktree]"))).toBe(false);
+
+      // 对照组：同样的配置、进程已确认关闭 → 清理点**会被走到**
+      // （临时目录不是 git worktree，所以清理会失败并如实记日志；
+      //  这里要证明的是「代码路径走到了」，不是清理成功。）
+      const safe = makeHarness({
+        script: [{ kind: "leased", task: TASK, lease: LEASE }],
+        outcome: outcomeWithState("stopped", { worktree_path: worktreePath }),
+      });
+      const safeReport = await runDaemon(
+        withLog(makeOptions({ cleanup_worktree: true, max_idle_polls: 1 }), safe.logs),
+        safe.deps,
+      );
+      expect(safeReport.stop_reason).not.toBe("halt_process_unknown");
+      expect(safe.logs.some((line) => line.startsWith("[worktree]"))).toBe(true);
+    } finally {
+      rmSync(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  it("⑤ 反向锁定：状态为 stopped 且未 kill_failed 时不得误停", async () => {
+    // 「被信号终止、拿不到数字退出码」也属 stopped —— 若实现退回去看
+    // exit_code，这种正常结束会被误判 unknown 并停掉执行器。
+    const h = makeHarness({
+      script: twoLeased,
+      outcome: outcomeWithState("stopped"),
+    });
+    const report = await runDaemon(
+      withLog(makeOptions({ max_idle_polls: 1 }), h.logs),
+      h.deps,
+    );
+    expect(report.stop_reason).not.toBe("halt_process_unknown");
+    expect(report.stop_reason).not.toBe("halt_residual_process");
+    // 又领了下一个任务（而不是停在这一轮）
+    expect(h.acquireCalls()).toBeGreaterThan(1);
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * 2. 注册
  * ------------------------------------------------------------------ */
 
@@ -1397,6 +1543,11 @@ describe("B4 §7 租约失效", () => {
           lease_lost_reason: "lease_epoch_stale",
           sideEffectsSkipped: true,
           worktree_ready: true,
+          commit: null,
+          commit_skipped_reason: null,
+          kill_failed: false,
+          git_error: null,
+          process_state: "stopped",
         },
       }),
     });

@@ -77,9 +77,17 @@ B 核对通过后再审阅图与契约。
 
 ## 五、实跑记录
 
-```text
-（npm run check 的完整输出与退出码见提交说明 / CI）
-```
+| 命令 / 通道 | 退出码 | 结果 |
+| --- | --- | --- |
+| `npm run typecheck` | 0 | 无错误 |
+| `npm run check` | **0** | 21 文件 **507 passed / 1 skipped / 0 failed**（508），96.7s |
+| GitHub Actions | — | **#29（`feccefd`）**：`check (windows-latest)` **success**、`check (ubuntu-latest)` **success** |
+
+作业时长（用于判断是否跑完整套）：Windows `Run project checks` **30 s**、
+Ubuntu **16 s** —— 与该仓库同 OS 的历史成功值（Windows 25–32 s、Ubuntu 11–19 s）同量级。
+
+> 注意基准：本机 Windows 单跑 `npm run check` 需 **96.7 s**，Ubuntu CI 只要 **16 s**。
+> 两者不可互相作基准（本机有实时防护，每次 spawn 都更慢）。
 
 ## 六、未验证项与边界（不粉饰）
 

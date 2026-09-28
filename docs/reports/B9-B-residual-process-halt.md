@@ -81,7 +81,8 @@ A 的独立复验指出另外三类路径没有同等保护，本次全部补齐
 | --- | --- |
 | `npm run typecheck` | 退出码 **0** |
 | `npm test -- tests/executor/daemon.test.ts` | **72 passed / 0 failed**（新增 13 例；改动前 59 例） |
-| `npm run check` | 见下方「实跑记录」 |
+| `npm run check` | 退出码 **0**：21 文件 **507 passed / 1 skipped / 0 failed**（508），96.7s |
+| GitHub Actions | **#29（`feccefd`）** `check (windows-latest)` 与 `check (ubuntu-latest)` 均 **success** |
 
 新增 13 例（`tests/executor/daemon.test.ts`，`B9 §B8复验` 组）：
 

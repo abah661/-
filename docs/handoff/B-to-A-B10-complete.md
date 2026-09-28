@@ -104,10 +104,14 @@ export type AttemptProcessState = "not_started" | "stopped" | "residual" | "unkn
 | `npm run typecheck` | **0** | 无错误 |
 | `npm test -- tests/executor/{daemon,attempt,real-chain}.test.ts` | **0** | 3 文件 **112 passed / 0 failed**（180.2s） |
 | `npm run check` | **0** | 21 文件 **519 passed / 1 skipped / 0 failed**（520），177.3s |
-| GitHub Actions | 见提交说明补充 | — |
+| GitHub Actions | — | **#31（`9dbfd8f`）**：`check (windows-latest)` **success**、`check (ubuntu-latest)` **success** |
 
 总数对账：B9 基线 **507 passed / 1 skipped（508）** → 本轮 **519 / 1（520）**，
 差 **12** 例，与新增用例数吻合。
+
+作业时长：Windows `Run project checks` **24 s**、Ubuntu **19 s** —— 同 OS 历史成功值
+（Windows 24–34 s、Ubuntu 16–19 s）同量级，说明两个 OS 都跑完了整套。
+（本机 Windows 单跑同一命令需 **177 s**，不可与 CI 互作基准。）
 
 ## 六、未验证项与边界（不粉饰）
 

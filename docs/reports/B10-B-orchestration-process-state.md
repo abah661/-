@@ -131,12 +131,17 @@ export type AttemptProcessState = "not_started" | "stopped" | "residual" | "unkn
 | `npm run typecheck` | **0** | 无错误 |
 | `npm test -- tests/executor/{daemon,attempt,real-chain}.test.ts` | **0** | 3 文件 **112 passed / 0 failed**（180.2s） |
 | `npm run check` | **0** | 21 文件 **519 passed / 1 skipped / 0 failed**（520），177.3s |
-| GitHub Actions | 见下方补充 | — |
+| GitHub Actions | — | **#31（`9dbfd8f`）**：`check (windows-latest)` **success**、`check (ubuntu-latest)` **success** |
 
 总数对账：B9 基线为 **507 passed / 1 skipped（508）**，本轮 **519 / 1（520）**，
 差 **12** 例 —— 与新增用例数完全吻合。
 
-（CI 结果见本文件后续修订 / 提交说明。）
+作业时长（用于判断是否跑完整套）：Windows `Run project checks` **24 s**、
+Ubuntu **19 s**，与该仓库同 OS 的历史成功值（Windows 24–34 s、Ubuntu 16–19 s）
+同量级。
+
+> 基准提醒：本机 Windows 单跑 `npm run check` 需 **177 s**，Ubuntu CI 只要 **19 s**，
+> 两者不可互相作基准。
 
 ## 六、本轮自查发现的三处问题（都是自己引入或既有的，不粉饰）
 

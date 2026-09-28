@@ -19,8 +19,9 @@ CI 零改动。**B7-5 的逐项证据见第四节——其中只有 401 注册�
 
 | # | 提交 SHA | 内容 |
 | --- | --- | --- |
-| 1 | 见 §5.3 实测 | B8 实现 + 测试 + `docs/reports/B8-B-executor-hardening.md` + 本交接单 |
-| 2 | 见 §5.3 实测 | 仅补录 CI 结果（本文件 §五） |
+| 1 | `0897984ab6b5ab219c875ab5a24603b10f2229b7` | B8 实现（9 个源文件改动 + 新增 `core/child-env.ts`）、42 例回归、报告与本交接单 |
+| 2 | `a6d1b47a91cc4ce780e5a2c5a615c001e09f0407` | 修用例的平台假设（`#26` 的 Ubuntu 失败根因，见 §5.3 与报告 §6.2） |
+| 3 | 本提交（仅补录 `#27` 的 CI 结果） | 只改本文件 §五 |
 
 **SHA 核对方式**（本文件随文档提交前进、顶端 SHA 无法自指，故以实测为准）：
 
@@ -28,6 +29,10 @@ CI 零改动。**B7-5 的逐项证据见第四节——其中只有 401 注册�
 git ls-remote origin refs/heads/task/TASK-B-EXECUTOR/TASK-B-EXECUTOR-B8
 git rev-parse HEAD        # B 端 worktree 内
 ```
+
+B 端推送后实测：`git ls-remote` 返回
+`a6d1b47a91cc4ce780e5a2c5a615c001e09f0407`，与本地 `git rev-parse HEAD` **逐字一致**。
+补录本文件 §五 后顶端会再前进一次（只含本文件的改动），请以 `ls-remote` 为准。
 
 改动范围（`git diff --name-only 3c144a5..HEAD` 实测）：
 
@@ -115,7 +120,11 @@ A 端在 2026-09-28 对**自己的基线**（未整合 B7）跑 `npm run check` 
 | 运行 | 提交 | `windows-latest` | `ubuntu-latest` |
 | --- | --- | --- | --- |
 | **#26** | `0897984` | **success**（32 s） | ❌ **failure**（19 s） |
-| **#27** | 修正后（见下） | 待补录 | 待补录 |
+| **#27** | `a6d1b47`（修正后顶端） | **success**（33 s） | **success**（18 s） |
+
+run #27：<https://github.com/abah661/-/actions/runs/36373874974> —— 整体 `success`，两个 OS 均 `success`。
+两个 OS 的耗时都与同仓库历史成功值同量级（Ubuntu 11–19 s、Windows 25–33 s），
+**没有**出现 #19 那种 182 s 的异常耗时。
 
 **#26 的 Ubuntu 失败已定位并修正**，不是未查明项，根因完整记录在
 `docs/reports/B8-B-executor-hardening.md` §6.2：
@@ -130,6 +139,11 @@ A 端在 2026-09-28 对**自己的基线**（未整合 B7）跑 `npm run check` 
   并把「绝对路径夹带参数」拆成独立的拒绝用例。
 - 已核对：`tests/executor/` 内其余 Windows 路径字面量都只经纯字符串辅助函数
   （`isInside` / `join`），不触碰 `isAbsolute` / `existsSync`，因此不受影响。
+
+**修正后顶端与 CI**：`a6d1b47a91cc4ce780e5a2c5a615c001e09f0407`，
+run **#27** 两个 OS 均 `success`（Windows 33 s / Ubuntu 18 s）。
+用例数量未变（42 例），**未删断言、未跳过用例、未放宽标准**，只是把例子换成
+本平台路径并把「夹带参数」拆成独立用例。
 
 对照历史基线（同样跑 11–19 s，说明 Ubuntu 上是**跑完整套**后才失败，不是早期中断）：
 B7 #25 ubuntu 17 s success、#24 ubuntu 19 s success、B6 #21 ubuntu 11 s success。

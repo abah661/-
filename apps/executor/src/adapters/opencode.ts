@@ -430,6 +430,38 @@ async function collect(stream: AsyncIterable<Uint8Array | string>): Promise<stri
 }
 
 /**
+ * **启动前阶段**的失败（B10，A 端 B9 复验 §4）。
+ *
+ * 「启动前」在这里有严格含义：`runner.start()` **还没有被调用**，
+ * 因此本机上不存在这次 attempt 的 agent 进程 —— 失败是**可证明安全的**。
+ *
+ * 它和「启动之后抛错」必须分开，否则调用方只能保守地把所有异常都当成
+ * 「进程状态未知」并停机，于是一个模型名写错就会让执行器每次启动都被
+ * 残留门禁拦住，得人工清一次标记才能起来。
+ */
+export class OpenCodePreStartError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OpenCodePreStartError";
+  }
+}
+
+/**
+ * 执行「启动前」的一段计算，并把其中任何异常统一转成
+ * {@link OpenCodePreStartError}。
+ *
+ * 只用于 `runner.start()` **之前**的代码。`runner.start()` 自身的失败
+ * 走的是**返回值**（见下方 try/catch），不是抛出，所以不在本函数覆盖范围内。
+ */
+function preStart<T>(compute: () => T): T {
+  try {
+    return compute();
+  } catch (error) {
+    throw new OpenCodePreStartError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
  * 非交互执行一次 OpenCode 任务。
  *
  * 判定顺序（与 Codex 适配器一致，理由见第 8 节步骤 8）：
@@ -442,7 +474,8 @@ export async function runOpenCodeTask(
   config: OpenCodeAdapterConfig = {},
   runner: OpenCodeProcessRunner = new NodeOpenCodeProcessRunner(),
 ): Promise<OpenCodeAdapterResult> {
-  const cliArgs = buildOpenCodeRunArgs(input, config);
+  // B10：进程尚未创建，这里的失败是「可证明的启动前失败」。
+  const cliArgs = preStart(() => buildOpenCodeRunArgs(input, config));
 
   /*
    * B6-2（A 端裁定）：**先解析出真实启动目标，再以绝对路径 + 参数数组启动**。
@@ -460,12 +493,14 @@ export async function runOpenCodeTask(
    * 原先会被自动探测替换成本机真实的 `opencode.exe` 并**真的启动**，
    * 于是「起不来要快速失败」这条路径被悄悄换成了另一件事。
    */
-  const launch: OpenCodeLaunchResolution | null =
-    config.launcher !== undefined
-      ? resolveOpenCodeLaunch({ configured: config.launcher })
-      : config.executable !== undefined
-        ? null
-        : resolveOpenCodeLaunch();
+  const launch: OpenCodeLaunchResolution | null = preStart<OpenCodeLaunchResolution | null>(
+    () =>
+      config.launcher !== undefined
+        ? resolveOpenCodeLaunch({ configured: config.launcher })
+        : config.executable !== undefined
+          ? null
+          : resolveOpenCodeLaunch(),
+  );
 
   const resolvedSpec = launch !== null && launch.kind === "resolved" ? launch.spec : null;
   const command = resolvedSpec !== null ? resolvedSpec.command : (config.executable ?? "opencode");

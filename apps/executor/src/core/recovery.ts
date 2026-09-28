@@ -37,7 +37,12 @@ export type InFlightState =
   | "skipped_lease_lost"
   /** 上报失败（网络/服务端），已记录 */
   | "failed_to_report"
-  /** 编排阶段抛异常 */
+  /**
+   * 编排阶段抛异常，且**可证明**异常发生在任何进程启动之前因此无残留风险。
+   *
+   * 与下一条的区别就是「进程已确认不存在」与「进程状态未知」的区别，
+   * 这两种情况的处置不同，不能合并。
+   */
   | "failed_orchestration"
   /** 版本绑定四项不全，拒绝开工 */
   | "refused_binding_incomplete"
@@ -58,7 +63,20 @@ export type InFlightState =
    * 与 `reported` 分开记的理由：这两种情况下「下次启动该不该照常开工」
    * 的答案不同——有残留进程时必须先人工确认 worktree 已释放。
    */
-  | "halted_residual_process";
+  | "halted_residual_process"
+  /**
+   * 编排阶段抛异常，且**无法证明**该 attempt 的进程已退出（B10，A 端 B9 复验 §4）。
+   *
+   * 命名刻意与 `halted_residual_process` 区分：
+   * - `halted_residual_process` = **已确认**有杀不掉的进程；
+   * - `halted_process_unknown`  = **状态未知**，既没确认存在、也没确认不存在。
+   *
+   * 把未知写成「已确认残留」是**冒称**，会把排查引向错误方向；而把它当成
+   * 「已停止」（旧实现的 `failed_orchestration` + continue）则是 fail-open ——
+   * 异常可能发生在子进程启动之后，此时新任务会和去向不明的旧进程并行。
+   * 两者都不允许，所以它必须是一个独立状态。
+   */
+  | "halted_process_unknown";
 
 /** 本地持久化的在途任务记录（存于 .local/，忽略提交）。 */
 export interface InFlightRecord {

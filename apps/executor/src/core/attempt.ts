@@ -50,7 +50,7 @@ import type {
   OpenCodeAdapterResult,
   OpenCodeProcessRunner,
 } from "../adapters/opencode.js";
-import { runOpenCodeTask } from "../adapters/opencode.js";
+import { OpenCodePreStartError, runOpenCodeTask } from "../adapters/opencode.js";
 
 /* ------------------------------------------------------------------ *
  * 编排输入
@@ -157,6 +157,63 @@ export interface AttemptTrace {
   git_error: string | null;
 }
 
+/* ------------------------------------------------------------------ *
+ * 进程状态与编排异常（B10，A 端 B9 复验 §4）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 一次 attempt **异常退出**时，本机可证明的进程状态。
+ *
+ * A 端复验单要的是「四种状态」而不是一个布尔，理由很直接：
+ * **「异常」不等于「进程已停止」**。之前 `runAttempt` 抛异常时，
+ * 常驻入口只看到「抛了个错」，于是把「本机可能有进程还在跑」这件事
+ * 当成「没有进程」处理，继续领取下一个任务 —— 这就是被点名的 fail-open。
+ *
+ * - `not_started`：可证明异常发生在任何 agent / 测试进程启动**之前**；
+ * - `stopped`    ：可证明进程已退出（拿到过退出码）；
+ * - `residual`   ：已确认进程**没有**被终止（`kill_failed`）；
+ * - `unknown`    ：无法证明进程是否还在跑。
+ *
+ * `unknown` 既不等于 `stopped`，也不允许冒充 `residual` ——
+ * 它是「不知道」，而不知道在进程可能仍占用 worktree 的场景下同样不安全。
+ */
+export type AttemptProcessState = "not_started" | "stopped" | "residual" | "unknown";
+
+/**
+ * 编排异常（B10，A 端 B9 复验 §4）。
+ *
+ * 为什么要包一层而不是原样抛出：异常的**形态**里不携带「进程现在在哪」，
+ * 调用方无法据此判断能不能安全继续。包成这个类型后，`process_state` 是
+ * 强制字段 —— 想抛异常就必须先回答「进程状态是什么」，不允许留空由
+ * 调用方去猜（猜的结果过去就是「当成没有进程」）。
+ */
+export class AttemptOrchestrationError extends Error {
+  readonly process_state: AttemptProcessState;
+
+  constructor(message: string, process_state: AttemptProcessState, cause: unknown) {
+    super(message);
+    this.name = "AttemptOrchestrationError";
+    this.process_state = process_state;
+    // 保留原始异常：上层沿用原有的错误码分类（见 `errorCodeOf`），
+    // 不要把 `CoordinatorHttpError` 之类的既有分类信息丢掉。
+    this.cause = cause;
+  }
+}
+
+/** 进程状态的人话说明，供日志与上报备注复用（避免两处措辞不一致）。 */
+export function describeProcessState(state: AttemptProcessState): string {
+  switch (state) {
+    case "not_started":
+      return "异常发生在进程启动之前（无残留风险）";
+    case "stopped":
+      return "进程已确认退出";
+    case "residual":
+      return "进程**已确认未被终止**（kill_failed）";
+    case "unknown":
+      return "**无法证明**进程已退出（状态未知）";
+  }
+}
+
 export interface AttemptOutcome {
   report: ResultReport;
   trace: AttemptTrace;
@@ -203,6 +260,15 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     kill_failed: false,
     git_error: null,
   };
+
+  /**
+   * 本机进程状态记账（B10，A 端 B9 复验 §4）。
+   *
+   * 初始为 `not_started`：还没碰过任何子进程，异常一定安全。
+   * 之后每跨过一个「可能已有进程存在」的边界就更新一次，
+   * 保证**任何时刻抛出都能说出进程在哪**。
+   */
+  let processState: AttemptProcessState = "not_started";
 
   const { lease } = input;
   const worktreePath = join(input.worktree_root, lease.attempt_id);
@@ -261,6 +327,11 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
 
     /* --- 3. 跑 agent ------------------------------------------ */
     setPhase("running_agent");
+    // B10（A 端 B9 复验 §4）：从这一行起，本机**可能**出现一个 agent 进程。
+    // 若此后抛异常，而没拿到退出码，就无从证明它已结束 —— 先按「未知」记账；
+    // 正常返回后再按引擎给出的退出事实改写为 stopped / unknown。
+    // 刻意**不**在这里记 `not_started`：那会把「可能已在跑」说成「肯定没在跑」。
+    processState = "unknown";
     const agentResult: OpenCodeAdapterResult = await runOpenCodeTask(
       {
         prompt: input.prompt,
@@ -272,6 +343,10 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       deps.agent_config ?? {},
       deps.agent_runner as OpenCodeProcessRunner,
     );
+
+    // B10：**退出码才是证据**。拿到 → 进程确实结束了（stopped）；
+    // 拿不到（例如 SIGKILL 之后仍未退出）→ 只能是「未知」，不能算「已停止」。
+    processState = agentResult.exit_code !== null ? "stopped" : "unknown";
 
     /* --- 4. 核对写入范围 -------------------------------------- */
     setPhase("checking_diff");
@@ -306,6 +381,11 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       // B8（A 端 B7-1）：杀不掉的进程必须成为**显式信号**，
       // 而不是只留一句备注。常驻入口据此停机。
       trace.kill_failed = collected.kill_failed;
+      // B10（A 端 B9 复验 §4）：测试进程已确认杀不掉 → `residual`，这是
+      // 最坏的一种，不允许被后来的步骤回退成 `stopped`。
+      // 只在 kill_failed 时改写：agent 那次若本来就「未知」，
+      // 不能因为这次测试进程干净退出就被洗白。
+      if (collected.kill_failed) processState = "residual";
     }
 
     /* --- 6. 创建提交（B5，评审单 P0-2）------------------------- */
@@ -429,6 +509,24 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       changed_files: changedFiles,
       raw_test_output: rawTestOutput,
     };
+  } catch (error) {
+    // B10（A 端 B9 复验 §4）：异常**不再原样抛出**。
+    //
+    // 原实现把内部异常直接丢给常驻入口，而异常形态里没有「进程现在在哪」，
+    // 入口只能记一句 failed_orchestration 然后继续领任务 —— 那条路径在
+    // 子进程已启动时是 fail-open。
+    //
+    // 现在：`OpenCodePreStartError` 是**可证明**的「启动前失败」（进程还没
+    // 被创建），按 `not_started` 处理；其余一律沿用前面逐段记账的
+    // `processState`。**绝不在这里默认成 `stopped`** —— 拿不到证据就是 `unknown`。
+    const state: AttemptProcessState =
+      error instanceof OpenCodePreStartError ? "not_started" : processState;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new AttemptOrchestrationError(
+      `编排异常（${describeProcessState(state)}）：${detail}`,
+      state,
+      error,
+    );
   } finally {
     // 顺序：先停心跳与续租，再考虑清理（避免清理时仍在续租）
     heartbeat.markStopping();

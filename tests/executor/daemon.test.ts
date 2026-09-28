@@ -34,7 +34,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { Lease, ResultReport, TaskNode } from "@dac/protocol";
-import type { AttemptDeps, AttemptInput, AttemptOutcome, AttemptRunner } from "../../apps/executor/src/core/attempt.js";
+import type { AttemptDeps, AttemptInput, AttemptOutcome } from "../../apps/executor/src/core/attempt.js";
+import { AttemptOrchestrationError } from "../../apps/executor/src/core/attempt.js";
 import type { HeartbeatRequest, HeartbeatTransport } from "../../apps/executor/src/core/heartbeat.js";
 import type { LeaseClock, LeaseTransport, RenewOutcome } from "../../apps/executor/src/core/lease.js";
 import type { InFlightRecord, RecoveryTransport, TaskOwnership } from "../../apps/executor/src/core/recovery.js";
@@ -55,11 +56,12 @@ import {
   clearInFlightRecord,
   fileInFlightStore,
   findBindingProblem,
-  findResidualProcessRecord,
+  findHaltedProcessRecord,
   inFlightDir,
   inFlightRecordPath,
   isActiveInFlightRecord,
   isBlockedCode,
+  isHaltedProcessState,
   isSupportedAgentKind,
   listInFlightRecords,
   loadDaemonOptions,
@@ -67,7 +69,12 @@ import {
   resolveAgentKind,
   runDaemon,
 } from "../../apps/executor/src/daemon.js";
-import type { DaemonDeps, DaemonOptions, PushResult } from "../../apps/executor/src/daemon.js";
+import type {
+  AttemptRunner,
+  DaemonDeps,
+  DaemonOptions,
+  PushResult,
+} from "../../apps/executor/src/daemon.js";
 
 /* ------------------------------------------------------------------ *
  * 夹具
@@ -828,14 +835,22 @@ describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () =>
     expect(h.logs.some((line) => line.includes("残留进程"))).toBe(true);
   });
 
-  it("⑧ 残留标记不是活动租约（load_in_flight 看不到），但启动门禁能看到", () => {
+  it("⑧ 停机标记不是活动租约（load_in_flight 看不到），但启动门禁能看到", () => {
     const record = residualRecord("C:\\repo");
     // 这正是 B8 的盲点：按「活动租约」过滤会把它漏掉
     expect(isActiveInFlightRecord(record)).toBe(false);
-    expect(findResidualProcessRecord([record])?.attempt_id).toBe("TASK-0001-A1");
+    expect(findHaltedProcessRecord([record])?.attempt_id).toBe("TASK-0001-A1");
     // 正常记录不触发
-    expect(findResidualProcessRecord([makeInFlightRecord("C:\\repo", "TASK-0002-A1")])).toBeNull();
-    expect(findResidualProcessRecord([])).toBeNull();
+    expect(findHaltedProcessRecord([makeInFlightRecord("C:\\repo", "TASK-0002-A1")])).toBeNull();
+    expect(findHaltedProcessRecord([])).toBeNull();
+    // B10：判据是「已确认残留 **或** 状态未知」，两种都要拦
+    expect(isHaltedProcessState("halted_residual_process")).toBe(true);
+    expect(isHaltedProcessState("halted_process_unknown")).toBe(true);
+    // 其余状态不得被误拦（否则正常终态会让执行器永远起不来）
+    expect(isHaltedProcessState("in_flight")).toBe(false);
+    expect(isHaltedProcessState("reported")).toBe(false);
+    expect(isHaltedProcessState("failed_to_report")).toBe(false);
+    expect(isHaltedProcessState(undefined)).toBe(false);
   });
 
   it("⑨ 集成 fileInFlightStore：标记在 → 拒绝开工；显式清除后可正常开工", async () => {
@@ -881,6 +896,165 @@ describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () =>
     expect(report.stop_reason).toBe("idle_limit");
     expect(h.events).toContain("register");
     expect(h.events).toContain("acquire");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B10 § 编排异常后的进程状态（A 端 B9 复验 §4）
+ *
+ * 旧实现：runner 抛异常 → 记 `failed_orchestration` → `continue` 领下一个任务。
+ * 那是 fail-open —— 异常可能发生在子进程启动**之后**，进程去向未知，
+ * 却被当成「已停止」处理，于是新任务会和去向不明的旧进程并行。
+ *
+ * 现在按**可证明的进程状态**分流，四种状态各有确定性用例：
+ *   not_started / stopped → 无残留风险：记录后继续；
+ *   residual / unknown    → 停机 + 保留标记 + 重启门禁拦截。
+ * 另加一条反向锁：**非类型化异常必须按 unknown 处理** ——
+ * 拿不到状态声明时，不允许乐观默认为「已停止」。
+ * ------------------------------------------------------------------ */
+
+describe("B10 §B9复验 编排异常后的进程状态与 fail-closed 停机", () => {
+  type State = "not_started" | "stopped" | "residual" | "unknown";
+
+  /** 故障注入：模拟编排在「进程已启动之后」（或可证明的启动之前）抛异常。 */
+  const throwingRunner = (state: State, message = "故障注入"): AttemptRunner =>
+    async () => {
+      throw new AttemptOrchestrationError(`${message}（${state}）`, state, new Error("injected"));
+    };
+
+  /** 队列里塞两个任务：没有停机门时**一定**会去领第二个。 */
+  const twoLeased = [
+    { kind: "leased" as const, task: TASK, lease: LEASE },
+    { kind: "leased" as const, task: TASK, lease: LEASE },
+  ];
+
+  /* --- 不可证明的两种状态 → 必须停机 ------------------------- */
+
+  for (const [label, state, expectedStop, expectedState, keyword] of [
+    ["unknown", "unknown", "halt_process_unknown", "halted_process_unknown", "无法证明"],
+    ["residual", "residual", "halt_residual_process", "halted_residual_process", "已确认未被终止"],
+  ] as const) {
+    it(`① 编排异常且状态为 ${label} → 停机、不再领第二个任务、标记持久化`, async () => {
+      const h = makeHarness({
+        script: twoLeased,
+        attemptRunner: throwingRunner(state),
+      });
+      const report = await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
+
+      // attempt 视角：这次 attempt 确实没跑完
+      expect(report.attempts[0]!.result).toBe("failed_orchestration");
+      // 本机不安全 → 停机，且**只领过一次**
+      expect(report.stop_reason).toBe(expectedStop);
+      expect(h.acquireCalls()).toBe(1);
+      expect(h.saved.at(-1)?.state).toBe(expectedState);
+      // 未推送、未上报：没有 outcome，构造不出可信报告
+      expect(h.events).not.toContain("push");
+      expect(h.events).not.toContain("report");
+      // 状态措辞必须能分辨「已确认残留」与「未知」，否则会把排查引偏
+      expect(h.logs.some((line) => line.includes(keyword))).toBe(true);
+      // worktree 刻意不清理：清理可能被仍未退出的进程挡住
+      expect(h.logs.some((line) => line.includes("worktree 刻意不清理"))).toBe(true);
+    });
+  }
+
+  /* --- 可证明的两种状态 → 允许按安全结束处理 ------------------ */
+
+  for (const [label, state] of [
+    ["not_started（异常可证明发生在进程启动之前）", "not_started"],
+    ["stopped（进程已确认退出）", "stopped"],
+  ] as const) {
+    it(`② ${label} → 记录后继续领下一个任务（不误停）`, async () => {
+      const h = makeHarness({
+        script: twoLeased,
+        attemptRunner: throwingRunner(state),
+      });
+      const report = await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
+
+      // 两个任务都被处理（各自抛异常），第三次领取遇到空队列 → 正常退出
+      expect(h.acquireCalls()).toBe(3);
+      expect(report.attempts).toHaveLength(2);
+      expect(report.attempts.every((a) => a.result === "failed_orchestration")).toBe(true);
+      expect(report.stop_reason).toBe("idle_limit");
+      // 安全结束走的是既有的 failed_orchestration，**不得**写停机标记
+      expect(h.saved.at(-1)?.state).toBe("failed_orchestration");
+      expect(isHaltedProcessState(h.saved.at(-1)?.state)).toBe(false);
+    });
+  }
+
+  /* --- 反向锁：拿不到状态声明 → 一律按未知处置 ----------------- */
+
+  it("③ 非类型化异常（裸 Error）→ 按 unknown 处理，不乐观默认「已停止」", async () => {
+    const h = makeHarness({
+      script: twoLeased,
+      attemptRunner: async () => {
+        throw new Error("裸异常：抛错方没有回答「进程在哪」");
+      },
+    });
+    const report = await runDaemon(withLog(makeOptions({ max_idle_polls: 1 }), h.logs), h.deps);
+
+    expect(report.attempts[0]!.result).toBe("failed_orchestration");
+    expect(report.stop_reason).toBe("halt_process_unknown");
+    expect(h.acquireCalls()).toBe(1);
+    expect(h.saved.at(-1)?.state).toBe("halted_process_unknown");
+  });
+
+  /* --- 重启门禁：未知标记同样要拦 ----------------------------- */
+
+  it("④ 重启发现「状态未知」标记 → 同样拒绝开工（不注册、不领取）", async () => {
+    const unknownRecord: InFlightRecord = {
+      ...makeInFlightRecord("C:\\repo", "TASK-0001-A1"),
+      state: "halted_process_unknown",
+    };
+    const h = makeHarness({
+      script: [{ kind: "leased", task: TASK, lease: LEASE }],
+      inFlightRecords: [unknownRecord],
+    });
+    const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
+
+    expect(report.stop_reason).toBe("halt_process_unknown_on_startup");
+    expect(report.registered).toBe(false);
+    // 「拒绝开工」= 连注册都不做（注册是本次第一个云端写操作）
+    expect(h.events).not.toContain("register");
+    expect(h.acquireCalls()).toBe(0);
+    // 措辞要说「未知」，不能说成「已确认残留」
+    expect(h.logs.some((line) => line.includes("状态**未知**"))).toBe(true);
+    expect(h.logs.some((line) => line.includes("已确认") && line.includes("残留进程"))).toBe(false);
+  });
+
+  it("⑤ 集成 fileInFlightStore：未知标记在 → 拒绝开工；显式清除后可正常开工", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dac-unknown-"));
+    try {
+      const store = fileInFlightStore(dir);
+      store.save_in_flight?.({
+        ...makeInFlightRecord(dir, "TASK-0001-A1"),
+        state: "halted_process_unknown",
+      });
+
+      // ① 标记存在 → 拒绝开工
+      const blocked = makeHarness({ script: [{ kind: "empty" }] });
+      const first = await runDaemon(
+        withLog(makeOptions({ max_idle_polls: 1 }), blocked.logs),
+        { ...blocked.deps, ...store },
+      );
+      expect(first.stop_reason).toBe("halt_process_unknown_on_startup");
+      expect(blocked.events).not.toContain("acquire");
+      // 记录**原样保留**——门禁不是删除许可
+      expect(listInFlightRecords(dir)).toHaveLength(1);
+
+      // ② 人工显式清除这个标记（唯一被允许的解除方式）
+      expect(clearInFlightRecord(dir, "TASK-0001-A1").removed).toBe(true);
+
+      // ③ 清除后重启正常开工
+      const ok = makeHarness({ script: [{ kind: "empty" }] });
+      const second = await runDaemon(
+        withLog(makeOptions({ max_idle_polls: 1 }), ok.logs),
+        { ...ok.deps, ...store },
+      );
+      expect(second.stop_reason).toBe("idle_limit");
+      expect(ok.events).toContain("acquire");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -86,8 +86,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ResultReportSchema } from "@dac/protocol";
 import type { Lease, ResultReport, TaskNode, WriteScope } from "@dac/protocol";
 
-import { runAttempt } from "../../apps/executor/src/core/attempt.js";
-import type { AttemptDeps, AttemptRunner } from "../../apps/executor/src/core/attempt.js";
+import { AttemptOrchestrationError, runAttempt } from "../../apps/executor/src/core/attempt.js";
+import type { AttemptDeps, AttemptInput } from "../../apps/executor/src/core/attempt.js";
 import type { HeartbeatRequest, HeartbeatTransport } from "../../apps/executor/src/core/heartbeat.js";
 import type { LeaseClock, LeaseTransport, RenewOutcome } from "../../apps/executor/src/core/lease.js";
 import type { InFlightRecord, RecoveryTransport } from "../../apps/executor/src/core/recovery.js";
@@ -110,13 +110,15 @@ import type {
   ResultReporter,
 } from "../../apps/executor/src/transport/adapters.js";
 import {
+  clearInFlightRecord,
   fileInFlightStore,
   gitPushBranch,
   inFlightRecordPath,
+  listInFlightRecords,
   readRemoteBranchSha,
   runDaemon,
 } from "../../apps/executor/src/daemon.js";
-import type { DaemonDeps, DaemonOptions } from "../../apps/executor/src/daemon.js";
+import type { AttemptRunner, DaemonDeps, DaemonOptions } from "../../apps/executor/src/daemon.js";
 
 /* ------------------------------------------------------------------ *
  * 夹具
@@ -1191,5 +1193,164 @@ describe("B6 §8 连续两个 attempt 的在途记录互不覆盖", () => {
       expect(recB.state).toBe("reported");
     },
     180_000,
+  );
+});
+
+/* ================================================================== *
+ * B10 §4 编排异常后的进程状态与 fail-closed 停机（真实仓库）
+ *
+ * A 端复验要求（原文）：「新增故障注入测试：模拟 runner 在启动子进程后抛
+ * 异常，验证不领取第二个任务、不清理仍可能被占用的 worktree、在途记录
+ * 持久化，并且重启门禁在显式人工解除前拒绝开工；同时覆盖确定发生在启动前
+ * 的异常分支。」
+ *
+ * `daemon.test.ts` 用**注入的** `AttemptOrchestrationError` 覆盖了入口如何
+ * 分流；本组补两件它证明不了的事：
+ *   1. `runAttempt` 自己真的会算出正确状态（不是被测试替身喂进去的）；
+ *   2. 走完整链路时 worktree 与在途记录**真实落盘**成什么样。
+ *
+ * 故障注入点选在**进程边界**：假 agent 已被启动，但退出事实无从观察。
+ * 这正是 A 端所说「异常发生在子进程启动之后」的形态——旧实现会把它记成
+ * `failed_orchestration` 后继续领任务（fail-open）。
+ * ================================================================== */
+
+describe("B10 §4 编排异常后的进程状态与 fail-closed 停机（真实仓库）", () => {
+  /**
+   * 假 agent：进程**已被创建**，但句柄失效——退出码永远拿不到。
+   *
+   * 「状态未知」的真实来源：进程可能还在跑，也可能早退了，本机**没有证据**。
+   */
+  function noExitCodeAgent(): OpenCodeProcessRunner {
+    return {
+      start(): OpenCodeProcess {
+        return {
+          stdout: (async function* empty() {})(),
+          stderr: (async function* empty() {})(),
+          exit_code: Promise.reject(new Error("句柄失效：退出码不可得")),
+          kill: () => undefined,
+        };
+      },
+    };
+  }
+
+  function attemptInputFor(repo: RealRepo, model = "myapi/test-model"): AttemptInput {
+    return {
+      lease: makeLease(repo),
+      repo_root: repo.root,
+      worktree_root: join(repo.root, ...WORKTREE_ROOT_SEGMENTS),
+      prompt: "故障注入",
+      model,
+      write_scope: { allow: ["apps/demo/**"], deny: [] },
+      test_command: TEST_COMMAND,
+      heartbeat_interval_ms: 50,
+      commit_spec: { summary: "故障注入" },
+    };
+  }
+
+  it(
+    "进程已启动但拿不到退出码 → 类型化异常且状态是 unknown（既非 not_started 也非 stopped）",
+    async () => {
+      const repo = makeRealRepo();
+      const thrown = await runAttempt(
+        attemptInputFor(repo),
+        makeAttemptDeps(noExitCodeAgent()),
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(thrown).toBeInstanceOf(AttemptOrchestrationError);
+      const typed = thrown as AttemptOrchestrationError;
+      // 口径：进程**已经**启动过，绝不能说成「启动前的失败」
+      expect(typed.process_state).toBe("unknown");
+      expect(typed.message).toContain("无法证明");
+      expect(typed.message).not.toContain("启动之前");
+    },
+    60_000,
+  );
+
+  it(
+    "可证明的启动前失败（模型标识非法 → 进程从未创建）→ not_started，且 agent 一次都没启动",
+    async () => {
+      const repo = makeRealRepo();
+      const probe = { started: 0 };
+      const neverStarted: OpenCodeProcessRunner = {
+        start(): OpenCodeProcess {
+          probe.started += 1;
+          throw new Error("本用例不允许真的启动 agent");
+        },
+      };
+
+      const thrown = await runAttempt(
+        attemptInputFor(repo, "bad model"),
+        makeAttemptDeps(neverStarted),
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(thrown).toBeInstanceOf(AttemptOrchestrationError);
+      expect((thrown as AttemptOrchestrationError).process_state).toBe("not_started");
+      // 「可证明」的证据就是这个计数：start() 根本没被调用过
+      expect(probe.started).toBe(0);
+    },
+    60_000,
+  );
+
+  it(
+    "端到端：状态未知 → 只领一次、停机、标记落盘；重启被门禁拦住；显式清除后才能开工",
+    async () => {
+      const repo = makeRealRepo();
+      const task = makeTask({ allow: ["apps/demo/**"], deny: [] });
+      const store = fileInFlightStore(repo.root);
+
+      // 队列里放**两个**任务：没有停机门时一定会去领第二个
+      const first = makeRealHarness(
+        repo,
+        [
+          { kind: "leased", task, lease: makeLease(repo) },
+          { kind: "leased", task, lease: makeLease(repo) },
+        ],
+        {},
+        {},
+        noExitCodeAgent(),
+      );
+      const haltedRun = await runDaemon(first.options, first.deps);
+
+      // ① 停机，且只领过一次
+      expect(haltedRun.attempts).toHaveLength(1);
+      expect(haltedRun.attempts[0]!.result).toBe("failed_orchestration");
+      expect(haltedRun.stop_reason).toBe("halt_process_unknown");
+      expect(first.acquireCalls()).toBe(1);
+      // ② 未推送、未上报：没有 outcome，构造不出可信报告
+      expect(haltedRun.attempts[0]!.pushed).toBe(false);
+      expect(first.pushes).toHaveLength(0);
+      expect(first.reports).toHaveLength(0);
+      // ③ worktree **刻意保留**：它可能仍被去向不明的进程占着
+      const worktreePath = join(repo.root, ...WORKTREE_ROOT_SEGMENTS, "TASK-0001-A1");
+      expect(existsSync(worktreePath)).toBe(true);
+
+      // ④ 标记真实落盘，且状态名说的是「未知」而不是「已确认残留」
+      const records = listInFlightRecords(repo.root);
+      expect(records).toHaveLength(1);
+      expect(records[0]!.state).toBe("halted_process_unknown");
+
+      // ⑤ 重启：门禁在**注册之前**拦住（注册是本次第一个云端写操作）
+      const second = makeRealHarness(repo, [{ kind: "empty" }], {}, {}, noExitCodeAgent());
+      const restart = await runDaemon(second.options, { ...second.deps, ...store });
+      expect(restart.stop_reason).toBe("halt_process_unknown_on_startup");
+      expect(restart.registered).toBe(false);
+      expect(second.acquireCalls()).toBe(0);
+      // 记录**原样保留**——门禁不是删除许可
+      expect(listInFlightRecords(repo.root)).toHaveLength(1);
+
+      // ⑥ 只有显式人工解除，重启才能重新开工
+      expect(clearInFlightRecord(repo.root, "TASK-0001-A1").removed).toBe(true);
+      const third = makeRealHarness(repo, [{ kind: "empty" }], {}, {}, noExitCodeAgent());
+      const resumed = await runDaemon(third.options, { ...third.deps, ...store });
+      expect(resumed.stop_reason).toBe("idle_limit");
+      expect(third.acquireCalls()).toBe(1);
+    },
+    120_000,
   );
 });

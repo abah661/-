@@ -13,7 +13,11 @@
 import { describe, expect, it } from "vitest";
 import { ResultReportSchema } from "@dac/protocol";
 import type { Lease } from "@dac/protocol";
-import { runAttempt } from "../../apps/executor/src/core/attempt.js";
+import {
+  AttemptOrchestrationError,
+  describeProcessState,
+  runAttempt,
+} from "../../apps/executor/src/core/attempt.js";
 import type { AttemptInput } from "../../apps/executor/src/core/attempt.js";
 import type { LeaseTransport, RenewOutcome } from "../../apps/executor/src/core/lease.js";
 import type { HeartbeatRequest, HeartbeatTransport } from "../../apps/executor/src/core/heartbeat.js";
@@ -357,5 +361,67 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
       },
     });
     expect(report.error_code).toBe("TESTS_FAILED");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B10 § 编排异常后的进程状态分类（A 端 B9 复验 §4）
+ *
+ * A 端原话：「异常不能默认映射为『已停止』」「只有可证明异常发生在进程启动
+ * 之前，或已有可靠终止证据时，才允许按安全结束处理」。
+ *
+ * 因此 `runAttempt` 不再原样抛出内部异常，而是抛**带进程状态**的类型化异常，
+ * 由常驻入口据此决定「继续领任务」还是「停机并保留标记」。
+ * 本组锁定「抛出的类型」与「状态口径」两件事；各状态在入口处如何分流由
+ * `daemon.test.ts` 的故障注入用例覆盖，「进程已启动但拿不到退出码 → unknown」
+ * 这条真实路径由 `real-chain.test.ts` 用真实仓库覆盖（它必须真有 worktree
+ * 才能走到 agent 阶段，而本文件刻意不碰真实 Git 仓库）。
+ * ------------------------------------------------------------------ */
+
+describe("B10 § 编排异常的进程状态分类", () => {
+  it("四种状态的说明互不相同，且不把「未知」冒称为「已确认残留」", () => {
+    const texts = [
+      describeProcessState("not_started"),
+      describeProcessState("stopped"),
+      describeProcessState("residual"),
+      describeProcessState("unknown"),
+    ];
+
+    // 措辞一旦合并，排障就分不清「已确认有残留」和「不知道有没有残留」
+    expect(new Set(texts).size).toBe(4);
+    expect(describeProcessState("not_started")).toContain("启动之前");
+    expect(describeProcessState("stopped")).toContain("已确认");
+    expect(describeProcessState("residual")).toContain("已确认");
+    expect(describeProcessState("unknown")).toContain("无法证明");
+    // 「未知」不得冒称「已确认」
+    expect(describeProcessState("unknown")).not.toContain("已确认");
+  });
+
+  it("异常可证明发生在进程启动之前（worktree 都没建起来）→ 类型化异常 + not_started", async () => {
+    const probe = new OrderProbe();
+    const runner = new FakeAgentRunner(probe);
+
+    const thrown = await runAttempt(makeInput({ repo_root: "C:/definitely/not/a/repo" }), {
+      lease_transport: new RecordingLeaseTransport(probe),
+      heartbeat_transport: new RecordingHeartbeatTransport(),
+      agent_runner: runner,
+      clock: new FastClock(),
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    // 类型化异常：入口**无需猜测**就能分流（旧实现抛的是不带状态的裸异常）
+    expect(thrown).toBeInstanceOf(AttemptOrchestrationError);
+    const typed = thrown as AttemptOrchestrationError;
+    expect(typed.process_state).toBe("not_started");
+    expect(typed.message).toContain("进程启动之前");
+    // 原始异常留在 cause：错误码分类（errorCodeOf）仍要看原始异常
+    expect(typed.cause).toBeInstanceOf(Error);
+    expect((typed.cause as Error).message).toMatch(/不存在|worktree|无法/i);
+
+    // 确实一次都没有启动过 agent
+    expect(probe.events).not.toContain("agent");
+    expect(runner.lastCwd).toBeNull();
   });
 });

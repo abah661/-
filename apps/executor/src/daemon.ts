@@ -60,8 +60,14 @@ import { pathToFileURL } from "node:url";
 import type { Capability, ErrorCode, ExecutorRegistration, Lease, ResultStatus, TaskNode, WriteScope } from "@dac/protocol";
 import { ERROR_POLICY, blockedStatusFor } from "@dac/protocol";
 
-import { runAttempt } from "./core/attempt.js";
-import type { AttemptDeps, AttemptInput, AttemptOutcome, TestCommand } from "./core/attempt.js";
+import { AttemptOrchestrationError, describeProcessState, runAttempt } from "./core/attempt.js";
+import type {
+  AttemptDeps,
+  AttemptInput,
+  AttemptOutcome,
+  AttemptProcessState,
+  TestCommand,
+} from "./core/attempt.js";
 import type { OpenCodeProcessRunner } from "./adapters/opencode.js";
 import {
   describeLaunchResolution,
@@ -217,12 +223,13 @@ export interface DaemonDeps {
   /** 读取在途记录（重启恢复用）；返回 null 表示无在途 */
   load_in_flight?: () => InFlightRecord | null;
   /**
-   * 列出**全部**在途记录（含终态），供启动门禁检查残留进程标记（B9，A 端 B8 复验）。
+   * 列出**全部**在途记录（含终态），供启动门禁检查「进程情况是否已确认」
+   * （B9 §3.3，B10 §4 扩展到「状态未知」）。
    *
    * 不能复用 `load_in_flight`：那个只返回仍属活动租约的记录，而
-   * `halted_residual_process` **恰恰不是活动租约**——它描述的是一次已经结束、
-   * 但本机可能仍有残留进程的 attempt。只按「活动租约」过滤，正是 B8 漏掉
-   * 重启门禁的原因。
+   * `halted_residual_process` / `halted_process_unknown` **恰恰不是活动租约**
+   * ——它们描述的是一次已经结束、但本机进程去向尚未确认的 attempt。
+   * 只按「活动租约」过滤，正是 B8 漏掉重启门禁的原因。
    */
   load_in_flight_records?: () => readonly InFlightRecord[];
   /**
@@ -246,6 +253,13 @@ export interface DaemonAttemptRecord {
     | "skipped_lease_lost"
     | "skipped_aborted"
     | "failed_to_report"
+    /**
+     * 编排抛异常（B10，A 端 B9 复验 §4）。
+     *
+     * 与 `failed_to_report` 分开记：那个是「跑完了但上报不出去」，
+     * 这个是「压根没跑完」。混在一个值里会让排障看不出异常发生在哪一段。
+     */
+    | "failed_orchestration"
     | "refused_binding_incomplete";
   report_status: ResultStatus | null;
   pushed: boolean;
@@ -279,6 +293,14 @@ export type DaemonStopReason =
    */
   | "halt_residual_process"
   /**
+   * 编排异常，且**无法证明**该 attempt 的进程已退出（B10，A 端 B9 复验 §4）。
+   *
+   * 与 `halt_residual_process` 的区别是证据强度，不是严重程度：
+   * 那条是「已确认有杀不掉的进程」，这条是「不知道进程还在不在」。
+   * 两者都停机，但日志与在途记录必须能分辨，否则会把排查引向错误方向。
+   */
+  | "halt_process_unknown"
+  /**
    * 启动时发现**上一次运行留下的**残留进程标记（B9，A 端 B8 复验 §3.3）。
    *
    * B8 会把 `halted_residual_process` 写进在途记录，却没有在启动时消费它：
@@ -286,7 +308,14 @@ export type DaemonStopReason =
    * 现在启动即拒绝开工，直到人工确认残留已清理、并**显式**清除该标记
    * （`clearInFlightRecord`，常驻入口不会自动调用）。
    */
-  | "halt_residual_process_on_startup";
+  | "halt_residual_process_on_startup"
+  /**
+   * 启动时发现**上一次运行留下的**「进程状态未知」标记（B10，A 端 B9 复验 §4）。
+   *
+   * 与上一条同理，只是证据不同：那次异常没能证明进程已退出。既然无法排除
+   * 残留，重启同样必须拒绝开工——「不知道」不能当成「可以开工」。
+   */
+  | "halt_process_unknown_on_startup";
 
 export interface DaemonReport {
   stop_reason: DaemonStopReason;
@@ -395,19 +424,31 @@ export function isActiveInFlightRecord(record: InFlightRecord): boolean {
 }
 
 /**
- * 找出「有残留进程未清理」的终态记录（B9，A 端 B8 复验 §3.3）。
+ * 该在途状态是否意味着「本机进程情况尚未确认，不得开工」（B10，A 端 B9 复验 §4）。
  *
- * 这些记录的含义是：结果已经如实上报，但测试/agent 进程**没被杀掉**。
- * 它们**不是**活动租约（所以 `load_in_flight` 看不见它们），却必须让重启停下——
- * 残留进程可能仍占着 worktree 与文件锁，继续开工只会制造无法解释的失败。
+ * 两种状态都要拦住：
+ * - `halted_residual_process`：**已确认**有杀不掉的进程；
+ * - `halted_process_unknown` ：**无法证明**该 attempt 的进程已退出。
  *
- * 返回第一条即可：只要存在一条未清理的残留标记，本机就处在「需要人工确认」
- * 的状态，多一条不改变结论。
+ * 它们都**不是**活动租约（所以 `load_in_flight` 看不见它们），却都必须让
+ * 当前进程停机、让重启拒绝开工——「不知道」在可能仍有进程占用 worktree 的
+ * 场景下同样不安全。
  */
-export function findResidualProcessRecord(
+export function isHaltedProcessState(state: InFlightState | undefined): boolean {
+  return state === "halted_residual_process" || state === "halted_process_unknown";
+}
+
+/**
+ * 找出「进程情况尚未确认」的记录，供启动门禁使用（B9 §3.3 / B10 §4）。
+ *
+ * 返回第一条即可：只要存在一条这样的标记，本机就处在「需要人工确认」的
+ * 状态，多一条不改变结论。调用方据 `record.state` **区分**「已确认残留」与
+ * 「状态未知」——这两者的日志措辞与停机原因都不该相同，否则会把排查引偏。
+ */
+export function findHaltedProcessRecord(
   records: readonly InFlightRecord[],
 ): InFlightRecord | null {
-  return records.find((record) => record.state === "halted_residual_process") ?? null;
+  return records.find((record) => isHaltedProcessState(record.state)) ?? null;
 }
 
 /**
@@ -648,6 +689,9 @@ function httpStatusOf(error: unknown): number | null {
 
 function errorCodeOf(error: unknown): ErrorCode {
   if (error instanceof CoordinatorHttpError) return error.code;
+  // B10：编排异常是包了一层再抛的，错误码分类要看**原始**异常，
+  // 否则 `CoordinatorHttpError` 携带的 code 会被 `INTERNAL_ERROR` 盖掉。
+  if (error instanceof AttemptOrchestrationError) return errorCodeOf(error.cause);
   return "INTERNAL_ERROR";
 }
 
@@ -775,19 +819,30 @@ export async function runDaemon(
   report.health_ok = true;
   log(`[health] OK（${options.config.base_url}）`);
 
-  /* --- 2.5 残留进程门禁（B9，A 端 B8 复验 §3.3）--------------- */
+  /* --- 2.5 残留进程门禁（B9 §3.3 / B10 §4）------------------- */
   // 刻意放在**注册之前**：注册是本次运行的第一个云端写操作，
   // 「拒绝开工」就必须在它之前拦住，不能先注册再后悔。
   // 也不放在健康检查之前：health 是只读的，留着它让排查多一条有意义的线索。
-  const residual = findResidualProcessRecord(deps.load_in_flight_records?.() ?? []);
-  if (residual) {
+  //
+  // B10：门禁从「只认已确认残留」扩展到「已确认残留 **或** 状态未知」。
+  // 只拦前者的漏洞是：编排异常留下的 `halted_process_unknown` 会让重启照常开工，
+  // 而那次异常根本没证明过进程已退出。
+  const halted = findHaltedProcessRecord(deps.load_in_flight_records?.() ?? []);
+  if (halted) {
+    const residualConfirmed = halted.state === "halted_residual_process";
     log(
-      `[halt] 上次运行留下未清理的残留进程标记（attempt=${residual.attempt_id}）：` +
-        "拒绝开工——可能有杀不掉的进程仍占用 worktree 与文件锁。" +
+      `[halt] 上次运行留下未解除的停机标记（attempt=${halted.attempt_id}，` +
+        `state=${halted.state}）：${
+          residualConfirmed
+            ? "**已确认**存在杀不掉的残留进程"
+            : "进程状态**未知**（上次异常没能证明进程已退出）"
+        }——拒绝开工。可能有进程仍占用 worktree 与文件锁。` +
         "请人工确认残留进程已清理（必要时重启本机）后，" +
         "用 clearInFlightRecord 显式清除该标记，再重新启动",
     );
-    report.stop_reason = "halt_residual_process_on_startup";
+    report.stop_reason = residualConfirmed
+      ? "halt_residual_process_on_startup"
+      : "halt_process_unknown_on_startup";
     return report;
   }
 
@@ -1012,16 +1067,49 @@ export async function runDaemon(
           : {}),
       });
     } catch (error) {
-      log(`[attempt] 编排异常（${errorCodeOf(error)}）：记录并继续`);
+      // ---- B10（A 端 B9 复验 §4）：异常不能一律当成「安全结束」------
+      //
+      // 旧实现记录 `failed_orchestration` 后直接 `continue`，于是**异常状态未知
+      // 却继续领取任务**（fail-open）：异常可能发生在子进程启动之后，新任务会
+      // 和去向不明的旧进程并行，争抢同一个 worktree 与文件锁。
+      //
+      // 现在按可证明的进程状态分流：
+      //   not_started / stopped → 无残留风险，记 `failed_orchestration` 后继续；
+      //   residual / unknown    → 保留停机标记、当前进程停机、重启门禁也拦。
+      //
+      // 非 `AttemptOrchestrationError` 的异常一律按 `unknown` 处理（fail-closed）：
+      // 拿不到状态声明，就说明抛错方**没有**回答「进程在哪」，此时乐观默认
+      // 成「已停止」正是 A 点名的那个错误。
+      const processState: AttemptProcessState =
+        error instanceof AttemptOrchestrationError ? error.process_state : "unknown";
+      const residualConfirmed = processState === "residual";
+      const unsafe = residualConfirmed || processState === "unknown";
+      const stateText = describeProcessState(processState);
+
       attemptRecords.push({
         task_id: task.task_id,
         attempt_id: lease.attempt_id,
         lease_epoch: lease.lease_epoch,
-        result: "failed_to_report",
+        result: "failed_orchestration",
         report_status: null,
         pushed: false,
         error_code: errorCodeOf(error),
       });
+
+      if (unsafe) {
+        const haltState = residualConfirmed ? "halted_residual_process" : "halted_process_unknown";
+        markInFlight(flightRecord, haltState);
+        log(
+          `[halt] 编排异常（${stateText}）：保留停机标记 ${haltState} 并停止领取新任务。` +
+            "worktree 刻意不清理——清理动作可能被仍未退出的进程挡住，" +
+            "而「清理失败」会把「需要人工处理」伪装成一次普通告警。" +
+            "请人工确认进程已清理后，用 clearInFlightRecord 显式清除该标记再启动",
+        );
+        report.stop_reason = residualConfirmed ? "halt_residual_process" : "halt_process_unknown";
+        break;
+      }
+
+      log(`[attempt] 编排异常（${stateText}）：记录并继续`);
       markInFlight(flightRecord, "failed_orchestration");
       continue;
     }

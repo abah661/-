@@ -585,6 +585,41 @@ async function collect(stream: AsyncIterable<Uint8Array | string>): Promise<stri
 }
 
 /**
+ * `Promise.race` 的**定时器安全**版本：兜底定时器一定会被清理（B14）。
+ *
+ * 为什么需要它（实测出来的故障）：原写法是
+ * ```ts
+ * await Promise.race([exitedPromise, spawnFailure,
+ *   new Promise<void>((resolve) => setTimeout(resolve, timeout + KILL_GRACE_MS))]);
+ * clearTimeout(killTimer);   // ← 清的却是**另一个**定时器
+ * ```
+ * 那个兜底定时器从此没有任何人清理。`timeout` 默认 1_800_000 ms（30 分钟），
+ * 于是**一次正常完成的 agent 调用**也会在事件循环里留下一个 30 分钟的
+ * **ref 定时器**：常驻入口打印完总结、所有产出都已落盘之后，进程仍然不退出
+ * ——现场实测存活 >14 分钟且 CPU 为 0，最后被人工结束，因此**从未给出退出码**
+ * （A 端 P3 首轮复验 §3）。
+ *
+ * 这个坑在 `core/process.ts` 的 `settledWithin` 里已经写明并防住
+ * （「否则一个已经完成的调用仍会留下长达 timeout_ms 的悬挂定时器，把进程的
+ * 退出时间拖满」），适配器这一处漏了。统一走本函数，避免第 N 次重犯。
+ *
+ * 语义与 `Promise.race` 完全一致：任一 promise 落定即返回（含拒绝）。
+ */
+async function raceWithTimeout(promises: readonly Promise<unknown>[], ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      ...promises,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
  * **启动前阶段**的失败（B10，A 端 B9 复验 §4）。
  *
  * 「启动前」在这里有严格含义：`runner.start()` **还没有被调用**，
@@ -764,11 +799,11 @@ export async function runOpenCodeTask(
     else input.signal.addEventListener("abort", onAbort, { once: true });
   }
 
-  await Promise.race([
-    exitedPromise,
-    spawnFailure,
-    new Promise<void>((resolve) => setTimeout(resolve, timeout + KILL_GRACE_MS)),
-  ]);
+  // B14：这里的兜底等待**必须**走 `raceWithTimeout`。
+  // 它此前是无保护的 `setTimeout(timeout + KILL_GRACE_MS)`（默认 30 分钟），
+  // 且从未被清理 —— 一次正常完成的调用也会把进程钉在事件循环里，
+  // 常驻入口因此永远拿不到退出码（见 `raceWithTimeout` 的说明）。
+  await raceWithTimeout([exitedPromise, spawnFailure], timeout + KILL_GRACE_MS);
   clearTimeout(killTimer);
   input.signal?.removeEventListener("abort", onAbort);
 
@@ -791,10 +826,8 @@ export async function runOpenCodeTask(
     // 白白让执行器停在人工门禁上。窗口是有限的，不能为等一个不响应的进程
     // 而无界阻塞。
     if (handle.closed !== undefined) {
-      await Promise.race([
-        handle.closed,
-        new Promise<void>((resolve) => setTimeout(resolve, POST_KILL_GRACE_MS)),
-      ]);
+      // B14：同上 —— 即使这个窗口只有 2 秒，也不能留一个没人清的定时器。
+      await raceWithTimeout([handle.closed], POST_KILL_GRACE_MS);
     }
   }
 

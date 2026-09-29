@@ -231,10 +231,23 @@ tsc -p .local/tsconfig.tests.json      → 13 项错误（一次性本地补查�
 ## 六、补录（提交后回填）
 
 ```text
-代码提交 SHA：
-npm run check 完整计数：
-CI：
+代码提交 SHA：2344ddce6b5f620b7126ce75ca70c8be0603e816
+  父提交：    090b6268a1dfdcc3c6fa27e6a6faa24cc9c07e47（B11 顶端）
+  规模：      12 files changed, 2131 insertions(+), 104 deletions(-)
+
+npm run check（干净环境）完整计数：
+  Test Files  22 passed (22)
+  Tests       567 passed | 1 skipped (568)
+  Duration    221.46s
+  退出码      0
+
+npm run check（父 shell 带代理变量）：退出码 1，唯一失败见 §4.4（假失败，非本分支回归）
 ```
+
+**顶端说明**：本文件（`docs/handoff/B-to-A-B12-complete.md`）的本次修改是
+**该代码提交之后的一次纯文档补录提交**，不含代码改动；分支顶端以
+转发消息中给出的 SHA 为准。若你需要一个「文档与代码同 SHA」的归档，
+请用 §八 的 ZIP（其顶层目录名即该提交的短 SHA）。
 
 ---
 

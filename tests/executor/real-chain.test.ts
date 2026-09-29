@@ -127,6 +127,9 @@ import type { AttemptRunner, DaemonDeps, DaemonOptions } from "../../apps/execut
 const TOKEN = "real-chain-secret-token";
 const WORKTREE_ROOT_SEGMENTS = [".local", "worktrees"];
 
+/** 平台门控用（B15）：真实进程用例里，依赖 Windows 进程语义的那一部分只在 Windows 跑。 */
+const IS_WINDOWS = process.platform === "win32";
+
 /** 产出的测试输出。必须是 `evidence.ts` 能解析的 vitest 形状。 */
 const TEST_OUTPUT = "Tests  4 passed (4)";
 
@@ -1520,6 +1523,31 @@ describe("B11 §B10复验 正常返回路径的进程状态（真实子进程）
  *   1. 父关闭、后代仍活 → **不得**判 `stopped`，必须 `residual`，
  *      且 attempt 必须**短路**后续 worktree 操作（不跑测试、不提交）；
  *   2. 父关闭、后代也确实不在 → 仍照旧判 `stopped`（不误停）。
+ *
+ * ## B15：这些真实进程用例的**平台边界**（A 端 B13/B14 复核裁定 方案甲）
+ *
+ * 「父关闭、**分离**后代仍活」这个形状**只在 Windows 上可观测**，原因是两侧
+ * 判定树存活的手段不同（见 `core/proc-tree.ts`）：
+ *
+ * - Windows：按 `ParentProcessId` 递归枚举。父进程退出后该字段被**原样保留**，
+ *   所以分离后代照样被枚举到 → `residual`。
+ * - POSIX：`process.kill(-pgid, 0)` 只看根进程所在的**进程组**。而后代一旦
+ *   `detached: true`（POSIX 上就是 `setsid()`）就**另立进程组**，组探测看不见它
+ *   → 会被判成 `stopped`。
+ *
+ * 这是 `core/proc-tree.ts` 的模块注释里早已写明的**已知边界**，`setsid()` 逃逸
+ * 需要 cgroup / Job Object 级别的机制，**本轮没有修**，也**不允许**把它说成修好了。
+ * 因此：
+ *
+ * - 依赖 Windows 进程语义的分离后代用例 → `it.runIf(IS_WINDOWS)`（断言一字未改，
+ *   在 Windows 上照样必须通过）；
+ * - 普通**同进程组**后代（组探测可见的那一类）→ POSIX 侧的真实进程覆盖**保留**，
+ *   由下方 `it.runIf(!IS_WINDOWS)` 的用例承担；
+ * - 「父关闭且没有后代 → `stopped`」的对照组两个平台都跑，不受影响。
+ *
+ * 当前项目的执行器范围是 **Windows**；若将来要把 POSIX 作为正式目标，必须另立
+ * 工作项评估运行期采样 / cgroup 等可验证的进程树控制方案，不能拿本次门控充当
+ * POSIX 安全验收。
  * ================================================================== */
 
 describe("B12 §B11复验 P1 进程树：父进程关闭但后代仍存活（真实进程）", () => {
@@ -1533,20 +1561,24 @@ describe("B12 §B11复验 P1 进程树：父进程关闭但后代仍存活（真
   ];
 
   /**
-   * 父进程：拉起一个**分离的长驻后代**（`detached` + `stdio: 'ignore'`），
-   * 记下后代的 pid，然后**立刻正常退出**。
+   * 父进程：拉起一个长驻后代（`stdio: 'ignore'`），记下后代的 pid，
+   * 然后**立刻正常退出**。
    *
-   * `detached: true` 不是可选项，而是这个场景的**定义**（A 端复验 §三 P1 的
-   * 原文也是「一个**分离**、stdio 为 ignore 的长驻后代」）。本机实测：
-   * Windows 上不分离的子进程与父进程**共用同一个控制台**，父进程一退出控制台
-   * 关闭，子进程会被一并终止 —— 于是「父关闭、后代仍活」这个前提根本不成立，
-   * 用例会退化成一句空断言（探针如实答 `gone`，被正确判成 `stopped`）。
+   * `detached` 决定这条用例在哪个平台成立（B15，见本文件 §10 的平台边界）：
    *
-   * 后代**不**继承父进程的 stdio，父进程因此可以干净地关闭；它的
-   * `ParentProcessId` 在 Windows 上仍原样保留为父进程的 pid —— 这正是
-   * 「父进程关了、后代还活着」的真实形状。
+   * - `true`：后代 `setsid()` **另立进程组**，**只在 Windows 可观测** ——
+   *   Windows 按 `ParentProcessId` 枚举，父进程退出后该字段原样保留，所以
+   *   看得见它；POSIX 的组探测只看根所在的进程组，逃逸者看不见。
+   *   本机实测：Windows 上**不**分离的子进程与父进程共用同一个控制台，父进程
+   *   一退出控制台关闭、子进程被一并终止 —— 于是「父关闭、后代仍活」这个前提
+   *   根本不成立，用例会退化成一句空断言（探针如实答 `gone`，被正确判成
+   *   `stopped`）。所以这个形状**必须** `detached`，也只能在 Windows 上断言。
+   * - `false`：后代留在父进程的**同一个进程组**里，POSIX 的组探测可见 ——
+   *   这是 POSIX 侧保留的真实进程覆盖。
+   *
+   * 后代**不**继承父进程的 stdio，父进程因此可以干净地关闭。
    */
-  function makeTreeAgentScript(pidFile: string): string {
+  function makeTreeAgentScript(pidFile: string, detached: boolean): string {
     const dir = track(mkdtempSync(join(tmpdir(), "dac-b12-tree-")));
     const script = join(dir, "tree-agent.js");
     writeFileSync(
@@ -1555,7 +1587,7 @@ describe("B12 §B11复验 P1 进程树：父进程关闭但后代仍存活（真
         "const { spawn } = require('node:child_process');",
         "const fs = require('node:fs');",
         "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)']," +
-          " { stdio: 'ignore', detached: true, windowsHide: true });",
+          ` { stdio: 'ignore', detached: ${detached ? "true" : "false"}, windowsHide: true });`,
         "fs.writeFileSync(" + JSON.stringify(pidFile) + ", String(child.pid), 'utf8');",
         ...EVENT_LINES,
         "process.exit(0);",
@@ -1576,9 +1608,17 @@ describe("B12 §B11复验 P1 进程树：父进程关闭但后代仍存活（真
 
   const alive = (pid: number): boolean => probeProcessAlive(pid) === "alive";
 
-  it(
-    "父进程正常关闭、后代仍存活 → residual（不是 stopped）；attempt 短路、worktree 保留",
-    async () => {
+  /**
+   * 场景主体：父进程（agent）正常关闭，但它拉起的后代仍存活。
+   *
+   * Windows 与 POSIX 共用这**同一份断言**（不允许任何一侧被放宽）；函数体就是
+   * B12 用例的原文，只是把「后代怎么造」抽成了参数 —— 两者唯一的差别是：
+   * Windows 必须 `detached`（同控制台的子进程会被父进程的退出一并带走），
+   * POSIX 必须同进程组（组探测才看得见）。见本文件 §10 说明。
+   */
+  async function expectResidualWithLiveDescendant(
+    buildAgentScript: (pidFile: string) => string,
+  ): Promise<void> {
       const repo = makeRealRepo();
       const task = makeTask({ allow: ["apps/demo/**"], deny: [] });
       const store = fileInFlightStore(repo.root);
@@ -1597,7 +1637,7 @@ describe("B12 §B11复验 P1 进程树：父进程关闭但后代仍存活（真
           // agent 刻意**不写任何文件**：这样「没有提交」不可能被归因于
           // 「越界」或「测试失败」——只可能来自进程状态短路。
           {},
-          { agent_launcher: launchWith(makeTreeAgentScript(pidFile)), max_idle_polls: 1 },
+          { agent_launcher: launchWith(buildAgentScript(pidFile)), max_idle_polls: 1 },
           // 用**真实**进程启动器：默认 runner 才带整棵树的探测通道
           null,
         );
@@ -1647,7 +1687,20 @@ describe("B12 §B11复验 P1 进程树：父进程关闭但后代仍存活（真
         }
         expect(alive(descendantPid)).toBe(false);
       }
-    },
+  }
+
+  /* 依赖 Windows 进程语义（`ParentProcessId` 枚举看得见分离后代）→ 只在 Windows 跑。
+     断言与重构前**逐字一致**，没有删除也没有放宽。 */
+  it.runIf(IS_WINDOWS)(
+    "父进程正常关闭、**分离**后代仍存活 → residual（不是 stopped）；attempt 短路、worktree 保留",
+    () => expectResidualWithLiveDescendant((pidFile) => makeTreeAgentScript(pidFile, true)),
+    120_000,
+  );
+
+  /* POSIX 侧保留的真实进程覆盖：后代在**同一个进程组**里，组探测可见。 */
+  it.runIf(!IS_WINDOWS)(
+    "POSIX：父进程正常关闭、**同进程组**后代仍存活 → residual（保留的 POSIX 覆盖）",
+    () => expectResidualWithLiveDescendant((pidFile) => makeTreeAgentScript(pidFile, false)),
     120_000,
   );
 

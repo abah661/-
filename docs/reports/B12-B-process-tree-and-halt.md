@@ -216,3 +216,36 @@ expect(a1.evidence.output_sha256).toBe(a2.evidence.output_sha256);
 
 **根配置未被本分支修改**：`tsconfig.json`、`package.json`、
 `.github/workflows/**`、`packages/protocol/**`、`apps/coordinator/**` 一律未动。
+
+---
+
+## 7. B15 补记：本模块的平台边界与测试口径（A 端 B13/B14 复核裁定 方案甲）
+
+### 7.1 事实
+
+§3.1 已写明「`detached` 是 Windows 上后代存活的前提」。**反向也成立**：
+在 POSIX 上，`detached: true` 就是 `setsid()`，后代**另立进程组**，而本模块的
+POSIX 分支只做组探测 `process.kill(-pgid, 0)` —— 逃出组的后代因此**看不见**，
+会被判成 `stopped`。这条边界在本文件 §「已知边界」里原本就有记录。
+
+B12 的 `real-chain.test.ts` §10 第一条用例却在**所有平台**无条件断言
+「父关闭 + 分离后代仍活 → `residual`」。它在 Windows 上成立，在 POSIX 上
+**结构性不成立**，于是 CI 的 ubuntu job 自 B12 起一直红（windows job 绿）。
+
+### 7.2 处置（B15，只动测试与文档，不动判定逻辑）
+
+| 项 | 处置 |
+| --- | --- |
+| 依赖 Windows 进程语义的分离后代用例 | `it.runIf(IS_WINDOWS)` 限定在 Windows；**断言原文一字未改**（函数体整体抽成 `expectResidualWithLiveDescendant`，两侧共用） |
+| POSIX 对**同一进程组**后代的真实覆盖 | **保留并显式化**：新增 `it.runIf(!IS_WINDOWS)` 用例，后代不加 `detached`，组探测可见 → 仍必须判 `residual` |
+| 对照组（父关闭、无后代 → `stopped`） | 两平台照跑，不受影响 |
+| 本模块判定逻辑 | **未改**（`probePosixTree` / `determineProcessState` 原样） |
+
+### 7.3 明确不声称的事
+
+- 这**不是**修复了 POSIX 的 `setsid()` 逃逸问题：逃逸后代在 POSIX 上**依然
+  不可观测**，行为与本补记之前完全一样。
+- 因此该门控**不能**当作 POSIX 的安全验收。POSIX 要成为正式执行器目标，必须
+  另立工作项评估运行期采样后代 pid / cgroup / Job Object 等可验证方案。
+- 当前执行器范围是 **Windows**，Windows 上对「父退出、分离后代仍存活」的强
+  断言**保持不变**，没有放宽。

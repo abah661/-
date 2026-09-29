@@ -35,7 +35,22 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import type { ErrorCode } from "@dac/protocol";
 import { scrubbedChildEnv } from "../core/child-env.js";
+import { systemTreeKiller } from "../core/process.js";
+import type { TreeKiller } from "../core/process.js";
+import {
+  determineProcessState,
+  probeProcessAlive,
+  systemTreeProbe,
+  treeCreationWindow,
+} from "../core/proc-tree.js";
+import type { ControlledProcessState, ProcessLiveness, TreeProbe } from "../core/proc-tree.js";
 import { describeLaunchResolution, resolveOpenCodeLaunch } from "./opencode-launcher.js";
+
+// B12：进程存活与状态判定的实现搬到 `core/proc-tree.ts`（测试进程也要用同一套）。
+// 这里**原样再导出**，既有调用方与测试的导入路径不变。
+export { determineProcessState, probeProcessAlive };
+export type { ProcessLiveness };
+
 import type {
   OpenCodeLaunchConfig,
   OpenCodeLaunchResolution,
@@ -107,7 +122,17 @@ export interface OpenCodeProcess {
   stdout: AsyncIterable<Uint8Array | string>;
   stderr: AsyncIterable<Uint8Array | string>;
   exit_code: Promise<number | null>;
-  kill(signal?: NodeJS.Signals): void;
+  /**
+   * 终止进程。
+   *
+   * B12：**必须作用于整棵受控进程树**，而不是只向直接子进程发信号。
+   * 「父进程关了、它拉起的后代还活着」正是 A 端 B11 复验 P1 点名的缺口，
+   * 只杀父进程等于把后代变成孤儿继续写 worktree。
+   *
+   * 返回 `void | Promise<void>`：POSIX 的组信号是同步的，而 Windows 的
+   * 树杀要走 `taskkill`（异步）。调用方一律 `await` 结果，两种实现都接受。
+   */
+  kill(signal?: NodeJS.Signals): void | Promise<void>;
   /**
    * 进程**启动失败**的错误（例如可执行文件不在 PATH 上的 `ENOENT`）。
    * 正常启动时为 `null`，未提供该字段时视为「不会启动失败」。
@@ -143,6 +168,18 @@ export interface OpenCodeProcess {
    * 缺省时视为无法探测（等价于 `unknown`）。
    */
   probe_alive?: () => ProcessLiveness;
+  /**
+   * 主动探测**整棵受控进程树**是否仍有存活成员（B12，A 端 B11 复验 P1）。
+   *
+   * 为什么单独一条通道：`closed` 只证明**直接子进程**关闭。agent 若拉起了
+   * 分离的长驻后代，父进程的 close 与「现场已干净」之间还差一整棵树
+   * —— A 端就是用这个场景复现出 B11 的 `stopped` 误判。
+   *
+   * 判定时优先使用本通道；只有它在场时，「观察到关闭」才可能被判为
+   * `stopped`（且还必须树也 `gone`）。缺省时退化为直接子进程语义，
+   * 而出厂 runner 永远提供本通道。
+   */
+  probe_tree_alive?: () => Promise<ProcessLiveness>;
 }
 
 export interface OpenCodeProcessRunner {
@@ -156,12 +193,26 @@ export interface OpenCodeProcessRunner {
  * （B5 真实链路测试需要真实 spawn 一个不存在的路径，而不是模拟）。
  */
 export class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
+  private readonly killer: TreeKiller;
+  private readonly treeProbe: TreeProbe;
+
+  constructor(options: { killer?: TreeKiller; tree_probe?: TreeProbe } = {}) {
+    this.killer = options.killer ?? systemTreeKiller;
+    this.treeProbe = options.tree_probe ?? systemTreeProbe;
+  }
+
   start(executable: string, args: readonly string[], cwd: string): OpenCodeProcess {
     const child: ChildProcess = spawn(executable, [...args], {
       cwd,
       // 参数数组隔离的前提：不经 shell
       shell: false,
       windowsHide: true,
+      // B12（A 端 B11 复验 P1）：POSIX 上让 agent 进入**独立进程组**。
+      // 只有这样 `kill(-pgid)` 才覆盖它拉起的后代，存活探测也才能观察到
+      // 整棵树；否则「杀父进程」会让后代变成孤儿继续占用 worktree，
+      // 而 close 事件还会让执行器以为现场已经干净。
+      // Windows 没有进程组语义，改走 taskkill /T + 后代枚举（见 core/proc-tree.ts）。
+      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
       // B8（A 端 B7-3）：agent 进程同样**不得**继承协调器凭据。
       // 原实现不传 env，等于把 COORDINATOR_API_TOKEN 交给 agent 与它
@@ -178,10 +229,16 @@ export class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
     // B11（A 端 B10 复验 §a）：**关闭事件**与**退出码**分别记账。
     // 被信号终止的进程没有数字退出码，但关闭事件确实发生过；
     // 启动失败会把 `exit_code` 也兑现成 null，却根本没有进程。
+    //
+    // B12：这里同时记下**创建时刻**与**退出观察时刻** —— Windows 后代枚举的
+    // 时间窗口两端。窗口必须由 `spawn` / `close` 给出，而只有这里同时看得到。
+    const spawnAt = Date.now();
+    let closedAt: number | null = null;
     let close_observed = false;
     const close_event = new Promise<void>((resolve) => {
       child.once("close", () => {
         close_observed = true;
+        closedAt = Date.now();
         resolve();
       });
     });
@@ -203,15 +260,46 @@ export class NodeOpenCodeProcessRunner implements OpenCodeProcessRunner {
         if (pid === undefined) return "gone";
         return probeProcessAlive(pid);
       },
-      kill: (signal = "SIGTERM") => {
-        try {
-          child.kill(signal);
-        } catch {
+      probe_tree_alive: async (): Promise<ProcessLiveness> => {
+        const pid = child.pid;
+        if (pid === undefined) return "gone";
+        // B12（A 端 B11 复验 P1）：close 之后 pid 可能已被复用给无关进程，
+        // 且更早的树可能留下「父 pid 恰好等于本 pid」的孤儿。枚举必须带创建
+        // 时间窗口把这两类**可证明无关**的进程剔掉（见 core/proc-tree.ts）。
+        return await this.treeProbe.probeTree(pid, {
+          include_root: !close_observed,
+          ...treeCreationWindow({ spawn_at_ms: spawnAt, closed_at_ms: closedAt }),
+        });
+      },
+      kill: (signal = "SIGTERM"): Promise<void> => {
+        const pid = child.pid;
+        if (pid === undefined) {
           // 启动失败时没有可终止的进程；终止动作本身不应抛出。
+          return Promise.resolve();
         }
+        // B12：**树级**终止。只对孩子发信号会留下后代继续写 worktree。
+        return this.killer
+          .killTree(pid, signal === "SIGKILL")
+          .then((outcome) => {
+            // 树杀没能报告成功时，退化为直接向子进程发信号：
+            // 有界、尽力而为，绝不因为树杀失败就什么都不做。
+            if (!outcome.ok) killDirect(child, signal);
+          })
+          .catch(() => {
+            killDirect(child, signal);
+          });
       },
       spawn_error,
     };
+  }
+}
+
+/** 直接向子进程发信号（树杀不可用时的兜底，尽力而为、绝不抛出）。 */
+function killDirect(child: ChildProcess, signal: NodeJS.Signals): void {
+  try {
+    child.kill(signal);
+  } catch {
+    // 启动失败或进程已退出；终止动作本身不应抛出。
   }
 }
 
@@ -476,63 +564,17 @@ const KILL_GRACE_MS = 5_000;
  */
 const POST_KILL_GRACE_MS = 2_000;
 
-/** 进程存活性的三态探测结果（B11，A 端 B10 复验 §a）。 */
-export type ProcessLiveness = "alive" | "gone" | "unknown";
-
 /**
- * 进程生命周期状态（B11，A 端 B10 复验 §a）。
+ * 进程生命周期状态（B11/B12，A 端 B10 复验 §a、B11 复验 P1）。
  *
  * 刻意不是布尔：`spawn_failed`（连进程都没有）与 `unknown`（有过进程、
  * 去向不明）在「要不要继续开工」上的答案完全不同 —— 前者可以安全继续，
  * 后者必须停机。把它们压成一个 `boolean` 正是被点名的那种丢信息。
- */
-export type OpenCodeProcessState = "spawn_failed" | "stopped" | "unknown" | "residual";
-
-/**
- * 用 pid 主动探测进程是否仍存在（B11，A 端 B10 复验 §a）。
  *
- * `process.kill(pid, 0)` 只做存在性检查、不发信号：
- *  - 不抛错 → 进程存在（此刻确实能「确认它活着」）；
- *  - `ESRCH` → 进程不存在；
- *  - `EPERM` → 进程存在但拿不到权限（Windows 上常见），仍算活着；
- *  - 其他错误 / 拿不到有效 pid → 无法判断。
- *
- * 返回 `unknown` 时调用方**不得**当作 `gone`：这三态是刻意分开的，
- * 「探不到」与「已经退出」是两件事。
+ * 定义与判定顺序见 `core/proc-tree.ts`：测试进程与 agent 进程共用同一套，
+ * 否则两条链会对「什么叫已停止」给出两种解释。
  */
-export function probeProcessAlive(pid: number): ProcessLiveness {
-  if (!Number.isInteger(pid) || pid <= 0) return "unknown";
-  try {
-    process.kill(pid, 0);
-    return "alive";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return "gone";
-    if (code === "EPERM") return "alive";
-    return "unknown";
-  }
-}
-
-/**
- * 由**可观测事实**判定进程状态（B11，A 端 B10 复验 §a）。
- *
- * 顺序即优先级，全程**不**看 `exit_code`：
- *  1. `spawn_failed`   —— 连进程都没创建（可证明安全）；
- *  2. `close_observed` —— 真的观察到关闭（**唯一**直接的「已停止」证据；
- *     即使退出码是 null 也算，因为进程可能是被信号终止的）；
- *  3. 走到这里意味着「已启动、已发终止信号、却始终没看到关闭」：
- *     只有主动探测答「还活着」才记 `residual`，否则一律 `unknown`。
- */
-export function determineProcessState(input: {
-  spawn_failed: boolean;
-  close_observed: boolean;
-  probe?: (() => ProcessLiveness) | undefined;
-}): OpenCodeProcessState {
-  if (input.spawn_failed) return "spawn_failed";
-  if (input.close_observed) return "stopped";
-  const probed = input.probe !== undefined ? input.probe() : "unknown";
-  return probed === "alive" ? "residual" : "unknown";
-}
+export type OpenCodeProcessState = ControlledProcessState;
 
 async function collect(stream: AsyncIterable<Uint8Array | string>): Promise<string> {
   const chunks: string[] = [];
@@ -695,14 +737,27 @@ export async function runOpenCodeTask(
     spawn_error = error;
   });
 
+  /**
+   * B12：终止现在可能是**异步**的（Windows 的树杀要走 `taskkill`），
+   * 因此统一从这里发出并吞掉拒绝 —— 终止失败的真实后果由 `process_state`
+   * 的探测结果接住，不该变成一个未处理拒绝把执行器打掉。
+   */
+  const terminate = (signal: NodeJS.Signals): void => {
+    void Promise.resolve()
+      .then(() => handle.kill(signal))
+      .catch(() => {
+        /* 见上：状态探测才是判据 */
+      });
+  };
+
   const killTimer = setTimeout(() => {
     timed_out = true;
-    handle.kill("SIGTERM");
+    terminate("SIGTERM");
   }, timeout);
 
   // 外部取消（Ctrl+C）：与超时复用同一条终止路径，不做特殊状态码。
   const onAbort = (): void => {
-    handle.kill("SIGTERM");
+    terminate("SIGTERM");
   };
   if (input.signal) {
     if (input.signal.aborted) onAbort();
@@ -727,7 +782,10 @@ export async function runOpenCodeTask(
   if (failure === null && !exited) {
     // 仍未退出：认定超时，并在放弃前再补一次强杀。
     timed_out = true;
-    handle.kill("SIGKILL");
+    // B12：先把**树级**强杀命令交出去再等关闭事件 —— 否则等的可能是个空。
+    await Promise.resolve()
+      .then(() => handle.kill("SIGKILL"))
+      .catch(() => undefined);
     // 交出强杀信号后再给一个**有界**窗口观察关闭事件：SIGKILL 之后进程通常
     // 很快被回收，若此刻立刻判定，会把「刚被杀掉的进程」说成「状态未知」，
     // 白白让执行器停在人工门禁上。窗口是有限的，不能为等一个不响应的进程
@@ -750,17 +808,21 @@ export async function runOpenCodeTask(
 
   /*
    * B11（A 端 B10 复验 §a）：进程状态由**可观测事实**判定，不由退出码反推。
+   * B12（A 端 B11 复验 P1）：**观察到关闭不再等于已停止** —— 关闭事件只证明
+   * 直接子进程关闭，它拉起的后代可能仍在写同一个 worktree。判定必须再问一次
+   * 整棵受控树的存活情况（`probe_tree_alive`），树上有活口一律 `residual`。
    *
    * 走到这里仍「没观察到关闭」只剩一种情形：进程已启动、发过终止信号、
    * 却迟迟不退出（超时/取消路径）。此时只有主动探测明确答「还活着」才记
    * `residual`；问不到、或探到已不存在，一律 `unknown` —— 「探不到」与
    * 「已经退出」刻意分开，不能互相冒充。两种状态在常驻入口都会停机。
    */
-  const process_state = determineProcessState({
+  const process_state = await determineProcessState({
     spawn_failed: failure !== null,
     // 缺省 `closed` 通道的注入式 runner：以「退出码已兑现且非启动失败」近似。
     close_observed:
       handle.closed !== undefined ? close_observed : exited && failure === null,
+    probe_tree: handle.probe_tree_alive,
     probe: handle.probe_alive,
   });
 

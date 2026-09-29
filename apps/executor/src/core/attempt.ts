@@ -34,6 +34,7 @@ import type { LeaseClock, LeaseTransport } from "../core/lease.js";
 import { Heartbeat } from "../core/heartbeat.js";
 import type { ExecutorPhase, HeartbeatTransport } from "../core/heartbeat.js";
 import { checkDiffScope, findSensitiveTouches, isPathAllowed } from "../core/diff-check.js";
+import type { DiffCheckResult } from "../core/diff-check.js";
 import {
   buildCommitMessage,
   createTaskCommit,
@@ -134,8 +135,28 @@ export interface AttemptTrace {
   phases: ExecutorPhase[];
   lease_lost: boolean;
   lease_lost_reason: string | null;
-  /** 是否因为租约丢失而放弃后续副作用（推送/清理） */
+  /**
+   * 是否放弃后续副作用（推送 / 清理）。
+   *
+   * 两种原因都会置位：租约在运行期间丢失（B5）；或本机进程状态不安全
+   * （B12，A 端 B11 复验 P1）——后者下仍可能有进程在写同一个 worktree，
+   * 推送与清理都必须放弃，现场保留给人工处理。
+   */
   sideEffectsSkipped: boolean;
+  /**
+   * 是否因本机进程状态不安全而**在 attempt 内**放弃了后续 worktree 操作（B12，
+   * A 端 B11 复验 P1）。
+   *
+   * 两种来源都会置位：
+   * - agent 进程状态不安全 → 在核对 diff **之前**短路（不跑测试）；
+   * - 测试进程状态不安全 → 不提交。
+   * 两者都不推送、不清理，现场保留给人工处理。
+   *
+   * 之所以要独立于 `sideEffectsSkipped`：那个字段的原因可能是「取消」或
+   * 「租约丢失」，而本次既没取消也没丢租约 —— 混在一起会让日志与本地记录
+   * 说明一个根本没发生的原因。
+   */
+  shortCircuited: boolean;
   /** worktree 是否创建成功 */
   worktree_ready: boolean;
   /** 本次是否创建了提交（含提交失败的结果），未尝试时为 null */
@@ -280,22 +301,58 @@ export function haltStopReasonFor(
 }
 
 /**
- * 从 trace 汇总出「是否需要停机」（B11，A 端 B10 复验 §a）。
+ * 合并两次观察到的进程状态，**取更严的一档**（B12，A 端 B11 复验 P2）。
+ *
+ * 一次 attempt 里有两个环节可能留下进程：agent 进程与测试进程。二者各自的
+ * 状态都必须如实保留，合起来只允许往更严的方向走：
+ *
+ * 严重度 `not_started`(0) < `stopped`(1) < `unknown`(2) < `residual`(3)。
+ * `not_started` 排在最低是因为它说的是「**根本没有** agent 进程」，一旦测试
+ * 真的跑过，`stopped` 才更准确。`residual` 排在最后不是因为它「更危险」，
+ * 而是因为它携带**更强**的证据（已确认存活）—— 一旦有它就必须如实报出来，
+ * 不能被降级成 `unknown`。
+ */
+export function combineProcessStates(
+  left: AttemptProcessState,
+  right: AttemptProcessState,
+): AttemptProcessState {
+  const rank = (state: AttemptProcessState): number => {
+    switch (state) {
+      case "not_started":
+        return 0;
+      case "stopped":
+        return 1;
+      case "unknown":
+        return 2;
+      case "residual":
+        return 3;
+    }
+  };
+  return rank(right) > rank(left) ? right : left;
+}
+
+/**
+ * 从 trace 汇总出「是否需要停机」（B11，A 端 B10 复验 §a；B12 修正）。
  *
  * 输入刻意取**两个**信号：`process_state` 是主判据，`kill_failed` 是它对应的
- * 旧信号。二者本应一致（attempt 层在 `kill_failed` 时把状态置为 `residual`），
- * 真出现不一致时这里**取更严的一档**：停机判据宁愿多停一次（代价是一次人工
- * 确认），也不能漏停（代价是残留进程与新任务并行抢同一个 worktree）。
+ * 旧信号。二者本应一致，真出现不一致时这里取更严的一档：停机判据宁愿多停
+ * 一次（代价是一次人工确认），也不能漏停（代价是残留进程与新任务并行抢同一个
+ * worktree）。
  *
- * `not_started` / `stopped` 且未 `kill_failed` 时返回 `unsafe: false`。
+ * B12 修正（A 端 B11 复验 P2）：`kill_failed` **不再**被升级成 `residual`。
+ * 它只说明「没等到退出」，不说明「进程还活着」——拿它去报 `residual` 就是用
+ * 「不知道」冒充「已确认残留」。现在保守记 `unknown`：**仍然停机**，
+ * 但不冒称证据强度。真实存在残留时，attempt 层的探测会把状态如实置为
+ * `residual`，那条路径不受影响。
  */
 export function haltSignalOf(trace: {
   kill_failed: boolean;
   process_state: AttemptProcessState;
 }): { unsafe: boolean; state: AttemptProcessState } {
-  if (trace.process_state === "residual") return { unsafe: true, state: "residual" };
-  if (trace.process_state === "unknown") return { unsafe: true, state: "unknown" };
-  if (trace.kill_failed) return { unsafe: true, state: "residual" };
+  if (isUnsafeProcessState(trace.process_state)) {
+    return { unsafe: true, state: trace.process_state };
+  }
+  if (trace.kill_failed) return { unsafe: true, state: "unknown" };
   return { unsafe: false, state: trace.process_state };
 }
 
@@ -339,6 +396,7 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     lease_lost: false,
     lease_lost_reason: null,
     sideEffectsSkipped: false,
+    shortCircuited: false,
     worktree_ready: false,
     commit: null,
     commit_skipped_reason: null,
@@ -441,6 +499,66 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     processState = mapAdapterProcessState(agentResult.process_state);
     trace.process_state = processState;
 
+    /* --- 3b. unsafe 状态立即短路（B12，A 端 B11 复验 P1 裁定）------ */
+    /*
+     * 常驻入口原本是在整个 attempt 返回、尝试上报**之后**才按 trace 停机。
+     * 于是「已经知道有进程去向不明」之后，执行器仍然继续核对 diff、跑测试、
+     * 暂存并本地提交 —— 而这些操作都在和一个**可能仍在写盘的进程**抢同一个
+     * worktree，产出的证据与提交无法对应一个稳定快照。
+     *
+     * A 的裁定：`unknown` / `residual` 必须在 attempt 内**立即**短路这些
+     * worktree 操作 —— 不跑测试、不暂存、不提交、不推送、不清理；保留
+     * worktree 与持久化停机标记；仍生成并上报明确的失败结果，然后停机。
+     * 只有 `not_started` / `stopped` 才允许继续验证与提交。
+     */
+    if (isUnsafeProcessState(processState)) {
+      const reason =
+        `agent 进程状态为 ${processState}（${describeProcessState(processState)}）` +
+        "，已短路后续 worktree 操作（未核对 diff、未跑测试、未提交、未清理）";
+      trace.commit_skipped_reason = reason;
+      // 明确放弃后续副作用：不推送、不清理（时序约束 3 的加强版）。
+      trace.sideEffectsSkipped = true;
+      trace.shortCircuited = true;
+      setPhase("reporting");
+
+      // 生成**明确的失败结果**。这里的 diff 是**如实声明「未执行核对」**，
+      // 而不是调 `checkDiffScope` 伪造一个「无变更」或「核对通过」——
+      // 后者会让人以为现场被检查过。normalizeResult 见到 `error` 非空
+      // 会判 `failed` + `INTERNAL_ERROR`（fatal，需人工判断），与
+      // 「读不出 Git 状态」的处理一致：都不是 agent 的代码缺陷。
+      const unverifiedDiff: DiffCheckResult = {
+        changed_files: [],
+        violations: [],
+        ok: false,
+        has_uncommitted: false,
+        error: `未执行写入范围核对：${reason}`,
+      };
+      const report = normalizeResult({
+        lease,
+        adapter: agentResult,
+        diff: unverifiedDiff,
+        evidence: null,
+        base_sha: lease.binding.base_sha,
+        // 没有核对、也不可能提交：如实沿用基线，绝不伪造新 HEAD。
+        head_sha: lease.binding.base_sha,
+        sensitive_touches: [],
+        commit_shas: [],
+        note: reason,
+        reported_at: new Date(now()).toISOString(),
+      });
+
+      return {
+        report,
+        trace,
+        worktree_removed: false,
+        worktree_path: worktreePath,
+        local_commits: [],
+        commit: null,
+        changed_files: [],
+        raw_test_output: "",
+      };
+    }
+
     /* --- 4. 核对写入范围 -------------------------------------- */
     setPhase("checking_diff");
     const diff = checkDiffScope({
@@ -474,12 +592,24 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
       // B8（A 端 B7-1）：杀不掉的进程必须成为**显式信号**，
       // 而不是只留一句备注。常驻入口据此停机。
       trace.kill_failed = collected.kill_failed;
-      // B10（A 端 B9 复验 §4）：测试进程已确认杀不掉 → `residual`，这是
-      // 最坏的一种，不允许被后来的步骤回退成 `stopped`。
-      // 只在 kill_failed 时改写：agent 那次若本来就「未知」，
-      // 不能因为这次测试进程干净退出就被洗白。
-      if (collected.kill_failed) processState = "residual";
+      // B12（A 端 B11 复验 P2）：**不再**把 `kill_failed` 直接当成「已确认残留」。
+      // 它只说明「没等到退出」，而没等到退出不等于还活着 —— 旧写法把
+      // 「不知道」说成了「确认活着」。现在由存活探测给出的状态决定：
+      // 确认仍存活才是 `residual`，否则 `unknown`。
+      //
+      // 与 agent 那次的状态**取更严者**：agent 若本来就「未知」，不能因为
+      // 这次测试进程干净退出就被洗白；反之，测试进程留下的残留也不允许
+      // 被 agent 的干净结果盖掉。
+      processState = combineProcessStates(
+        processState,
+        mapAdapterProcessState(collected.process_state),
+      );
       trace.process_state = processState;
+      if (isUnsafeProcessState(processState)) {
+        // 与 agent 侧同一裁定：不提交、不推送、不清理，保留现场等人工处理。
+        trace.sideEffectsSkipped = true;
+        trace.shortCircuited = true;
+      }
     }
 
     /* --- 6. 创建提交（B5，评审单 P0-2）------------------------- */
@@ -494,6 +624,13 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     let commitBlockedReason: string | null = null;
     if (commitSpec === null) {
       commitBlockedReason = "调用方未提供 commit_spec";
+    } else if (isUnsafeProcessState(processState)) {
+      // B12（A 端 B11 复验 P1）：还有进程去向不明（或确认未终止）时**不得提交**。
+      // 这是 agent 侧短路之外的第二道拦截：测试进程也可能是不安全的来源，
+      // 而那时 agent 的状态是干净的，只能在这里拦。
+      commitBlockedReason =
+        `进程状态不安全（${processState}，${describeProcessState(processState)}），` +
+        "无法证明提交对应稳定快照";
     } else if (diff.error !== null) {
       // B8（A 端 B7-2）：**核对失败即未通过**。
       // 「读不出 git 状态」绝不能被当成「没有越界」而放行提交。
@@ -578,6 +715,11 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
     if (terminationDetail !== null) {
       noteParts.push(`测试进程终止异常：${terminationDetail}`);
     }
+    if (isUnsafeProcessState(processState)) {
+      noteParts.push(
+        `本机进程状态：${processState}（${describeProcessState(processState)}），已放弃提交与推送`,
+      );
+    }
     const report = normalizeResult({
       lease,
       adapter: agentResult,
@@ -633,7 +775,16 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
 
     // 时序约束 3：默认**不清理**。推送与远端 SHA 核对需要该目录存在，
     // 是否清理由调用方在推送与上报全部结束之后决定（评审单 P0-1）。
-    if (input.cleanup_worktree && !trace.lease_lost && trace.worktree_ready) {
+    //
+    // B12（A 端 B11 复验 P1）：进程状态不安全时**一律不清理**，即使调用方
+    // 要求清理 —— 可能有进程仍在写这个目录，删掉它既会掩盖现场，也可能
+    // 让仍在运行的进程继续往已删除的路径写。现场必须保留到人工解除。
+    if (
+      input.cleanup_worktree &&
+      !trace.lease_lost &&
+      trace.worktree_ready &&
+      !isUnsafeProcessState(trace.process_state)
+    ) {
       try {
         removeWorktree(input.repo_root, worktreePath, true);
         trace.phases.push("reporting");

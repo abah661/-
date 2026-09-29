@@ -11,6 +11,7 @@
 import { createHash } from "node:crypto";
 import { runProcess } from "./process.js";
 import type { ProcessRunner, TreeKiller } from "./process.js";
+import type { ControlledProcessState } from "./proc-tree.js";
 import type { TestEvidence } from "@dac/protocol";
 
 export interface RunEvidenceInput {
@@ -96,6 +97,17 @@ export interface EvidenceResult {
    * worktree 与文件锁，继续领取新任务只会制造更多冲突（A 端 B7-1）。
    */
   kill_failed: boolean;
+  /**
+   * 测试进程的**进程状态**（B12，A 端 B11 复验 P2）。
+   *
+   * 为什么要和 `kill_failed` 并存：`kill_failed` 只说明「没等到退出」，
+   * 而「没等到退出」不等于「进程还活着」。原实现直接把它当成「已确认残留」
+   * （`residual`），把「不知道」说成了「确认活着」。
+   *
+   * 现在由存活探测回答：**确认仍存活**才是 `residual`，探不到或只缺关闭
+   * 证据一律 `unknown`。两者都要停机，但日志与持久化状态必须分别如实表达。
+   */
+  process_state: ControlledProcessState;
 }
 
 /**
@@ -141,5 +153,6 @@ export async function collectEvidence(
     summary_parsed: parsed !== null,
     termination_detail: result.kill_detail,
     kill_failed: result.kill_failed,
+    process_state: result.process_state,
   };
 }

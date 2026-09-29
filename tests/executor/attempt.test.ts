@@ -15,6 +15,7 @@ import { ResultReportSchema } from "@dac/protocol";
 import type { Lease } from "@dac/protocol";
 import {
   AttemptOrchestrationError,
+  combineProcessStates,
   describeProcessState,
   haltSignalOf,
   haltStopReasonFor,
@@ -485,7 +486,7 @@ describe("B11 §B10复验 适配器进程状态 → 编排层进程状态", () =
     expect(haltStopReasonFor("unknown")).not.toBe(haltStopReasonFor("residual"));
   });
 
-  it("haltSignalOf 取两信号中更严的一档（不一致时不漏停机）", () => {
+  it("haltSignalOf 取两信号中更严的一档，且 kill_failed **不冒称**「已确认残留」", () => {
     expect(haltSignalOf({ kill_failed: false, process_state: "stopped" })).toEqual({
       unsafe: false,
       state: "stopped",
@@ -495,9 +496,31 @@ describe("B11 §B10复验 适配器进程状态 → 编排层进程状态", () =
       state: "unknown",
     });
     expect(haltSignalOf({ kill_failed: false, process_state: "not_started" }).unsafe).toBe(false);
-    // 不一致：旧信号说「杀不掉」，新状态却说「已退出」→ 按更严的 residual 处置
+    expect(haltSignalOf({ kill_failed: false, process_state: "residual" })).toEqual({
+      unsafe: true,
+      state: "residual",
+    });
+    // B12（A 端 B11 复验 P2）：旧信号说「杀不掉」、新状态却说「已退出」时，
+    // 仍然要停机（宁可多停一次），但**不得**把状态写成 `residual` ——
+    // `kill_failed` 只说明「没等到退出」，不说明「确认还活着」。
+    // 用「不知道」冒充「已确认残留」会把排查引向错误方向。
     const inconsistent = haltSignalOf({ kill_failed: true, process_state: "stopped" });
     expect(inconsistent.unsafe).toBe(true);
-    expect(inconsistent.state).toBe("residual");
+    expect(inconsistent.state).toBe("unknown");
+    expect(inconsistent.state).not.toBe("residual");
+  });
+
+  it("combineProcessStates 取更严的一档：not_started < stopped < unknown < residual", () => {
+    // 两个环节都安全 → 仍是安全，且不出现 `not_started` 冒充结论
+    expect(combineProcessStates("not_started", "stopped")).toBe("stopped");
+    expect(combineProcessStates("stopped", "not_started")).toBe("stopped");
+    expect(combineProcessStates("stopped", "stopped")).toBe("stopped");
+    // 任一环节不安全 → 整体不安全（不允许被干净的一方洗白）
+    expect(combineProcessStates("stopped", "unknown")).toBe("unknown");
+    expect(combineProcessStates("not_started", "unknown")).toBe("unknown");
+    expect(combineProcessStates("stopped", "residual")).toBe("residual");
+    // 证据强的一方不被降级：已确认存活胜过「不知道」
+    expect(combineProcessStates("residual", "unknown")).toBe("residual");
+    expect(combineProcessStates("unknown", "residual")).toBe("residual");
   });
 });

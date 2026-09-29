@@ -96,7 +96,7 @@ import type {
   OpenCodeProcess,
   OpenCodeProcessRunner,
 } from "../../apps/executor/src/adapters/opencode.js";
-import { NodeOpenCodeProcessRunner, runOpenCodeTask } from "../../apps/executor/src/adapters/opencode.js";
+import { NodeOpenCodeProcessRunner, probeProcessAlive, runOpenCodeTask } from "../../apps/executor/src/adapters/opencode.js";
 import {
   describeLaunchResolution,
   resolveOpenCodeLaunch,
@@ -1460,10 +1460,20 @@ describe("B11 §B10复验 正常返回路径的进程状态（真实子进程）
       );
       const haltedRun = await runDaemon(first.options, first.deps);
 
-      // ① 这次 attempt 走的是**正常收尾**（不是 B10 的异常分支）
+      // ① B12（A 端 B11 复验 P1 裁定）：状态不安全时 attempt **在核对 diff
+      //    之前就短路**，因此本地记录是 `skipped_unsafe_process`，而不是
+      //    `reported` —— 后者会让人以为「没跑测试也没提交」是因为别的原因。
       expect(haltedRun.attempts).toHaveLength(1);
-      expect(haltedRun.attempts[0]!.result).toBe("reported");
+      expect(haltedRun.attempts[0]!.result).toBe("skipped_unsafe_process");
       expect(first.reports).toHaveLength(1);
+      // 短路不等于「不上报」：A 的裁定要求**仍如实上报明确的失败结果**，
+      // 否则协调器永远等不到这个 attempt 的下落。
+      const shortCircuited = first.reports[0]!;
+      expect(shortCircuited.status).not.toBe("ready_for_integration");
+      // 没有跑测试、也没有提交：证据为空、head 仍是基线（不伪造新 HEAD）
+      expect(shortCircuited.evidence).toBeNull();
+      expect(shortCircuited.head_sha).toBe(repo.base_sha);
+      expect(shortCircuited.commit_shas).toEqual([]);
       // ② 但进程状态未知 → 停机，且**只领过一次**
       expect(haltedRun.stop_reason).toBe("halt_process_unknown");
       expect(first.acquireCalls()).toBe(1);
@@ -1492,5 +1502,171 @@ describe("B11 §B10复验 正常返回路径的进程状态（真实子进程）
       expect(third.acquireCalls()).toBe(1);
     },
     180_000,
+  );
+});
+
+/* ================================================================== *
+ * §10 B12：观察单位是**整棵受控进程树**，不是直接子进程
+ *      （A 端 B11 复验 §三 P1）
+ *
+ * A 端用真实父子进程复现的缺口：
+ * > 父进程（agent）正常关闭后，B11 判定为 `stopped`，
+ * > 而它拉起的分离后代**仍然存活**，可以继续写同一个 worktree。
+ *
+ * `close` 事件只证明**直接子进程**关闭。把它当成「现场已干净」是错的，
+ * 于是「已停止」这个结论在最需要它准确的地方失效了。
+ *
+ * 本组用真实进程驱动方向相反的两条结论：
+ *   1. 父关闭、后代仍活 → **不得**判 `stopped`，必须 `residual`，
+ *      且 attempt 必须**短路**后续 worktree 操作（不跑测试、不提交）；
+ *   2. 父关闭、后代也确实不在 → 仍照旧判 `stopped`（不误停）。
+ * ================================================================== */
+
+describe("B12 §B11复验 P1 进程树：父进程关闭但后代仍存活（真实进程）", () => {
+  const launchWith = (script: string) => ({ js_entry: script, node_path: process.execPath });
+
+  /** 打印一份合法的 `--format json` 事件流（让适配器判为正常收尾）。 */
+  const EVENT_LINES = [
+    "process.stdout.write(JSON.stringify({ type: 'step_start', sessionID: 'ses_tree' }) + '\\n');",
+    "process.stdout.write(JSON.stringify({ type: 'text', part: { type: 'text', text: 'done' } }) + '\\n');",
+    "process.stdout.write(JSON.stringify({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop', tokens: { total: 1, input: 1, output: 0, reasoning: 0 } } }) + '\\n');",
+  ];
+
+  /**
+   * 父进程：拉起一个**分离的长驻后代**（`detached` + `stdio: 'ignore'`），
+   * 记下后代的 pid，然后**立刻正常退出**。
+   *
+   * `detached: true` 不是可选项，而是这个场景的**定义**（A 端复验 §三 P1 的
+   * 原文也是「一个**分离**、stdio 为 ignore 的长驻后代」）。本机实测：
+   * Windows 上不分离的子进程与父进程**共用同一个控制台**，父进程一退出控制台
+   * 关闭，子进程会被一并终止 —— 于是「父关闭、后代仍活」这个前提根本不成立，
+   * 用例会退化成一句空断言（探针如实答 `gone`，被正确判成 `stopped`）。
+   *
+   * 后代**不**继承父进程的 stdio，父进程因此可以干净地关闭；它的
+   * `ParentProcessId` 在 Windows 上仍原样保留为父进程的 pid —— 这正是
+   * 「父进程关了、后代还活着」的真实形状。
+   */
+  function makeTreeAgentScript(pidFile: string): string {
+    const dir = track(mkdtempSync(join(tmpdir(), "dac-b12-tree-")));
+    const script = join(dir, "tree-agent.js");
+    writeFileSync(
+      script,
+      [
+        "const { spawn } = require('node:child_process');",
+        "const fs = require('node:fs');",
+        "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)']," +
+          " { stdio: 'ignore', detached: true, windowsHide: true });",
+        "fs.writeFileSync(" + JSON.stringify(pidFile) + ", String(child.pid), 'utf8');",
+        ...EVENT_LINES,
+        "process.exit(0);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    return script;
+  }
+
+  /** 对照组：不拉起任何后代，正常打印并退出。 */
+  function makeLeafAgentScript(): string {
+    const dir = track(mkdtempSync(join(tmpdir(), "dac-b12-leaf-")));
+    const script = join(dir, "leaf-agent.js");
+    writeFileSync(script, [...EVENT_LINES, "process.exit(0);", ""].join("\n"), "utf8");
+    return script;
+  }
+
+  const alive = (pid: number): boolean => probeProcessAlive(pid) === "alive";
+
+  it(
+    "父进程正常关闭、后代仍存活 → residual（不是 stopped）；attempt 短路、worktree 保留",
+    async () => {
+      const repo = makeRealRepo();
+      const task = makeTask({ allow: ["apps/demo/**"], deny: [] });
+      const store = fileInFlightStore(repo.root);
+      const pidDir = track(mkdtempSync(join(tmpdir(), "dac-b12-pid-")));
+      const pidFile = join(pidDir, "descendant.pid");
+
+      let descendantPid: number | null = null;
+      try {
+        const first = makeRealHarness(
+          repo,
+          [
+            { kind: "leased", task, lease: makeLease(repo) },
+            // 队列里放第二个：没有停机门时一定会去领它
+            { kind: "leased", task, lease: makeLease(repo) },
+          ],
+          // agent 刻意**不写任何文件**：这样「没有提交」不可能被归因于
+          // 「越界」或「测试失败」——只可能来自进程状态短路。
+          {},
+          { agent_launcher: launchWith(makeTreeAgentScript(pidFile)), max_idle_polls: 1 },
+          // 用**真实**进程启动器：默认 runner 才带整棵树的探测通道
+          null,
+        );
+        const halted = await runDaemon(first.options, first.deps);
+
+        /* --- 先证「后代真的存在过」，否则下面的断言是空的 --- */
+        expect(existsSync(pidFile)).toBe(true);
+        descendantPid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+        expect(Number.isInteger(descendantPid)).toBe(true);
+
+        /* --- 核心断言：父已关闭、后代仍活 → `residual`，不是 `stopped` --- */
+        expect(halted.stop_reason).toBe("halt_residual_process");
+        expect(first.acquireCalls()).toBe(1);
+        expect(first.pushes).toHaveLength(0);
+
+        /* --- 短路：没跑测试、没暂存、没提交（A 的裁定） --- */
+        expect(halted.attempts[0]!.result).toBe("skipped_unsafe_process");
+        const sent = first.reports[0]!;
+        expect(sent.evidence).toBeNull();
+        expect(sent.head_sha).toBe(repo.base_sha);
+        expect(sent.commit_shas).toEqual([]);
+        expect(sent.changed_files).toEqual([]);
+
+        /* --- worktree 保留、标记为「已确认残留」（有证据的那一档） --- */
+        const worktreePath = join(repo.root, ...WORKTREE_ROOT_SEGMENTS, "TASK-0001-A1");
+        expect(existsSync(worktreePath)).toBe(true);
+        const records = listInFlightRecords(repo.root);
+        expect(records).toHaveLength(1);
+        expect(records[0]!.state).toBe("halted_residual_process");
+
+        /* --- 后代此刻仍可被独立观测到：证明上面判 residual 不是靠猜 --- */
+        expect(alive(descendantPid)).toBe(true);
+      } finally {
+        // 只终止**本次测试创建**的后代，然后再确认它确实不在了。
+        if (descendantPid !== null) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            /* 可能已自行退出 */
+          }
+        }
+      }
+      // 清理后确认不再存活（测试自己不留孤儿）
+      if (descendantPid !== null) {
+        for (let i = 0; i < 40 && alive(descendantPid); i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(alive(descendantPid)).toBe(false);
+      }
+    },
+    120_000,
+  );
+
+  it(
+    "对照组：父进程关闭且没有后代 → 树探测为 gone → stopped（不误停）",
+    async () => {
+      const cwd = track(mkdtempSync(join(tmpdir(), "dac-b12-cwd-")));
+      const result = await runOpenCodeTask(
+        { prompt: "无后代", cwd, model: "myapi/gpt-5.6-sol" },
+        { launcher: launchWith(makeLeafAgentScript()) },
+        new NodeOpenCodeProcessRunner(),
+      );
+
+      // 同一条探测链路上，没有后代就必须老老实实答「已停止」——
+      // 否则「加了树探测」会变成「从此不敢判 stopped」，那是另一种错。
+      expect(result.process_state).toBe("stopped");
+      expect(result.status).toBe("completed");
+      expect(result.exit_code).toBe(0);
+    },
+    60_000,
   );
 });

@@ -268,6 +268,14 @@ export interface DaemonAttemptRecord {
      * 这个是「压根没跑完」。混在一个值里会让排障看不出异常发生在哪一段。
      */
     | "failed_orchestration"
+    /**
+     * 因本机进程状态不安全而在 attempt 内放弃了 worktree 操作（B12，A 端 B11 复验 P1）。
+     *
+     * 与 `skipped_lease_lost` / `skipped_aborted` 分开记：那两个是「云端原因」
+     * 导致不推送，而这一个是「本机可能有进程还在写 worktree」。用同一个值会
+     * 让排障把「残留进程」读成「租约问题」，追错方向。
+     */
+    | "skipped_unsafe_process"
     | "refused_binding_incomplete";
   report_status: ResultStatus | null;
   pushed: boolean;
@@ -1136,6 +1144,57 @@ export async function runDaemon(
       log(`[attempt] 编排异常（${stateText}）：记录并继续`);
       markInFlight(flightRecord, "failed_orchestration");
       continue;
+    }
+
+    /* --- 11b. 进程状态不安全 → attempt 内已短路（B12，A 端 B11 复验 P1）--- */
+    //
+    // 这次 attempt **既没取消、也没丢租约**：是 A 端裁定要求「`unknown` /
+    // `residual` 必须在 attempt 内立即短路后续 worktree 操作」。因此不能落进
+    // 下面的 `sideEffectsSkipped` 分支 —— 那条分支会把原因写成「收到取消信号」
+    // 或「租约失效」，而这两件事都没有发生，记录里还会写下 LEASE_EPOCH_STALE。
+    //
+    // A 的裁定同时要求「仍可生成并上报明确的失败结果，然后停机」：所以这里
+    // **照常上报**（否则协调器永远等不到这个 attempt 的下落，租约要等自然过期
+    // 才回收），但不推送、不清理，并保留停机标记等人工处理。
+    const shortCircuitHalt = haltSignalOf(outcome.trace);
+    if (outcome.trace.shortCircuited && shortCircuitHalt.unsafe) {
+      const haltState = haltedStateFor(shortCircuitHalt.state);
+      log(
+        `[halt] ${describeProcessState(shortCircuitHalt.state)}：已在 attempt 内短路后续` +
+          " worktree 操作（未跑测试 / 未提交 / 未推送 / 未清理），worktree 保留。" +
+          `仍如实上报失败结果，然后停止领取新任务（标记 ${haltState}）`,
+      );
+      markInFlight(flightRecord, haltState);
+      try {
+        await deps.result_reporter.report(outcome.report);
+        attemptRecords.push({
+          task_id: task.task_id,
+          attempt_id: lease.attempt_id,
+          lease_epoch: lease.lease_epoch,
+          result: "skipped_unsafe_process",
+          report_status: outcome.report.status,
+          pushed: false,
+          error_code: outcome.report.error_code,
+        });
+        log(`[report] 已上报 ${task.task_id} / ${lease.attempt_id}：${outcome.report.status}`);
+      } catch (error) {
+        // 上报失败**不改变结论**：停机标记已经落盘，重启门禁仍会拦住新任务。
+        attemptRecords.push({
+          task_id: task.task_id,
+          attempt_id: lease.attempt_id,
+          lease_epoch: lease.lease_epoch,
+          result: "failed_to_report",
+          report_status: outcome.report.status,
+          pushed: false,
+          error_code: errorCodeOf(error),
+        });
+        log(
+          `[report] 上报失败（HTTP ${httpStatusOf(error) ?? "无"} / ${errorCodeOf(error)}）：` +
+            "停机标记已保留，请人工确认进程已清理后再启动",
+        );
+      }
+      report.stop_reason = haltStopReasonFor(shortCircuitHalt.state);
+      break;
     }
 
     /* --- 11/13. 租约失效或收到取消：不推送、不上报 ----------- */

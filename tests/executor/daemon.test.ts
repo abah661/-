@@ -183,6 +183,8 @@ function makeOutcome(overrides: Partial<AttemptOutcome> = {}): AttemptOutcome {
       // 需要「状态未知 / 已确认残留」的用例必须显式覆盖它，
       // 否则会悄悄退回「默认安全」这条被点名过的老路。
       process_state: "stopped",
+      // B12：默认「没有因为在途进程状态而短路 worktree 操作」。
+      shortCircuited: false,
     },
     worktree_removed: true,
     worktree_path: "/repo/.local/worktrees/TASK-0001-A1",
@@ -636,7 +638,7 @@ describe("B8 §B7-6 测试命令结构化配置", () => {
  * ------------------------------------------------------------------ */
 
 describe("B8 §B7-1 残留进程停机门槛", () => {
-  it("kill_failed → 上报后停止，不再领取新任务/不再推送/不清理 worktree", async () => {
+  it("kill_failed（无存活证据）→ 按「状态未知」停机，不冒称已确认残留、不领新任务/不推送/不清理", async () => {
     const h = makeHarness({
       // 队列里给两个任务：若没有停机门槛，会继续领第二个
       script: [
@@ -650,7 +652,10 @@ describe("B8 §B7-1 残留进程停机门槛", () => {
 
     const report = await runDaemon(withLog(makeOptions({ enable_push: true }), h.logs), h.deps);
 
-    expect(report.stop_reason).toBe("halt_residual_process");
+    // B12（A 端 B11 复验 P2）：`kill_failed` 只说明「没等到退出」，
+    // **不说明「确认还活着」**。没有存活探测证据时必须记「状态未知」，
+    // 用「不知道」冒充「已确认残留」就是伪造证据。
+    expect(report.stop_reason).toBe("halt_process_unknown");
     // 只领了**一次**：停机门槛生效
     expect(h.acquireCalls()).toBe(1);
     expect(report.attempts).toHaveLength(1);
@@ -662,8 +667,30 @@ describe("B8 §B7-1 残留进程停机门槛", () => {
     expect(h.pushes).toHaveLength(0);
     expect(h.reports[0]!.status).toBe("failed");
     // 在途记录终态可区分于「正常上报」
+    expect(h.saved.at(-1)?.state).toBe("halted_process_unknown");
+    // 日志必须点明「需要人工处理」，且措辞与证据强度一致
+    expect(h.logs.some((line) => line.includes("状态未知的进程"))).toBe(true);
+    expect(h.logs.some((line) => line.includes("残留进程"))).toBe(false);
+  });
+
+  it("kill_failed 且存活探测确认仍在运行（process_state=residual）→ 标记为「已确认残留」", async () => {
+    const h = makeHarness({
+      script: [
+        { kind: "leased", task: TASK, lease: LEASE },
+        { kind: "leased", task: TASK, lease: LEASE },
+      ],
+      outcome: makeOutcome({
+        trace: { ...makeOutcome().trace, kill_failed: true, process_state: "residual" },
+      }),
+    });
+
+    const report = await runDaemon(withLog(makeOptions({ enable_push: true }), h.logs), h.deps);
+
+    // 有探测证据才用「已确认」这个词：两者都要停机，但结论强度不同。
+    expect(report.stop_reason).toBe("halt_residual_process");
+    expect(h.acquireCalls()).toBe(1);
+    expect(h.events).not.toContain("push");
     expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
-    // 日志必须点明「需要人工处理」
     expect(h.logs.some((line) => line.includes("残留进程"))).toBe(true);
   });
 
@@ -679,6 +706,7 @@ describe("B8 §B7-1 残留进程停机门槛", () => {
     expect(report.stop_reason).toBe("idle_limit");
     expect(h.saved.some((record) => record.state === "reported")).toBe(true);
     expect(report.stop_reason).not.toBe("halt_residual_process");
+    expect(report.stop_reason).not.toBe("halt_process_unknown");
   });
 });
 
@@ -705,7 +733,7 @@ describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () =>
 
   /* --- §3.1 取消 / 租约失效 ---------------------------------- */
 
-  it("① 取消 + kill_failed → 不声称「已终止」、保留残留标记、停止领取新任务", async () => {
+  it("① 取消 + kill_failed → 不声称「已终止」、保留停机标记、停止领取新任务", async () => {
     const controller = new AbortController();
     const h = makeHarness({
       // 队列里放两个：没有停机门槛时会继续领第二个
@@ -728,15 +756,17 @@ describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () =>
     expect(h.events).not.toContain("push");
     expect(h.events).not.toContain("report");
     // 但本机不安全 → 停机，且只领了一次
-    expect(report.stop_reason).toBe("halt_residual_process");
+    // B12（A 端 B11 复验 P2）：`kill_failed` 本身没有存活证据 → 「状态未知」，
+    // 不得写成「已确认残留」。
+    expect(report.stop_reason).toBe("halt_process_unknown");
     expect(h.acquireCalls()).toBe(1);
-    expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
+    expect(h.saved.at(-1)?.state).toBe("halted_process_unknown");
     // 不得声称子进程「已终止」——那句话在 kill_failed 时是假的
     expect(h.logs.some((line) => line.includes("已终止子进程"))).toBe(false);
-    expect(h.logs.some((line) => line.includes("未被终止"))).toBe(true);
+    expect(h.logs.some((line) => line.includes("状态未知"))).toBe(true);
   });
 
-  it("② 租约失效 + kill_failed → 保留残留标记并停机", async () => {
+  it("② 租约失效 + kill_failed → 保留停机标记并停机", async () => {
     const h = makeHarness({
       script: [
         { kind: "leased", task: TASK, lease: LEASE },
@@ -751,10 +781,10 @@ describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () =>
     const report = await runDaemon(withLog(makeOptions(), h.logs), h.deps);
 
     expect(report.attempts[0]!.result).toBe("skipped_lease_lost");
-    expect(report.stop_reason).toBe("halt_residual_process");
+    expect(report.stop_reason).toBe("halt_process_unknown");
     expect(h.acquireCalls()).toBe(1);
-    expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
-    expect(h.logs.some((line) => line.includes("未被终止"))).toBe(true);
+    expect(h.saved.at(-1)?.state).toBe("halted_process_unknown");
+    expect(h.logs.some((line) => line.includes("状态未知"))).toBe(true);
   });
 
   it("③ 取消但进程已正常终止 → 仍是 skipped_aborted / aborted（不误报残留）", async () => {
@@ -777,12 +807,12 @@ describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () =>
   /* --- §3.2 上报失败（401/403/409/其他）---------------------- */
 
   for (const [label, status, code, expectedStop] of [
-    ["401", 401, "AUTH_EXPIRED", "halt_residual_process"],
-    ["403", 403, "AUTH_EXPIRED", "halt_residual_process"],
-    ["409", 409, "LEASE_EPOCH_STALE", "halt_residual_process"],
-    ["500", 500, "INTERNAL_ERROR", "halt_residual_process"],
+    ["401", 401, "AUTH_EXPIRED", "halt_process_unknown"],
+    ["403", 403, "AUTH_EXPIRED", "halt_process_unknown"],
+    ["409", 409, "LEASE_EPOCH_STALE", "halt_process_unknown"],
+    ["500", 500, "INTERNAL_ERROR", "halt_process_unknown"],
   ] as const) {
-    it(`④ 上报 ${label} + kill_failed → 残留标记优先，停机（不再被 ${label} 分支抢走）`, async () => {
+    it(`④ 上报 ${label} + kill_failed → 停机标记优先，停机（不再被 ${label} 分支抢走）`, async () => {
       const h = makeHarness({
         script: [
           { kind: "leased", task: TASK, lease: LEASE },
@@ -795,9 +825,10 @@ describe("B9 §B8复验 残留进程状态的所有分支与重启门禁", () =>
 
       expect(report.attempts[0]!.result).toBe("failed_to_report");
       expect(report.stop_reason).toBe(expectedStop);
-      expect(h.saved.at(-1)?.state).toBe("halted_residual_process");
+      // B12（A 端 B11 复验 P2）：无存活证据时记「状态未知」，不冒称「已确认残留」
+      expect(h.saved.at(-1)?.state).toBe("halted_process_unknown");
       expect(h.acquireCalls()).toBe(1);
-      expect(h.logs.some((line) => line.includes("未被终止"))).toBe(true);
+      expect(h.logs.some((line) => line.includes("状态未知"))).toBe(true);
     });
   }
 
@@ -1542,6 +1573,10 @@ describe("B4 §7 租约失效", () => {
           lease_lost: true,
           lease_lost_reason: "lease_epoch_stale",
           sideEffectsSkipped: true,
+          // B12：`shortCircuited` 与 `sideEffectsSkipped` 是**两个不同的原因**。
+          // 本用例是「租约失效」，不是「进程状态不安全」，所以这里必须是 false
+          // —— 否则记录会把一个根本没发生的原因写进去。
+          shortCircuited: false,
           worktree_ready: true,
           commit: null,
           commit_skipped_reason: null,

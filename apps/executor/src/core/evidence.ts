@@ -39,6 +39,10 @@ export interface RunEvidenceInput {
  * Node 内置测试运行器（TAP），于是真实全绿的一次运行被解析成 `passed: 0`，
  * 上报被协调器以 `RESULT_SCHEMA_INVALID` 正确拒绝。**不能靠退出码 0
  * 或普通文本反推「测试通过」**，只能扩展解析器认识真实格式。
+ *
+ * B16（A 端 B15 复核）：B13 的 fail-closed 不完整 —— 只强制 `tests/pass/fail`，
+ * 缺字段按 0 补、不校验版本头与终止标记，于是**不完整/被截断**的 TAP 片段
+ * 也能报出通过数。现收紧为「只认结构完整的 TAP v13 输出」，详见 `parseTapSummary`。
  */
 export function parseTestSummary(output: string): TestEvidence["summary"] | null {
   // 先试 vitest/jest（顺序保持原样，避免改变既有行为），再试 TAP。
@@ -87,10 +91,28 @@ function parseTestsLineSummary(output: string): TestEvidence["summary"] | null {
 }
 
 /**
- * TAP 汇总块字段名。`suites` 只统计套件数，不参与用例数自洽校验。
+ * Node 22 内置运行器 TAP 输出的**版本头**。
+ *
+ * 实测（Node v22.22.2，`node --test` 默认 reporter）：完整跑完的输出里
+ * 这一行恰好出现一次、不缩进。但它只能证明「这是 TAP 输出」，**不能**证明
+ * 输出完整 —— 完整性由「全部汇总字段 + 终止标记」共同证明。
+ *
+ * 为什么**不**要求它是「第一行非空内容」：真实执行路径上，测试命令是
+ * 直接以数组形式拉起 `node --test` 的（stdout 第一行就是它），但也存在
+ * 经 `npm test` 之类包装后再采集的可能 —— 那时 stdout 前面会有 npm 的
+ * `> pkg@x test` 两行横幅。把版本头钉死在第一行会让这种**真实且完整**的
+ * 输出被判成「无法判定」，正好是本模块要避免的假阴性。所以这里只要求：
+ * 版本头**恰好一处**，且出现在汇总块**之前**。
+ */
+const TAP_VERSION_PATTERN = /^TAP version 13[ \t]*$/;
+
+/**
+ * TAP 汇总块的**计数字段**。`suites` 只统计套件数，不参与用例数自洽校验，
+ * 但它是真实输出的固定组成部分，B16 起同样**必须存在**。
  *
  * 真实采集于 Node v22.22.2、`node --test`（默认 reporter 就是 TAP），
- * 样本见 `tests/executor/evidence.test.ts` 的 `REAL_TAP_*` 常量：
+ * 原始样本见 `tests/executor/windows-integration.test.ts` 的 `REAL_TAP_*` 常量
+ * 与 `docs/reports/B13-*.md`：
  * ```text
  * TAP version 13
  * # Subtest: alpha
@@ -104,33 +126,80 @@ function parseTestsLineSummary(output: string): TestEvidence["summary"] | null {
  * # cancelled 0
  * # skipped 0
  * # todo 0
- * # duration_ms 288.5386
+ * # duration_ms 288.5386      ← 终止标记（最后一行）
  * ```
  *
- * 已实测确认的两件事（**不要凭记忆改**）：
+ * 已实测确认（**不要凭记忆改**）：
  * - 汇总块在整份输出里**只有一处**，且**不缩进**；即使跑多个测试文件或
  *   含嵌套 describe 子测试，也只输出一个聚合汇总。
- * - 因此可用「同一字段出现多个不同值」判定汇总重复/畸形。
+ * - `duration_ms` 的 YAML 形式（`  duration_ms: 1.0889`，缩进 + 冒号）
+ *   与被解析的汇总行（`# duration_ms 1.0889`）形态不同，不会互相污染。
  */
-const TAP_SUMMARY_FIELDS = ["tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"] as const;
+const TAP_COUNT_FIELDS = ["tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"] as const;
 
-/** 收集某个 TAP 汇总字段在输出里出现的全部取值（按出现顺序）。 */
-function collectTapFieldValues(output: string, field: string): number[] {
-  // 行首可有空白，但整行只允许 `# <字段> <整数>`，避免把正文里的
-  // `# pass` 之类偶然文本也算进来。
-  const pattern = new RegExp(`^[ \\t]*#\\s*${field}\\s+(\\d+)\\s*$`, "gim");
-  const values: number[] = [];
-  for (const match of output.matchAll(pattern)) values.push(Number(match[1]));
-  return values;
+/** 汇总块的终止标记字段名。 */
+const TAP_TERMINATOR_FIELD = "duration_ms";
+
+/** 某个 TAP 汇总字段的一次出现（取值 + 所在行号）。 */
+interface TapFieldOccurrence {
+  value: number;
+  lineIndex: number;
 }
 
 /**
- * TAP 汇总块解析（B13）。
+ * 收集某个 TAP 汇总字段在输出里出现的全部位置（按出现顺序）。
+ *
+ * 行首可有空白，但整行只允许 `# <字段> <数字>`，避免把正文里的
+ * `# pass` 之类偶然文本也算进来。数字允许小数是给 `duration_ms` 用的；
+ * 计数字段另做整数校验（`# tests 2.5` 属畸形，判不了）。
+ */
+function collectTapFieldOccurrences(lines: readonly string[], field: string): TapFieldOccurrence[] {
+  const pattern = new RegExp(`^[ \\t]*#\\s*${field}\\s+(\\d+(?:\\.\\d+)?)[ \\t]*$`);
+  const occurrences: TapFieldOccurrence[] = [];
+  lines.forEach((line, lineIndex) => {
+    const match = pattern.exec(line);
+    if (match) occurrences.push({ value: Number(match[1]), lineIndex });
+  });
+  return occurrences;
+}
+
+/** 找出所有版本头行的行号（用于校验「恰好一处」且「在汇总之前」）。 */
+function findTapVersionLines(lines: readonly string[]): number[] {
+  const hits: number[] = [];
+  lines.forEach((line, lineIndex) => {
+    if (TAP_VERSION_PATTERN.test(line)) hits.push(lineIndex);
+  });
+  return hits;
+}
+
+/**
+ * TAP 汇总块解析（B13；B16 收紧为「只认完整输出」）。
+ *
+ * B16 背景（A 端 B15 复核）：B13 只强制要求 `tests/pass/fail` 三项，缺
+ * `suites/cancelled/skipped/todo` 时按 0 补，也不要求版本头与终止标记。
+ * 于是下面两份**不完整**的输入都会报出通过数：
+ * ```text
+ * parseTestSummary("# tests 1\n# pass 1\n# fail 0")
+ *   → { passed: 1, failed: 0, skipped: 0 }
+ * parseTestSummary("TAP version 13\n# tests 2\n# pass 2\n# fail 0")
+ *   → { passed: 2, failed: 0, skipped: 0 }
+ * ```
+ * 前者连「像 TAP」都不成立；后者看着像，但真跑完的 Node 输出不可能只有
+ * 三行汇总。**按缺失字段补 0 就等于替真实运行「补结论」**，这是本模块
+ * 最不能出的错，故 B16 改为：只有识别到**结构完整**的 TAP v13 输出才返回摘要。
  *
  * fail closed 原则：下面任何一种情况都返回 `null`（由调用方按「无法判定」处理），
  * 而不是猜一个看起来合理的数字：
- * - 缺 `# tests` / `# pass` / `# fail` 任一必需字段；
- * - 同一字段出现**多个互相矛盾**的值（汇总块重复或被正文污染）；
+ * - **缺版本头** `TAP version 13`（整行、不缩进）：不是 Node TAP 输出；
+ *   版本头出现**不止一次**也拒绝（两次输出被拼在一起）；
+ * - `tests/suites/pass/fail/cancelled/skipped/todo` 或终止标记 `duration_ms`
+ *   有**任何一个缺失**；
+ * - 汇总块出现在版本头**之前**（顺序不对 = 输出被拼接/改写）；
+ * - 任一汇总字段出现**不止一次**（真实输出只有一个汇总块；重复说明输出被
+ *   拼接或污染，此时「取其中一个」没有依据。**数值一致也一律拒绝**）；
+ * - 计数字段不是整数；
+ * - `duration_ms` **不是汇总块的最后一个字段**（其后又冒出计数行 = 汇总块之后
+ *   还有第二次汇总，终止标记不算终止）；
  * - `# tests` 为 0（没有任何用例 = 没有测试结果）；
  * - 汇总不自洽：`pass + fail + cancelled + skipped + todo !== tests`
  *   （唯一实测反例是 `pass 0 / fail 0 / cancelled 1 / tests 1`，
@@ -141,24 +210,42 @@ function collectTapFieldValues(output: string, field: string): number[] {
  * 退化成与「解析失败」默认值 `0/0/0` 完全相同的形状，便于事后区分。
  */
 function parseTapSummary(output: string): TestEvidence["summary"] | null {
-  const seen = new Map<string, number>();
-  for (const field of TAP_SUMMARY_FIELDS) {
-    const values = collectTapFieldValues(output, field);
-    if (values.length === 0) continue;
-    const first = values[0]!;
-    // 重复但一致：视为同一汇总块（无害）；重复且矛盾：无法判定
-    if (values.some((value) => value !== first)) return null;
-    seen.set(field, first);
+  const lines = output.split(/\r?\n/);
+
+  // ① 版本头：整份输出里**恰好一处**（见 TAP_VERSION_PATTERN 的说明）
+  const versionLines = findTapVersionLines(lines);
+  if (versionLines.length !== 1) return null;
+  const versionLineIndex = versionLines[0]!;
+
+  // ② 每个字段必须**恰好出现一次**：缺失、重复（含数值一致的重复）都判不了；
+  //    且汇总块必须在版本头**之后**
+  const counts = new Map<string, TapFieldOccurrence>();
+  let terminator: TapFieldOccurrence | null = null;
+  for (const field of [...TAP_COUNT_FIELDS, TAP_TERMINATOR_FIELD]) {
+    const occurrences = collectTapFieldOccurrences(lines, field);
+    if (occurrences.length !== 1) return null;
+    const only = occurrences[0]!;
+    if (only.lineIndex < versionLineIndex) return null;
+    if (field === TAP_TERMINATOR_FIELD) {
+      terminator = only;
+    } else {
+      if (!Number.isInteger(only.value)) return null;
+      counts.set(field, only);
+    }
   }
 
-  const tests = seen.get("tests");
-  const pass = seen.get("pass");
-  const fail = seen.get("fail");
-  if (tests === undefined || pass === undefined || fail === undefined) return null;
+  // ③ 终止标记必须是汇总块的**最后一行**：其后不得再出现任何计数字段
+  const terminatorLine = terminator!.lineIndex;
+  for (const occurrence of counts.values()) {
+    if (occurrence.lineIndex > terminatorLine) return null;
+  }
 
-  const cancelled = seen.get("cancelled") ?? 0;
-  const skipped = seen.get("skipped") ?? 0;
-  const todo = seen.get("todo") ?? 0;
+  const tests = counts.get("tests")!.value;
+  const pass = counts.get("pass")!.value;
+  const fail = counts.get("fail")!.value;
+  const cancelled = counts.get("cancelled")!.value;
+  const skipped = counts.get("skipped")!.value;
+  const todo = counts.get("todo")!.value;
 
   // 没有任何用例：不能算作「测试通过」
   if (tests < 1) return null;

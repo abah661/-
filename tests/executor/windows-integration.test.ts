@@ -731,8 +731,13 @@ describe("真实测试输出解析（evidence.ts）", () => {
  *
  * 下面所有样本都是**真实采集**的（Node v22.22.2、`node --test`），
  * 采集脚本与原始输出见 docs/reports/B13-*.md；**不要凭记忆改这些常量**。
+ *
+ * B16 背景（A 端 B15 复核）：B13 的 fail-closed 只强制 `tests/pass/fail`，
+ * 缺 `suites/cancelled/skipped/todo` 时按 0 补，也不要求版本头与终止标记，
+ * 于是「不完整 TAP 片段」也能报出通过数。现收紧为**只认结构完整的
+ * TAP v13 输出**；下面同时保留 A 给出的两份不完整输入作为拒绝用例。
  */
-describe("Node 内置运行器 TAP 汇总解析（evidence.ts，B13）", () => {
+describe("Node 内置运行器 TAP 汇总解析（evidence.ts，B13；B16 只认完整输出）", () => {
   /** P3 目标仓库首轮真实输出（TASK-1001-A2），2 passed / 0 failed、退出码 0 */
   const REAL_TAP_P3 = [
     "TAP version 13",
@@ -864,6 +869,42 @@ describe("Node 内置运行器 TAP 汇总解析（evidence.ts，B13）", () => {
     "",
   ].join("\n");
 
+  /**
+   * 真实「测试文件顶层抛异常（加载失败）」样本。
+   *
+   * 之所以要留这份：汇总块之前有一大段 `# ...` **注释行**（堆栈、`# Node.js v22.22.2`），
+   * 是「正文污染汇总解析」最像真的反例 —— 解析器必须只认
+   * `# <字段> <数字>` 这种整行形态，不能被这些注释行带偏。
+   */
+  const REAL_TAP_LOAD_FAILURE = [
+    "TAP version 13",
+    "# file:///C:/Users/lenovo/AppData/Local/Temp/b13tap-O9SV9t/case-eg38m4/boom.test.mjs:1",
+    "# throw new Error(\"boom at load time\");",
+    "#       ^",
+    "# Error: boom at load time",
+    "#     at file:///C:/Users/lenovo/AppData/Local/Temp/b13tap-O9SV9t/case-eg38m4/boom.test.mjs:1:7",
+    "#     at ModuleJob.run (node:internal/modules/esm/module_job:343:25)",
+    "# Node.js v22.22.2",
+    "# Subtest: boom.test.mjs",
+    "not ok 1 - boom.test.mjs",
+    "  ---",
+    "  duration_ms: 207.6076",
+    "  type: 'test'",
+    "  failureType: 'testCodeFailure'",
+    "  code: 'ERR_TEST_FAILURE'",
+    "  ...",
+    "1..1",
+    "# tests 1",
+    "# suites 0",
+    "# pass 0",
+    "# fail 1",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 220.3114",
+    "",
+  ].join("\n");
+
   it("解析 P3 真实 TAP 输出：2 passed / 0 failed（本次 422 的修复点）", () => {
     expect(parseTestSummary(REAL_TAP_P3)).toEqual({ passed: 2, failed: 0, skipped: 0 });
   });
@@ -908,36 +949,45 @@ describe("Node 内置运行器 TAP 汇总解析（evidence.ts，B13）", () => {
   });
 
   it("缺必需字段（无 # fail）时 fail closed，不按 0 猜", () => {
-    const missingFail = [
-      "# tests 2",
-      "# pass 2",
-      "# skipped 0",
-      "# todo 0",
-      "",
-    ].join("\n");
-    expect(parseTestSummary(missingFail)).toBeNull();
-
-    const missingPass = ["# tests 2", "# fail 0", ""].join("\n");
-    expect(parseTestSummary(missingPass)).toBeNull();
-
-    const missingTests = ["# pass 2", "# fail 0", ""].join("\n");
-    expect(parseTestSummary(missingTests)).toBeNull();
+    // B16 起用「完整块抽掉一行」构造：唯一差异就是缺了那个字段，
+    // 否则用例会因为「缺版本头」而通过，测不到本来要测的规则。
+    expect(parseTestSummary(withoutLine("# fail 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# pass 1"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# tests 1"))).toBeNull();
   });
 
   it("汇总互相矛盾（重复字段取不同值）时 fail closed", () => {
     const contradictory = [
+      "TAP version 13",
+      "1..2",
       "# tests 2",
+      "# suites 0",
       "# pass 2",
       "# fail 0",
-      "# tests 5",
-      "# pass 3",
+      "# tests 5", // ← 同一字段再次出现且数值不同
+      "# cancelled 0",
+      "# skipped 0",
+      "# todo 0",
+      "# duration_ms 12.5",
       "",
     ].join("\n");
     expect(parseTestSummary(contradictory)).toBeNull();
   });
 
   it("汇总不自洽（各项之和 ≠ tests）时 fail closed", () => {
-    const inconsistent = ["# tests 10", "# pass 2", "# fail 0", "# skipped 0", "# todo 0", ""].join("\n");
+    const inconsistent = [
+      "TAP version 13",
+      "1..10",
+      "# tests 10",
+      "# suites 0",
+      "# pass 2",
+      "# fail 0",
+      "# cancelled 0",
+      "# skipped 0",
+      "# todo 0",
+      "# duration_ms 12.5",
+      "",
+    ].join("\n");
     expect(parseTestSummary(inconsistent)).toBeNull();
   });
 
@@ -957,21 +1007,119 @@ describe("Node 内置运行器 TAP 汇总解析（evidence.ts，B13）", () => {
     expect(parseTestSummary("")).toBeNull();
   });
 
-  it("重复但一致的汇总块仍可解析（不因重复本身判失败）", () => {
-    const duplicated = [
-      "# tests 2",
-      "# pass 2",
+  /* ------------------------------------------------------------------ *
+   * B16：只认「结构完整」的 TAP v13 输出（A 端 B15 复核）
+   *
+   * A 在 B15 候选上实跑，指出 B13 只要凑齐 `tests/pass/fail` 就出摘要，
+   * 缺字段按 0 补 —— 于是**不完整/被截断**的片段也会报出通过数。
+   * 下面用「抽掉某一行」的方式逐项证明每个必需成分都真的被强制。
+   * ------------------------------------------------------------------ */
+
+  /** 一份结构完整的汇总块；每个必需成分都能被单独抽掉做拒绝用例。 */
+  const COMPLETE_SUMMARY_LINES = [
+    "TAP version 13",
+    "# Subtest: alpha",
+    "ok 1 - alpha",
+    "1..1",
+    "# tests 1",
+    "# suites 0",
+    "# pass 1",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 12.5",
+  ];
+  const completeSummary = (): string => [...COMPLETE_SUMMARY_LINES, ""].join("\n");
+  const withoutLine = (needle: string): string =>
+    [...COMPLETE_SUMMARY_LINES.filter((line) => line !== needle), ""].join("\n");
+
+  it("B16 正对照：结构完整的汇总块仍能解析（证明拒绝用例不是假阴性）", () => {
+    expect(parseTestSummary(completeSummary())).toEqual({ passed: 1, failed: 0, skipped: 0 });
+  });
+
+  it("B16：A 给出的两份不完整输入必须拒绝（B13 曾分别报出 1 / 2 个通过）", () => {
+    // A 端原文：`parseTestSummary("# tests 1\n# pass 1\n# fail 0")` → { passed: 1, … }
+    expect(parseTestSummary("# tests 1\n# pass 1\n# fail 0")).toBeNull();
+    // A 端原文：`parseTestSummary("TAP version 13\n# tests 2\n# pass 2\n# fail 0")` → { passed: 2, … }
+    expect(parseTestSummary("TAP version 13\n# tests 2\n# pass 2\n# fail 0")).toBeNull();
+  });
+
+  it("B16：有完整汇总字段但缺版本头 `TAP version 13` → 拒绝", () => {
+    expect(parseTestSummary(withoutLine("TAP version 13"))).toBeNull();
+  });
+
+  it("B16：版本头不必是第一行（经 `npm test` 包装仍有 npm 横幅）→ 仍能解析", () => {
+    // 为什么要有这一条：执行器的测试命令直接拉起 `node --test` 时 stdout
+    // 第一行就是版本头，但若将来经 `npm test` 之类包装，前面会多出 npm 的
+    // `> pkg@x.y.z test` 两行横幅 —— 这种输出**真实且完整**，不能判成「无法判定」。
+    const wrapped = ["> demo@1.0.0 test", "> node --test", "", ...COMPLETE_SUMMARY_LINES, ""].join("\n");
+    expect(parseTestSummary(wrapped)).toEqual({ passed: 1, failed: 0, skipped: 0 });
+  });
+
+  it("B16：版本头出现两次（两段输出被拼接）→ 拒绝", () => {
+    const twoHeaders = [...COMPLETE_SUMMARY_LINES.slice(0, 1), ...COMPLETE_SUMMARY_LINES, ""].join("\n");
+    expect(parseTestSummary(twoHeaders)).toBeNull();
+  });
+
+  it("B16：汇总块出现在版本头之前（顺序被改写）→ 拒绝", () => {
+    const summaryFirst = [...COMPLETE_SUMMARY_LINES.slice(1), COMPLETE_SUMMARY_LINES[0]!, ""].join("\n");
+    expect(parseTestSummary(summaryFirst)).toBeNull();
+  });
+
+  it("B16：缺终止标记 `# duration_ms`（输出被截断）→ 拒绝", () => {
+    expect(parseTestSummary(withoutLine("# duration_ms 12.5"))).toBeNull();
+  });
+
+  it("B16：缺 suites / cancelled / skipped / todo 任一 → 拒绝（不再按 0 补）", () => {
+    expect(parseTestSummary(withoutLine("# suites 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# cancelled 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# skipped 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# todo 0"))).toBeNull();
+  });
+
+  it("B16：终止标记不在末尾（其后仍有计数字段）→ 拒绝", () => {
+    const movedUp = [
+      "TAP version 13",
+      "1..1",
+      "# tests 1",
+      "# suites 0",
+      "# pass 1",
       "# fail 0",
+      "# cancelled 0",
       "# skipped 0",
-      "# todo 0",
-      "# tests 2",
-      "# pass 2",
-      "# fail 0",
-      "# skipped 0",
-      "# todo 0",
+      "# duration_ms 12.5", // ← 提前出现，不再是「终止」标记
+      "# todo 0", // ← 终止标记之后又冒出计数字段
       "",
     ].join("\n");
-    expect(parseTestSummary(duplicated)).toEqual({ passed: 2, failed: 0, skipped: 0 });
+    expect(parseTestSummary(movedUp)).toBeNull();
+  });
+
+  it("B16：计数字段不是整数（畸形汇总）→ 拒绝", () => {
+    const fractional = COMPLETE_SUMMARY_LINES.map((line) =>
+      line === "# tests 1" ? "# tests 1.5" : line,
+    )
+      .concat("")
+      .join("\n");
+    expect(parseTestSummary(fractional)).toBeNull();
+  });
+
+  it("B16：正文含 `# ` 注释行（真实加载失败样本）仍能正确解析", () => {
+    const summary = parseTestSummary(REAL_TAP_LOAD_FAILURE);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(0);
+    expect(summary!.failed).toBe(1);
+    expect(summary!.skipped).toBe(0);
+  });
+
+  it("B16：汇总块重复（即使数值完全一致）不再接受", () => {
+    // 真实 node --test 只输出一个汇总块；出现两次说明输出被拼接/污染，
+    // 「取其中一个」没有依据 → 判不了。
+    expect(parseTestSummary(completeSummary() + completeSummary())).toBeNull();
+
+    // 单个计数字段重复出现同理（B13 曾把「重复但一致」当无害）。
+    const duplicatedField = COMPLETE_SUMMARY_LINES.concat(["# pass 1", ""]).join("\n");
+    expect(parseTestSummary(duplicatedField)).toBeNull();
   });
 
   it("既有 vitest/jest 解析不受影响（回归）", () => {

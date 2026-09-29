@@ -720,6 +720,271 @@ describe("真实测试输出解析（evidence.ts）", () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * 三之二、Node 内置测试运行器（TAP）汇总解析 —— B13
+ * ------------------------------------------------------------------ */
+
+/**
+ * B13 背景（A 端 P3 首轮真实运行裁定）：P3 目标仓库用 `node --test`
+ * （Node 内置运行器，默认输出 TAP），而 parseTestSummary 此前只认 vitest/jest
+ * 的 `Tests` 行，于是**真实全绿**的一次运行被解析成 `passed: 0`，
+ * 上报被协调器以 RESULT_SCHEMA_INVALID 正确拒绝。
+ *
+ * 下面所有样本都是**真实采集**的（Node v22.22.2、`node --test`），
+ * 采集脚本与原始输出见 docs/reports/B13-*.md；**不要凭记忆改这些常量**。
+ */
+describe("Node 内置运行器 TAP 汇总解析（evidence.ts，B13）", () => {
+  /** P3 目标仓库首轮真实输出（TASK-1001-A2），2 passed / 0 failed、退出码 0 */
+  const REAL_TAP_P3 = [
+    "TAP version 13",
+    "# Subtest: 冻结契约只要求字符串 id 和 name",
+    "ok 1 - 冻结契约只要求字符串 id 和 name",
+    "  ---",
+    "  duration_ms: 1.0889",
+    "  type: 'test'",
+    "  ...",
+    "# Subtest: getUser returns the frozen UserProfile shape",
+    "ok 2 - getUser returns the frozen UserProfile shape",
+    "  ---",
+    "  duration_ms: 0.7298",
+    "  type: 'test'",
+    "  ...",
+    "1..2",
+    "# tests 2",
+    "# suites 0",
+    "# pass 2",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 161.1573",
+    "",
+  ].join("\n");
+
+  /** 真实失败样本：1 passed / 1 failed */
+  const REAL_TAP_WITH_FAILURE = [
+    "TAP version 13",
+    "# Subtest: alpha",
+    "ok 1 - alpha",
+    "# Subtest: beta",
+    "not ok 2 - beta",
+    "  ---",
+    "  failureType: 'testCodeFailure'",
+    "  code: 'ERR_ASSERTION'",
+    "  ...",
+    "1..2",
+    "# tests 2",
+    "# suites 0",
+    "# pass 1",
+    "# fail 1",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 271.8326",
+    "",
+  ].join("\n");
+
+  /** 真实 skip + todo 样本（注意 `# pass` 不含被跳过的用例） */
+  const REAL_TAP_WITH_SKIP_TODO = [
+    "TAP version 13",
+    "# Subtest: alpha",
+    "ok 1 - alpha",
+    "# Subtest: beta",
+    "ok 2 - beta # SKIP",
+    "# Subtest: gamma",
+    "ok 3 - gamma # TODO",
+    "1..3",
+    "# tests 3",
+    "# suites 0",
+    "# pass 1",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 1",
+    "# todo 1",
+    "# duration_ms 233.1165",
+    "",
+  ].join("\n");
+
+  /** 真实嵌套 describe 样本：`# tests` 含子测试（3），`# suites` 单列 */
+  const REAL_TAP_NESTED = [
+    "TAP version 13",
+    "# Subtest: outer",
+    "    # Subtest: inner-a",
+    "    ok 1 - inner-a",
+    "    1..2",
+    "ok 1 - outer",
+    "  ---",
+    "  type: 'suite'",
+    "  ...",
+    "# Subtest: sibling",
+    "ok 2 - sibling",
+    "1..2",
+    "# tests 3",
+    "# suites 1",
+    "# pass 3",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 262.3032",
+    "",
+  ].join("\n");
+
+  /** 真实「无任何测试文件」样本：tests 为 0 —— 没有测试结果，不能算通过 */
+  const REAL_TAP_NO_TESTS = [
+    "TAP version 13",
+    "1..0",
+    "# tests 0",
+    "# suites 0",
+    "# pass 0",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 11.7005",
+    "",
+  ].join("\n");
+
+  /** 真实「用例被取消」样本：pass 0 / fail 0 / cancelled 1 */
+  const REAL_TAP_CANCELLED = [
+    "TAP version 13",
+    "# Subtest: slow.test.mjs",
+    "not ok 1 - slow.test.mjs",
+    "  ---",
+    "  failureType: 'cancelledByParent'",
+    "  ...",
+    "1..1",
+    "# tests 1",
+    "# suites 0",
+    "# pass 0",
+    "# fail 0",
+    "# cancelled 1",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 216.8423",
+    "",
+  ].join("\n");
+
+  it("解析 P3 真实 TAP 输出：2 passed / 0 failed（本次 422 的修复点）", () => {
+    expect(parseTestSummary(REAL_TAP_P3)).toEqual({ passed: 2, failed: 0, skipped: 0 });
+  });
+
+  it("解析真实 TAP 失败输出：failed 非零", () => {
+    const summary = parseTestSummary(REAL_TAP_WITH_FAILURE);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(1);
+    expect(summary!.failed).toBe(1);
+    expect(summary!.skipped).toBe(0);
+  });
+
+  it("解析真实 TAP skip + todo：skipped 单独计数，不计入 passed", () => {
+    const summary = parseTestSummary(REAL_TAP_WITH_SKIP_TODO);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(1);
+    expect(summary!.failed).toBe(0);
+    expect(summary!.skipped).toBe(1);
+  });
+
+  it("嵌套 describe：tests 含子测试，suites 不参与用例数", () => {
+    expect(parseTestSummary(REAL_TAP_NESTED)).toEqual({ passed: 3, failed: 0, skipped: 0 });
+  });
+
+  it("cancelled 计入 failed：不制造 passed>0 且 failed=0 的假绿", () => {
+    const summary = parseTestSummary(REAL_TAP_CANCELLED);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(0);
+    expect(summary!.failed).toBe(1);
+  });
+
+  it("CRLF 换行同样可解析（Windows 真实输出）", () => {
+    expect(parseTestSummary(REAL_TAP_P3.replace(/\n/g, "\r\n"))).toEqual({
+      passed: 2,
+      failed: 0,
+      skipped: 0,
+    });
+  });
+
+  it("tests 为 0 = 没有测试结果，fail closed", () => {
+    expect(parseTestSummary(REAL_TAP_NO_TESTS)).toBeNull();
+  });
+
+  it("缺必需字段（无 # fail）时 fail closed，不按 0 猜", () => {
+    const missingFail = [
+      "# tests 2",
+      "# pass 2",
+      "# skipped 0",
+      "# todo 0",
+      "",
+    ].join("\n");
+    expect(parseTestSummary(missingFail)).toBeNull();
+
+    const missingPass = ["# tests 2", "# fail 0", ""].join("\n");
+    expect(parseTestSummary(missingPass)).toBeNull();
+
+    const missingTests = ["# pass 2", "# fail 0", ""].join("\n");
+    expect(parseTestSummary(missingTests)).toBeNull();
+  });
+
+  it("汇总互相矛盾（重复字段取不同值）时 fail closed", () => {
+    const contradictory = [
+      "# tests 2",
+      "# pass 2",
+      "# fail 0",
+      "# tests 5",
+      "# pass 3",
+      "",
+    ].join("\n");
+    expect(parseTestSummary(contradictory)).toBeNull();
+  });
+
+  it("汇总不自洽（各项之和 ≠ tests）时 fail closed", () => {
+    const inconsistent = ["# tests 10", "# pass 2", "# fail 0", "# skipped 0", "# todo 0", ""].join("\n");
+    expect(parseTestSummary(inconsistent)).toBeNull();
+  });
+
+  it("输出被截断（只有测试行、没有汇总块）时 fail closed", () => {
+    const truncated = [
+      "TAP version 13",
+      "# Subtest: alpha",
+      "ok 1 - alpha",
+      "",
+    ].join("\n");
+    expect(parseTestSummary(truncated)).toBeNull();
+  });
+
+  it("只有零星字段、凑不成完整汇总时 fail closed", () => {
+    expect(parseTestSummary("# pass 3")).toBeNull();
+    expect(parseTestSummary("all 3 tests passed")).toBeNull();
+    expect(parseTestSummary("")).toBeNull();
+  });
+
+  it("重复但一致的汇总块仍可解析（不因重复本身判失败）", () => {
+    const duplicated = [
+      "# tests 2",
+      "# pass 2",
+      "# fail 0",
+      "# skipped 0",
+      "# todo 0",
+      "# tests 2",
+      "# pass 2",
+      "# fail 0",
+      "# skipped 0",
+      "# todo 0",
+      "",
+    ].join("\n");
+    expect(parseTestSummary(duplicated)).toEqual({ passed: 2, failed: 0, skipped: 0 });
+  });
+
+  it("既有 vitest/jest 解析不受影响（回归）", () => {
+    expect(parseTestSummary("      Tests  16 passed (16)")).toEqual({ passed: 16, failed: 0, skipped: 0 });
+    expect(parseTestSummary("Tests:       1 failed, 79 passed, 2 skipped, 82 total")).toEqual({
+      passed: 79,
+      failed: 1,
+      skipped: 2,
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * 四、真实 OpenCode 调用（可选联网/需登录）
  * ------------------------------------------------------------------ */
 

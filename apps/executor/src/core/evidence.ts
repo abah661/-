@@ -31,6 +31,23 @@ export interface RunEvidenceInput {
  * 由调用方决定按「无法判定」处理——**不要猜**，
  * 猜错的汇总数字会让 V06 的「测试必须全绿」变成假通过。
  *
+ * 目前认识两类格式：
+ * 1. vitest / jest 的 `Tests` 行（见 `parseTestsLineSummary`）
+ * 2. TAP 汇总块（`node --test` 的默认输出，见 `parseTapSummary`）
+ *
+ * B13（A 端 P3 首轮真实运行裁定）：此前只认第 1 类，而 P3 目标仓库用的是
+ * Node 内置测试运行器（TAP），于是真实全绿的一次运行被解析成 `passed: 0`，
+ * 上报被协调器以 `RESULT_SCHEMA_INVALID` 正确拒绝。**不能靠退出码 0
+ * 或普通文本反推「测试通过」**，只能扩展解析器认识真实格式。
+ */
+export function parseTestSummary(output: string): TestEvidence["summary"] | null {
+  // 先试 vitest/jest（顺序保持原样，避免改变既有行为），再试 TAP。
+  return parseTestsLineSummary(output) ?? parseTapSummary(output);
+}
+
+/**
+ * vitest / jest 的 `Tests` 行。
+ *
  * 真实输出样本（vitest 3.x，由 tests/executor/windows-integration.test.ts
  * 用真实运行采集，**不要凭记忆改这些正则**）：
  * - 全绿：  `      Tests  16 passed (16)`
@@ -41,7 +58,7 @@ export interface RunEvidenceInput {
  * 注意竖线格式曾漏掉，导致**真实失败**的运行被判为「无法判定」——
  * 这正是最不能出错的分支，故此处按分段解析而非单条大正则。
  */
-export function parseTestSummary(output: string): TestEvidence["summary"] | null {
+function parseTestsLineSummary(output: string): TestEvidence["summary"] | null {
   /**
    * 在「Tests」行内逐段统计。
    *
@@ -67,6 +84,87 @@ export function parseTestSummary(output: string): TestEvidence["summary"] | null
   // 一段都没认出 = 格式不认识，交回调用方按「无法判定」处理
   if (passed + failed + skipped + todo === 0) return null;
   return { passed, failed, skipped };
+}
+
+/**
+ * TAP 汇总块字段名。`suites` 只统计套件数，不参与用例数自洽校验。
+ *
+ * 真实采集于 Node v22.22.2、`node --test`（默认 reporter 就是 TAP），
+ * 样本见 `tests/executor/evidence.test.ts` 的 `REAL_TAP_*` 常量：
+ * ```text
+ * TAP version 13
+ * # Subtest: alpha
+ * ok 1 - alpha
+ * ...
+ * 1..2
+ * # tests 2
+ * # suites 0
+ * # pass 2
+ * # fail 0
+ * # cancelled 0
+ * # skipped 0
+ * # todo 0
+ * # duration_ms 288.5386
+ * ```
+ *
+ * 已实测确认的两件事（**不要凭记忆改**）：
+ * - 汇总块在整份输出里**只有一处**，且**不缩进**；即使跑多个测试文件或
+ *   含嵌套 describe 子测试，也只输出一个聚合汇总。
+ * - 因此可用「同一字段出现多个不同值」判定汇总重复/畸形。
+ */
+const TAP_SUMMARY_FIELDS = ["tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"] as const;
+
+/** 收集某个 TAP 汇总字段在输出里出现的全部取值（按出现顺序）。 */
+function collectTapFieldValues(output: string, field: string): number[] {
+  // 行首可有空白，但整行只允许 `# <字段> <整数>`，避免把正文里的
+  // `# pass` 之类偶然文本也算进来。
+  const pattern = new RegExp(`^[ \\t]*#\\s*${field}\\s+(\\d+)\\s*$`, "gim");
+  const values: number[] = [];
+  for (const match of output.matchAll(pattern)) values.push(Number(match[1]));
+  return values;
+}
+
+/**
+ * TAP 汇总块解析（B13）。
+ *
+ * fail closed 原则：下面任何一种情况都返回 `null`（由调用方按「无法判定」处理），
+ * 而不是猜一个看起来合理的数字：
+ * - 缺 `# tests` / `# pass` / `# fail` 任一必需字段；
+ * - 同一字段出现**多个互相矛盾**的值（汇总块重复或被正文污染）；
+ * - `# tests` 为 0（没有任何用例 = 没有测试结果）；
+ * - 汇总不自洽：`pass + fail + cancelled + skipped + todo !== tests`
+ *   （唯一实测反例是 `pass 0 / fail 0 / cancelled 1 / tests 1`，
+ *   即用例被取消 —— 不把 `cancelled` 计入就会与实测对不上）。
+ *
+ * `cancelled` 计入 `failed`：被取消的用例既不是通过也不是失败，但绝不能
+ * 让它落进「passed>0 且 failed=0」的假绿组合里。这样 `summary` 也**不会**
+ * 退化成与「解析失败」默认值 `0/0/0` 完全相同的形状，便于事后区分。
+ */
+function parseTapSummary(output: string): TestEvidence["summary"] | null {
+  const seen = new Map<string, number>();
+  for (const field of TAP_SUMMARY_FIELDS) {
+    const values = collectTapFieldValues(output, field);
+    if (values.length === 0) continue;
+    const first = values[0]!;
+    // 重复但一致：视为同一汇总块（无害）；重复且矛盾：无法判定
+    if (values.some((value) => value !== first)) return null;
+    seen.set(field, first);
+  }
+
+  const tests = seen.get("tests");
+  const pass = seen.get("pass");
+  const fail = seen.get("fail");
+  if (tests === undefined || pass === undefined || fail === undefined) return null;
+
+  const cancelled = seen.get("cancelled") ?? 0;
+  const skipped = seen.get("skipped") ?? 0;
+  const todo = seen.get("todo") ?? 0;
+
+  // 没有任何用例：不能算作「测试通过」
+  if (tests < 1) return null;
+  if (pass + fail + cancelled + skipped + todo !== tests) return null;
+
+  return { passed: pass, failed: fail + cancelled, skipped };
 }
 
 function sha256(value: string): string {

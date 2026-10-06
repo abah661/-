@@ -259,6 +259,20 @@ export interface HttpRequestSpec {
   idempotency_key?: string;
   /** 是否允许重试。默认 true */
   retry?: boolean;
+  /**
+   * 只读观察者（P1，B18）：**每次**拿到响应后回调一次，**含失败响应**
+   * （这样重试链里的 503 也看得到，最终状态码才不会被误记成首次的值）。
+   *
+   * 只承载可公开字段，绝不含请求头 / 响应体 / 凭据。
+   * 观察者抛错不影响请求结果 —— 它只观察，不具备改变请求结果的能力。
+   */
+  on_response?: (info: {
+    method: "GET" | "POST";
+    path: string;
+    status: number;
+    /** 从 0 起，重试时递增 */
+    attempt: number;
+  }) => void;
 }
 
 export interface HttpClientDeps {
@@ -364,6 +378,14 @@ export class CoordinatorClient {
           clearTimeout(timer);
         }
         status = response.status;
+        // 只读观察者：拿到状态码即回调，**先于**读取/解析响应体 ——
+        // 即使响应体处理随后失败，状态码也已被如实观察到。
+        // 观察者异常不得影响请求（它只观察，不做决定）。
+        try {
+          spec.on_response?.({ method: spec.method, path: spec.path, status, attempt });
+        } catch {
+          /* 观察者抛错：忽略，请求结果不受影响 */
+        }
         retryAfterMs = parseRetryAfter(response.headers.get("retry-after"), this.deps.now());
 
         const text = await response.text();

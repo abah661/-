@@ -128,6 +128,17 @@ export interface AttemptDeps {
   agent_config?: OpenCodeAdapterConfig;
   /** 注入 now() 便于测试确定性 */
   now?: () => number;
+  /**
+   * 阶段跃迁观察者（P2，B18）。
+   *
+   * `AttemptTrace.phases` 是**纯内存**的：进程一退，「这个 attempt 走过了
+   * 哪些阶段」就永久丢失。常驻入口据此把它**实时**写进审计日志
+   * （`.local/executor-audit/<attempt_id>.jsonl`）。
+   *
+   * 只读：抛错不影响编排。日志侧的 `detail` 会做有界校验，**禁止自由文本**
+   * 落盘（见 `core/audit.ts`）——所以这里原样透传，不在这里改写语义。
+   */
+  on_phase?: (phase: ExecutorPhase, detail?: string) => void;
 }
 
 /** 一步编排的可观测轨迹，便于测试与排障。 */
@@ -441,6 +452,13 @@ export async function runAttempt(input: AttemptInput, deps: AttemptDeps): Promis
   const setPhase = (phase: ExecutorPhase, detail?: string): void => {
     phases.push(phase);
     heartbeat.setPhase(phase, detail);
+    // P2（B18）：实时外发一次，供审计日志落盘。
+    // 只读观察者 —— 抛错不得影响编排，否则观测手段反而成了故障源。
+    try {
+      deps.on_phase?.(phase, detail);
+    } catch {
+      /* 观察者只观察 */
+    }
   };
 
   // running 必须带完整租约三元组（契约 §1）

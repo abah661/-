@@ -763,7 +763,15 @@ describe("HttpResultReporter", () => {
     });
     // 不得再套信封
     expect(fake.captured[0]!.body).not.toHaveProperty("report");
-    expect(out).toEqual({ accepted: true, state: "validating" });
+    // P1（B18，A 已批准）：ReportAck 新增 http_status / http_attempts。
+    // 这里保持**全量相等**（不是放宽成部分匹配）——新增字段必须被显式断言，
+    // 否则「收据能拿到状态码」这件事就没有测试锁住。
+    expect(out).toEqual({
+      accepted: true,
+      state: "validating",
+      http_status: 200,
+      http_attempts: 1,
+    });
   });
 
   it("旧 epoch 上报 → 409 上抛（说明该 attempt 已作废，不得伪装成功）", async () => {

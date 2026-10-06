@@ -57,7 +57,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import type { Capability, ErrorCode, ExecutorRegistration, Lease, ResultStatus, TaskNode, WriteScope } from "@dac/protocol";
+import type { Capability, ErrorCode, ExecutorRegistration, Lease, ResultReport, ResultStatus, TaskNode, WriteScope } from "@dac/protocol";
 import { ERROR_POLICY, blockedStatusFor } from "@dac/protocol";
 
 import {
@@ -95,6 +95,10 @@ import type {
   RecoveryTransport,
 } from "./core/recovery.js";
 import { git, removeWorktree } from "./core/worktree.js";
+import { buildReportReceipt, writeReportReceipt } from "./core/receipts.js";
+import type { ReportReceipt } from "./core/receipts.js";
+import { openAuditJournal } from "./core/audit.js";
+import type { AuditBase, AuditEventBody, AuditJournal } from "./core/audit.js";
 import {
   HttpHeartbeatTransport,
   HttpLeaseAcquirer,
@@ -107,6 +111,7 @@ import type {
   LeaseAcquirer,
   LeaseAcquisition,
   RegistrationTransport,
+  ReportAck,
   ResultReporter,
 } from "./transport/adapters.js";
 import { CoordinatorClient, CoordinatorHttpError, loadExecutorConfig, redactSecrets } from "./transport/http.js";
@@ -249,6 +254,22 @@ export interface DaemonDeps {
    * 记录一律留在磁盘上；真正清理走显式动作。
    */
   save_in_flight?: (record: InFlightRecord) => void;
+  /**
+   * 写成功上报收据（P1，B18）。未提供则不写。
+   *
+   * 收据是**追加式事实**，与 `.local/executor-attempts/`（恢复状态机）
+   * 分目录存放；不进上报体、不上传、不新增端点。写失败**应抛错**，
+   * 由主循环降级为一行日志并继续 —— 观测手段不得改变上报结论。
+   */
+  write_report_receipt?: (receipt: ReportReceipt) => void;
+  /**
+   * 为某个 attempt 打开审计日志（P2，B18）。返回 null 表示不记录。
+   *
+   * 只追加、不改恢复标记（`completed_phases`）语义、不新增端点；
+   * 读取走本机文件系统（`apps/executor/src/audit-read.ts`）。
+   * `on_error` 是降级日志出口（审计写失败不得影响 attempt 结果）。
+   */
+  open_audit_journal?: (base: AuditBase, on_error: (message: string) => void) => AuditJournal | null;
 }
 
 /** 一次 attempt 的本地记录。 */
@@ -563,6 +584,43 @@ export function clearInFlightRecord(
 }
 
 /* ------------------------------------------------------------------ *
+ * 上报收据 / 审计日志（P1 / P2，B18）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 收据存盘的默认实现（P1，B18）。
+ *
+ * 刻意与 `fileInFlightStore` **分开装配**：两者写不同目录、语义也不同
+ * （一个是恢复状态机，一个是追加式事实）。合成一个 store 会诱使后续
+ * 改动把它们当成同一件事，而 A 已裁定恢复标记语义不动。
+ */
+export function fileReceiptStore(
+  repoRoot: string,
+): Pick<DaemonDeps, "write_report_receipt"> {
+  return {
+    write_report_receipt: (receipt: ReportReceipt): void => {
+      // 写失败自然抛出 → 由主循环降级为一行日志。
+      writeReportReceipt(repoRoot, receipt);
+    },
+  };
+}
+
+/**
+ * 审计日志存盘的默认实现（P2，B18）。
+ *
+ * 路径落 `.local/executor-audit/`（已 gitignore，不进仓库）；
+ * 保留至 A 在 V01–V14 之后明确授权清理。
+ */
+export function fileAuditStore(
+  repoRoot: string,
+): Pick<DaemonDeps, "open_audit_journal"> {
+  return {
+    open_audit_journal: (base: AuditBase, on_error: (message: string) => void): AuditJournal =>
+      openAuditJournal(repoRoot, base, { on_error }),
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * 推送
  * ------------------------------------------------------------------ */
 
@@ -774,6 +832,29 @@ export async function runDaemon(
   const clock: LeaseClock = deps.clock ?? systemClock;
   const runner: AttemptRunner = deps.attempt_runner ?? runAttempt;
   const attemptRecords: DaemonAttemptRecord[] = [];
+  /**
+   * 当前 attempt 的审计日志（P2，B18）。
+   *
+   * 循环是顺序的，所以用单个变量即可；每次 attempt 开始时重新打开
+   * （`seq` 从已有行数续号），attempt 之间天然隔离。
+   */
+  let activeAudit: AuditJournal | null = null;
+
+  /**
+   * 追加一条审计事件（P2，B18）。
+   *
+   * **永不抛出**：审计是观测手段，写不进去不得影响 attempt 结果或停机判定。
+   * 这里再加一层守卫，是为了覆盖「注入的日志实现自己抛错」的情况 ——
+   * `AuditJournal.append` 按契约不抛，但契约之外的行为不能让编排买单。
+   */
+  const auditAppend = (event: AuditEventBody): void => {
+    if (activeAudit === null) return;
+    try {
+      activeAudit.append(event);
+    } catch {
+      log("[audit] 审计事件追加失败：降级继续，不影响本次结果");
+    }
+  };
 
   const report: DaemonReport = {
     stop_reason: "idle_limit",
@@ -804,6 +885,59 @@ export async function runDaemon(
     } catch {
       // 记录写不进去不应掩盖主流程结果；但必须留痕。
       log(`[in-flight] 状态写入失败（state=${state}）：继续，不影响本次结果`);
+    }
+    // P2（B18）：终态（非 `in_flight`）同时追加一条审计事实行。
+    // 审计记录**不参与任何门禁** —— 它只回答「发生过什么」。
+    if (state !== "in_flight") {
+      auditAppend({ event: "terminal", state });
+    }
+  };
+
+  /**
+   * 记录**一次上报**的结果：审计 `report` 事件 + 一张脱敏收据（P1/P2，B18）。
+   *
+   * 两条不可违反的边界：
+   * 1. **绝不改变控制流** —— 收据写失败只留一行降级日志；
+   * 2. `ack === null`（失败路径）时收据里不会出现应答，审计的 `accepted`
+   *    也记 null —— 失败不得被写成 `accepted: true`。
+   */
+  const recordReport = (args: {
+    task_id: string;
+    attempt_id: string;
+    lease_epoch: number;
+    report: ResultReport;
+    ack: ReportAck | null;
+    http_status: number | null;
+    http_attempts: number | null;
+    pushed: boolean;
+    commit_sha: string | null;
+    remote_sha: string | null;
+  }): void => {
+    auditAppend({
+      event: "report",
+      http_status: args.http_status,
+      accepted: args.ack === null ? null : args.ack.accepted,
+      result_status: args.report.status,
+    });
+    const sink = deps.write_report_receipt;
+    if (sink === undefined) return;
+    try {
+      sink(
+        buildReportReceipt({
+          task_id: args.task_id,
+          attempt_id: args.attempt_id,
+          lease_epoch: args.lease_epoch,
+          http_status: args.http_status,
+          http_attempts: args.http_attempts,
+          ack: args.ack,
+          report: args.report,
+          pushed: args.pushed,
+          commit_sha: args.commit_sha,
+          remote_sha: args.remote_sha,
+        }),
+      );
+    } catch {
+      log("[receipt] 上报收据写入失败：降级继续，不影响上报结论");
     }
   };
 
@@ -1060,6 +1194,24 @@ export async function runDaemon(
     };
     markInFlight(flightRecord, "in_flight");
 
+    /* --- P2：为本次 attempt 打开审计日志（只追加）------------- */
+    // 与恢复状态机（`.local/executor-attempts/`）分目录；不改其语义。
+    // 打开失败只降级为「本次不记录」，绝不阻断 attempt。
+    try {
+      activeAudit =
+        deps.open_audit_journal?.(
+          {
+            task_id: lease.task_id,
+            attempt_id: lease.attempt_id,
+            lease_epoch: lease.lease_epoch,
+          },
+          (message) => log(message),
+        ) ?? null;
+    } catch {
+      activeAudit = null;
+      log("[audit] 审计日志打开失败：本次不记录，继续执行 attempt");
+    }
+
     /* --- 6. 编排一次 attempt（续租/心跳在内部先于 agent 启动）- */
     const promptBuilder = options.prompt_for_task ?? buildTaskPrompt;
     const attemptInput: AttemptInput = {
@@ -1098,6 +1250,12 @@ export async function runDaemon(
         ...(options.agent_launcher !== undefined
           ? { agent_config: { launcher: options.agent_launcher } }
           : {}),
+        // P2（B18）：阶段跃迁**实时**写进审计日志。
+        // `detail` 在此只是**透传**；审计层会做有界校验，自由文本一律降级为
+        // null —— 它是防泄漏通道，不是记录自由文本的地方。
+        on_phase: (phase, detail) => {
+          auditAppend({ event: "phase", phase, outcome: detail ?? null });
+        },
       });
     } catch (error) {
       // ---- B10（A 端 B9 复验 §4）：异常不能一律当成「安全结束」------
@@ -1146,6 +1304,12 @@ export async function runDaemon(
       continue;
     }
 
+    /* --- P2：把「本次创建了哪个提交」记成独立事实行 -------------- */
+    // 只记**确实创建成功**的提交；未提交时什么都不写（缺行本身就是事实）。
+    if (outcome.commit?.committed === true && outcome.commit.sha !== null) {
+      auditAppend({ event: "commit", sha: outcome.commit.sha });
+    }
+
     /* --- 11b. 进程状态不安全 → attempt 内已短路（B12，A 端 B11 复验 P1）--- */
     //
     // 这次 attempt **既没取消、也没丢租约**：是 A 端裁定要求「`unknown` /
@@ -1166,7 +1330,7 @@ export async function runDaemon(
       );
       markInFlight(flightRecord, haltState);
       try {
-        await deps.result_reporter.report(outcome.report);
+        const ack = await deps.result_reporter.report(outcome.report);
         attemptRecords.push({
           task_id: task.task_id,
           attempt_id: lease.attempt_id,
@@ -1177,6 +1341,19 @@ export async function runDaemon(
           error_code: outcome.report.error_code,
         });
         log(`[report] 已上报 ${task.task_id} / ${lease.attempt_id}：${outcome.report.status}`);
+        // P1/P2：这条路径不推送，故 commit/remote SHA 一律 null。
+        recordReport({
+          task_id: task.task_id,
+          attempt_id: lease.attempt_id,
+          lease_epoch: lease.lease_epoch,
+          report: outcome.report,
+          ack,
+          http_status: ack.http_status ?? null,
+          http_attempts: ack.http_attempts ?? null,
+          pushed: false,
+          commit_sha: null,
+          remote_sha: null,
+        });
       } catch (error) {
         // 上报失败**不改变结论**：停机标记已经落盘，重启门禁仍会拦住新任务。
         attemptRecords.push({
@@ -1192,6 +1369,19 @@ export async function runDaemon(
           `[report] 上报失败（HTTP ${httpStatusOf(error) ?? "无"} / ${errorCodeOf(error)}）：` +
             "停机标记已保留，请人工确认进程已清理后再启动",
         );
+        // P1/P2：失败路径**不写 ack**（收据 ack 为 null），只记实际观察到的状态码。
+        recordReport({
+          task_id: task.task_id,
+          attempt_id: lease.attempt_id,
+          lease_epoch: lease.lease_epoch,
+          report: outcome.report,
+          ack: null,
+          http_status: httpStatusOf(error),
+          http_attempts: null,
+          pushed: false,
+          commit_sha: null,
+          remote_sha: null,
+        });
       }
       report.stop_reason = haltStopReasonFor(shortCircuitHalt.state);
       break;
@@ -1253,6 +1443,10 @@ export async function runDaemon(
 
     /* --- 8. 推送与「可整合」的前置条件（评审单 P0-3 / P0-4）--- */
     let pushed = false;
+    // P1（B18）：推送成功的两端 SHA 要带进收据，所以在这里提升为块外变量。
+    // 未推送时保持 null —— 收据据此区分「没推」与「推了」。
+    let pushedLocalSha: string | null = null;
+    let pushedRemoteSha: string | null = null;
     let reportToSend = outcome.report;
     const wouldPush = options.enable_push === true && hasPushCapability;
 
@@ -1306,6 +1500,8 @@ export async function runDaemon(
         pushed = push.pushed;
         if (pushed) {
           // 只有「远端 SHA 与本地 HEAD 逐字一致」才会走到这里（P0-3）
+          pushedLocalSha = push.local_sha;
+          pushedRemoteSha = push.remote_sha;
           log(
             `[push] 已推送并核对远端 ${branch}` +
               `（远端 ${(push.remote_sha ?? "").slice(0, 10)}）`,
@@ -1326,7 +1522,7 @@ export async function runDaemon(
 
     /* --- 9. 上报（幂等键由服务端按 task/attempt/epoch 计算）--- */
     try {
-      await deps.result_reporter.report(reportToSend);
+      const ack = await deps.result_reporter.report(reportToSend);
       attemptRecords.push({
         task_id: task.task_id,
         attempt_id: lease.attempt_id,
@@ -1337,6 +1533,19 @@ export async function runDaemon(
         error_code: null,
       });
       log(`[report] 已上报 ${task.task_id} / ${lease.attempt_id}：${reportToSend.status}`);
+      // P1/P2（B18）：这是**成功路径**，也正是一直没有留下 HTTP 状态码的那条。
+      recordReport({
+        task_id: task.task_id,
+        attempt_id: lease.attempt_id,
+        lease_epoch: lease.lease_epoch,
+        report: reportToSend,
+        ack,
+        http_status: ack.http_status ?? null,
+        http_attempts: ack.http_attempts ?? null,
+        pushed,
+        commit_sha: pushedLocalSha,
+        remote_sha: pushedRemoteSha,
+      });
       // B8（A 端 B7-1）：终态标记要能区分「正常收尾」与「有残留进程」——
       // 下次启动时这两种记录的处置不同。
       // B11（A 端 B10 复验 §a）：判据扩为整个进程状态。**正常返回**也可能
@@ -1366,6 +1575,20 @@ export async function runDaemon(
         error_code: errorCodeOf(error),
       });
       markInFlight(flightRecord, unsafe ? haltedStateFor(halt.state) : "failed_to_report");
+      // P1/P2（B18）：**失败路径同样留痕**，但绝不写 ack ——
+      // 收据必须能分辨「服务端收了」与「根本没送到」。
+      recordReport({
+        task_id: task.task_id,
+        attempt_id: lease.attempt_id,
+        lease_epoch: lease.lease_epoch,
+        report: reportToSend,
+        ack: null,
+        http_status: status,
+        http_attempts: null,
+        pushed,
+        commit_sha: pushedLocalSha,
+        remote_sha: pushedRemoteSha,
+      });
       if (unsafe) {
         // 优先于 401/403/409：先保证「本机有去向不明或杀不掉的进程」被记录下来，
         // 否则重启后没人知道要去清理它。
@@ -1712,6 +1935,10 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
 
   const deps = createHttpDaemonDeps(options.config, {
     ...fileInFlightStore(options.repo_root),
+    // P1/P2（B18）：收据与审计日志的默认存盘实现。
+    // 二者都只写 `.local/`（已 gitignore）：不进仓库、不进上报体、不上传。
+    ...fileReceiptStore(options.repo_root),
+    ...fileAuditStore(options.repo_root),
   });
 
   try {

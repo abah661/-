@@ -265,6 +265,24 @@ export class HttpRecoveryTransport implements RecoveryTransport {
 export interface ReportAck {
   accepted: boolean;
   state?: string;
+  /**
+   * 服务端成功应答的 **HTTP 状态码**（P1，B18）。
+   *
+   * 取**最后一次**响应（即重试链的最终那次）；一次都没拿到响应时为
+   * `undefined`。这是成功路径此前完全丢失的那个量：失败时日志有
+   * `HTTP <code>`，成功时一个都没有。
+   */
+  http_status?: number;
+  /** 本次上报实际发出的请求次数（含重试）；1 表示一次成功。不可得时为 undefined */
+  http_attempts?: number;
+}
+
+/** 上报响应观察者收到的信息（P1）。仅承载可公开字段。 */
+export interface ReportResponseInfo {
+  path: string;
+  status: number;
+  /** 从 0 起的重试序号 */
+  attempt: number;
 }
 
 /**
@@ -292,11 +310,25 @@ export interface ResultReporter {
  * （`project-do.ts`），客户端不再另传键。用旧 epoch 重报会得到 409
  * `LEASE_EPOCH_STALE` —— 这是正确行为，说明该 attempt 已作废，
  * 不应伪装成成功。
+ *
+ * ## P1（B18）：把成功应答的 HTTP 状态码带出来
+ * 客户端用 `on_response` 只读观察者记录**最后一次**响应，写进 `ReportAck`。
+ * 不改变 `request()` 的返回类型 —— 那会牵连 lease / heartbeat / recovery /
+ * registration / lease-acquire 全部调用点与其假体，改动面远大于收益。
  */
 export class HttpResultReporter implements ResultReporter {
-  constructor(private readonly client: CoordinatorClient) {}
+  constructor(
+    private readonly client: CoordinatorClient,
+    /**
+     * 可选的外部观察者（P1）。仅作转发；状态码本身由本类自行捕获，
+     * **不依赖**观察者是否存在。
+     */
+    private readonly observer?: (info: ReportResponseInfo) => void,
+  ) {}
 
   async report(report: ResultReport): Promise<ReportAck> {
+    let lastStatus: number | undefined;
+    let requestCount = 0;
     const response = await this.client.request<{
       accepted?: boolean;
       task_id?: string;
@@ -309,10 +341,18 @@ export class HttpResultReporter implements ResultReporter {
       body: report,
       // 上报结果不盲目重试 4xx；网络类错误由 request() 按分类决定。
       retry: true,
+      on_response: (info) => {
+        // 先记值，再转发 —— 转发抛错也不影响已捕获的状态码。
+        lastStatus = info.status;
+        requestCount = info.attempt + 1;
+        this.observer?.({ path: info.path, status: info.status, attempt: info.attempt });
+      },
     });
     return {
       accepted: response.accepted ?? true,
       ...(response.status !== undefined ? { state: response.status } : {}),
+      ...(lastStatus !== undefined ? { http_status: lastStatus } : {}),
+      ...(requestCount > 0 ? { http_attempts: requestCount } : {}),
     };
   }
 }

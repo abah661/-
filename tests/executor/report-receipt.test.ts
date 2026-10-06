@@ -34,6 +34,7 @@ import {
   RECEIPT_ALLOWED_KEYS,
   reportReceiptPath,
   receiptsDir,
+  sanitizeReportReceipt,
 } from "../../apps/executor/src/core/receipts.js";
 import type { ReportReceipt } from "../../apps/executor/src/core/receipts.js";
 import type {
@@ -695,5 +696,45 @@ describe("P1 收据：构造器护栏", () => {
     });
     expect(receipt.tests).toBeNull();
     expect(receipt.evidence).toBeNull();
+  });
+
+  it("写盘层再判：pushed 非 true 时，手工塞入的 commit_sha / remote_sha 一律降级 null（§七.1）", () => {
+    // 先造一张「已推送」的合法收据（两个 SHA 均为 40 位 hex，形状合格）
+    const pushedReceipt = buildReportReceipt({
+      task_id: "T",
+      attempt_id: "T-A1",
+      lease_epoch: 1,
+      http_status: 200,
+      http_attempts: 1,
+      ack: { accepted: true },
+      report: makeReport({ evidence: null, evidence_id: null }),
+      pushed: true,
+      commit_sha: SHA_A,
+      remote_sha: SHA_B,
+    });
+    expect(pushedReceipt.commit_sha).toBe(SHA_A);
+    expect(pushedReceipt.remote_sha).toBe(SHA_B);
+
+    // 绕过构造器，手工把 pushed 改成 false、但仍带着两个 SHA：
+    // 这一层必须清成 null，否则「没推」的收据读起来像「推了」
+    const tampered = sanitizeReportReceipt({ ...pushedReceipt, pushed: false });
+    expect(tampered.pushed).toBe(false);
+    expect(tampered.commit_sha).toBeNull();
+    expect(tampered.remote_sha).toBeNull();
+
+    // 反向对照：pushed:true 时两个 SHA 保留（证明不是把所有值一律抹掉）
+    const kept = sanitizeReportReceipt({ ...pushedReceipt, pushed: true });
+    expect(kept.commit_sha).toBe(SHA_A);
+    expect(kept.remote_sha).toBe(SHA_B);
+
+    // 再补一条：pushed:true 但 SHA 形状不合规 → 仍按形状判 null
+    const badShape = sanitizeReportReceipt({
+      ...pushedReceipt,
+      pushed: true,
+      commit_sha: "not-a-sha",
+      remote_sha: "x",
+    });
+    expect(badShape.commit_sha).toBeNull();
+    expect(badShape.remote_sha).toBeNull();
   });
 });

@@ -220,6 +220,9 @@ export function readAuditJournal(repoRoot: string, attemptId: string): AuditRead
   const records: AuditRecord[] = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
+    // 中间空行**跳过而非判坏**：空行不携带信息，不构成「文件被改动」的证据。
+    // 这是 A 在 B19 裁定 §七.2 明确接受的行为，记录在案、不视为缺陷。
+    // 真正判坏的只有「非空且不可解析」的行（见下方分支）。
     if (line.trim() === "") continue;
     const record = parseAuditLine(line);
     if (record === null) {

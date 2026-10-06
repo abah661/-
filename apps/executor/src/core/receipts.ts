@@ -257,6 +257,11 @@ export function buildReportReceipt(input: ReportReceiptInput): ReportReceipt {
  */
 export function sanitizeReportReceipt(receipt: ReportReceipt): ReportReceipt {
   const ack = receipt.ack;
+  // 纵深防御（A 于 B19 顺手项 §七.1 指出）：`buildReportReceipt` 与 daemon 传参
+  // 已保证「未推送时 `commit_sha` / `remote_sha` 为 null」，但写盘层不能只依赖上游。
+  // 这里再判一次：`pushed` 非 `true` 时，**无论调用方传了什么**，两个 SHA 一律降级
+  // 为 null —— 否则一张「没推」的收据可能带着提交号，读起来像「推了」。
+  const pushed = receipt.pushed === true;
   return {
     schema: RECEIPT_SCHEMA,
     recorded_at: isoOrNow(receipt.recorded_at),
@@ -270,9 +275,9 @@ export function sanitizeReportReceipt(receipt: ReportReceipt): ReportReceipt {
     ack: ack === null ? null : { accepted: ack.accepted === true, state: boundedToken(ack.state) },
     result_status: receipt.result_status,
     error_code: receipt.error_code === null ? null : (boundedToken(receipt.error_code, 48) as ErrorCode | null),
-    pushed: receipt.pushed === true,
-    commit_sha: shaLike(receipt.commit_sha),
-    remote_sha: shaLike(receipt.remote_sha),
+    pushed,
+    commit_sha: pushed ? shaLike(receipt.commit_sha) : null,
+    remote_sha: pushed ? shaLike(receipt.remote_sha) : null,
     tests:
       receipt.tests === null
         ? null

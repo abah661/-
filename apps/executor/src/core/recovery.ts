@@ -15,6 +15,69 @@ import { inspectWorktree, git } from "./worktree.js";
 import { isLeaseExpired } from "./lease.js";
 import type { Lease } from "@dac/protocol";
 
+/**
+ * 在途记录的生命周期状态（B5，评审单 P1-2）。
+ *
+ * ## 为什么需要状态而不是删除
+ * 原实现用 `save_in_flight(null)` → `rmSync` 直接把记录删掉。评审单判定这
+ * 违反清理规则：「不得把『运行完成』自动扩展为删除许可」。
+ *
+ * 现在一律**保留文件**，只推进状态。终态记录留在 `.local/` 里，
+ * 既是审计线索，也让「上次到底怎么结束的」可以被复查。
+ * 真正要清理必须走显式、已授权的动作（见 `clearInFlightRecord`）。
+ */
+export type InFlightState =
+  /** 正在执行，进程可能随时被杀 */
+  | "in_flight"
+  /** 结果已上报 */
+  | "reported"
+  /** 收到取消信号（Ctrl+C） */
+  | "skipped_aborted"
+  /** 运行期间租约失效，未推送未上报 */
+  | "skipped_lease_lost"
+  /** 上报失败（网络/服务端），已记录 */
+  | "failed_to_report"
+  /**
+   * 编排阶段抛异常，且**可证明**异常发生在任何进程启动之前因此无残留风险。
+   *
+   * 与下一条的区别就是「进程已确认不存在」与「进程状态未知」的区别，
+   * 这两种情况的处置不同，不能合并。
+   */
+  | "failed_orchestration"
+  /** 版本绑定四项不全，拒绝开工 */
+  | "refused_binding_incomplete"
+  /** 服务端确认旧租约已过期 */
+  | "abandoned_expired"
+  /** 服务端确认已重派给他人 */
+  | "abandoned_reassigned"
+  /** 服务端确认任务不存在 */
+  | "abandoned_unknown"
+  /**
+   * 重启后发现旧租约**仍归本机**，而本执行器不具备断点续跑能力。
+   * 安全停止并保留记录，等待租约自然到期或人工处理（评审单 P1-1）。
+   */
+  | "halted_still_mine"
+  /**
+   * 结果已上报，但测试/agent 进程**未能被终止**（B8，A 端 B7-1）。
+   *
+   * 与 `reported` 分开记的理由：这两种情况下「下次启动该不该照常开工」
+   * 的答案不同——有残留进程时必须先人工确认 worktree 已释放。
+   */
+  | "halted_residual_process"
+  /**
+   * 编排阶段抛异常，且**无法证明**该 attempt 的进程已退出（B10，A 端 B9 复验 §4）。
+   *
+   * 命名刻意与 `halted_residual_process` 区分：
+   * - `halted_residual_process` = **已确认**有杀不掉的进程；
+   * - `halted_process_unknown`  = **状态未知**，既没确认存在、也没确认不存在。
+   *
+   * 把未知写成「已确认残留」是**冒称**，会把排查引向错误方向；而把它当成
+   * 「已停止」（旧实现的 `failed_orchestration` + continue）则是 fail-open ——
+   * 异常可能发生在子进程启动之后，此时新任务会和去向不明的旧进程并行。
+   * 两者都不允许，所以它必须是一个独立状态。
+   */
+  | "halted_process_unknown";
+
 /** 本地持久化的在途任务记录（存于 .local/，忽略提交）。 */
 export interface InFlightRecord {
   task_id: string;
@@ -28,6 +91,13 @@ export interface InFlightRecord {
   completed_phases: readonly string[];
   /** 已创建的本地提交（可能未推送） */
   local_commits: readonly string[];
+  /**
+   * 生命周期状态。**可选**：B4 留下的记录没有这个字段，
+   * 读到旧记录时按 `in_flight` 处理（保守：不当作已终结）。
+   */
+  state?: InFlightState;
+  /** 状态变更时间（ISO 8601），便于排查「什么时候结束的」 */
+  state_updated_at?: string;
 }
 
 /**
@@ -40,8 +110,23 @@ export interface InFlightRecord {
  * - `unreachable` 是 B 端本地网络状态，**不是服务端 JSON 值**——
  *   由 HTTP 客户端在请求失败时构造。
  */
+/**
+ * 归属查询返回的租约子集。
+ *
+ * 服务端 `queryOwnership` 的 `still_mine` 应答只回
+ * `task_id / attempt_id / executor_id / lease_epoch / expires_at`，
+ * **不含** `binding` 与 `agent_kind`（见 `apps/coordinator/src/project-do.ts`）。
+ * 因此这里刻意用 `Pick<>` 而不是完整 `Lease` —— 不要为了凑类型
+ * 给缺省值，那会让「服务端没给」和「服务端给了」变得无法区分。
+ * 恢复决策只用得到 epoch 与过期时间，够用。
+ */
+export type OwnershipLease = Pick<
+  Lease,
+  "task_id" | "attempt_id" | "executor_id" | "lease_epoch" | "expires_at"
+>;
+
 export type TaskOwnership =
-  | { kind: "still_mine"; lease: Lease }
+  | { kind: "still_mine"; lease: OwnershipLease }
   | {
       kind: "reassigned";
       reason: string;

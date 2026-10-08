@@ -165,8 +165,14 @@ export class LeaseGuard {
  *
  * 用途：拿到租约后若剩余时间不足以覆盖「准备 worktree + 启动 agent」，
  * 应放弃本次领取让服务端重派，而不是开工后中途失效。
+ *
+ * 参数只要求 `expires_at`（结构化最小需求）：归属查询返回的租约子集
+ * 不含 `binding` / `agent_kind`，也必须能参与过期判定。
  */
-export function remainingLeaseMs(lease: Lease, now: number = Date.now()): number {
+export function remainingLeaseMs(
+  lease: Pick<Lease, "expires_at">,
+  now: number = Date.now(),
+): number {
   const expires = Date.parse(lease.expires_at);
   if (Number.isNaN(expires)) {
     throw new Error(`租约到期时间不是合法 ISO 8601：${lease.expires_at}`);
@@ -175,6 +181,9 @@ export function remainingLeaseMs(lease: Lease, now: number = Date.now()): number
 }
 
 /** 租约是否已过期（按本地时钟判断，仅作预检；最终以服务端为准）。 */
-export function isLeaseExpired(lease: Lease, now: number = Date.now()): boolean {
+export function isLeaseExpired(
+  lease: Pick<Lease, "expires_at">,
+  now: number = Date.now(),
+): boolean {
   return remainingLeaseMs(lease, now) <= 0;
 }

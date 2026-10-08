@@ -49,6 +49,7 @@ import {
   collectEvidence,
   parseTestSummary,
 } from "../../apps/executor/src/core/evidence.js";
+import { checkDiffScope } from "../../apps/executor/src/core/diff-check.js";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -208,6 +209,60 @@ describe("真实进程树停止（Windows 重点项）", () => {
       expect(result.stdout).toContain("done");
     },
     30_000,
+  );
+
+  /**
+   * B5 回归（真实链路逼出来的缺陷）。
+   *
+   * `runProcess` 原先**无条件**先 `await sleep(timeout_ms)`，再判断进程是否
+   * 早已退出。于是子进程瞬间正常结束时，调用方仍要空等满整个超时。
+   * 在真实链路上，`collectEvidence` 每次采集测试证据都会白等
+   * `test_timeout_ms`（常驻入口默认 600 秒／次）。
+   *
+   * 这条用例断言的核心不是「结果对不对」，而是**及时性**：
+   * 30 秒的超时下，一个立刻退出的进程必须在数秒内返回。
+   * 修复前这里会稳定地耗掉 30 秒。
+   */
+  it(
+    "真实进程立即退出时**立刻**返回，不空等满超时（B5 回归）",
+    async () => {
+      const started = Date.now();
+      const result = await runProcess(
+        {
+          executable: process.execPath,
+          args: ["-e", 'process.stdout.write("fast"); process.exit(0)'],
+          cwd: process.cwd(),
+        },
+        // 故意给一个很大的超时：修复前就会等这么久
+        { timeout_ms: 30_000, grace_ms: 1_000 },
+      );
+      const elapsed = Date.now() - started;
+
+      expect(result.timed_out).toBe(false);
+      expect(result.exit_code).toBe(0);
+      expect(result.stdout).toContain("fast");
+      // 留出充足余量给慢机器，但仍远小于 30 秒
+      expect(elapsed).toBeLessThan(15_000);
+    },
+    60_000,
+  );
+
+  it(
+    "真实非零退出码被如实返回（不得被静默抹成 null）",
+    async () => {
+      const result = await runProcess(
+        {
+          executable: process.execPath,
+          args: ["-e", "process.exit(7)"],
+          cwd: process.cwd(),
+        },
+        { timeout_ms: 30_000, grace_ms: 1_000 },
+      );
+
+      expect(result.timed_out).toBe(false);
+      expect(result.exit_code).toBe(7);
+    },
+    60_000,
   );
 
   it("真实收集 stdout 与 stderr，两者不混淆", async () => {
@@ -427,6 +482,111 @@ describe("真实 Git worktree（中文与空格路径）", () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * 二·补、真实 Git 核对失败必须 fail-closed（B8 · A 端 B7-2）
+ *
+ * A 端复现：在不存在的仓库路径调用 `checkDiffScope()` 得到 `ok: true`
+ * 与空违规列表。下面用**真实 Git**证明修复后的行为，而不是靠假体。
+ * ------------------------------------------------------------------ */
+
+describe("真实 Git fail-closed（B8 · B7-2）", () => {
+  let failCloseRoot: string;
+  const SCOPE = { allow: ["apps/executor/**"], deny: [] };
+
+  beforeAll(() => {
+    resolveGitExecutable();
+    failCloseRoot = mkdtempSync(join(tmpdir(), "dac-failclose-"));
+    const must = (args: string[]): void => {
+      const r = git(failCloseRoot, args);
+      if (r.exit_code !== 0) throw new Error(`git ${args.join(" ")} 失败：${r.stderr.trim()}`);
+    };
+    must(["init", "-q"]);
+    must(["config", "user.email", "b@example.invalid"]);
+    must(["config", "user.name", "B Test"]);
+    must(["config", "commit.gpgsign", "false"]);
+    mkdirSync(join(failCloseRoot, "apps", "coordinator", "src"), { recursive: true });
+    mkdirSync(join(failCloseRoot, "apps", "executor", "src"), { recursive: true });
+    writeFileSync(
+      join(failCloseRoot, "apps", "coordinator", "src", "api.ts"),
+      "export const a = 1;\n",
+      "utf8",
+    );
+    must(["add", "-A"]);
+    must(["commit", "-q", "-m", "init"]);
+  });
+
+  afterAll(() => {
+    if (failCloseRoot) rmSync(failCloseRoot, { recursive: true, force: true });
+  });
+
+  it("真实无效路径 → ok:false 且带 error（缺陷已修复）", () => {
+    const result = checkDiffScope({
+      worktree_path: join(failCloseRoot, "no-such-dir"),
+      base_sha: "0".repeat(40),
+      scope: SCOPE,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).not.toBeNull();
+    // 关键：不是「没有变更」，而是「没法核对」
+    expect(result.changed_files).toEqual([]);
+  });
+
+  it("真实基线提交不存在 → ok:false", () => {
+    const result = checkDiffScope({
+      worktree_path: failCloseRoot,
+      base_sha: "0".repeat(40),
+      scope: SCOPE,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).not.toBeNull();
+  });
+
+  it("真实跨范围重命名被查出来：源的越界不会被改名掩盖", () => {
+    const base = git(failCloseRoot, ["rev-parse", "HEAD"]).stdout.trim();
+    expect(base).toMatch(/^[0-9a-f]{40}$/);
+
+    const moved = git(failCloseRoot, [
+      "mv",
+      "apps/coordinator/src/api.ts",
+      "apps/executor/src/api.ts",
+    ]);
+    expect(moved.exit_code).toBe(0);
+    expect(git(failCloseRoot, ["commit", "-q", "-m", "rename across scope"]).exit_code).toBe(0);
+
+    const result = checkDiffScope({
+      worktree_path: failCloseRoot,
+      base_sha: base,
+      scope: SCOPE,
+    });
+    // 核对本身成功……
+    expect(result.error).toBeNull();
+    // ……结论是越界：`apps/coordinator/**` 不在允许范围内
+    expect(result.changed_files).toContain("apps/coordinator/src/api.ts");
+    expect(result.violations).toContain("apps/coordinator/src/api.ts");
+    expect(result.ok).toBe(false);
+  });
+
+  it("真实正常改动 → ok:true 且 error 为 null（fail-closed 没有把正常路径也判失败）", () => {
+    const base = git(failCloseRoot, ["rev-parse", "HEAD"]).stdout.trim();
+    writeFileSync(
+      join(failCloseRoot, "apps", "executor", "src", "new.ts"),
+      "export const b = 2;\n",
+      "utf8",
+    );
+    expect(git(failCloseRoot, ["add", "-A"]).exit_code).toBe(0);
+    expect(git(failCloseRoot, ["commit", "-q", "-m", "in scope"]).exit_code).toBe(0);
+
+    const result = checkDiffScope({
+      worktree_path: failCloseRoot,
+      base_sha: base,
+      scope: SCOPE,
+    });
+    expect(result.error).toBeNull();
+    expect(result.violations).toEqual([]);
+    expect(result.ok).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * 三、真实测试输出解析
  * ------------------------------------------------------------------ */
 
@@ -557,6 +717,419 @@ describe("真实测试输出解析（evidence.ts）", () => {
     expect(result.summary_parsed).toBe(false);
     expect(result.evidence.summary).toEqual({ passed: 0, failed: 0, skipped: 0 });
   }, 60_000);
+});
+
+/* ------------------------------------------------------------------ *
+ * 三之二、Node 内置测试运行器（TAP）汇总解析 —— B13
+ * ------------------------------------------------------------------ */
+
+/**
+ * B13 背景（A 端 P3 首轮真实运行裁定）：P3 目标仓库用 `node --test`
+ * （Node 内置运行器，默认输出 TAP），而 parseTestSummary 此前只认 vitest/jest
+ * 的 `Tests` 行，于是**真实全绿**的一次运行被解析成 `passed: 0`，
+ * 上报被协调器以 RESULT_SCHEMA_INVALID 正确拒绝。
+ *
+ * 下面所有样本都是**真实采集**的（Node v22.22.2、`node --test`），
+ * 采集脚本与原始输出见 docs/reports/B13-*.md；**不要凭记忆改这些常量**。
+ *
+ * B16 背景（A 端 B15 复核）：B13 的 fail-closed 只强制 `tests/pass/fail`，
+ * 缺 `suites/cancelled/skipped/todo` 时按 0 补，也不要求版本头与终止标记，
+ * 于是「不完整 TAP 片段」也能报出通过数。现收紧为**只认结构完整的
+ * TAP v13 输出**；下面同时保留 A 给出的两份不完整输入作为拒绝用例。
+ */
+describe("Node 内置运行器 TAP 汇总解析（evidence.ts，B13；B16 只认完整输出）", () => {
+  /** P3 目标仓库首轮真实输出（TASK-1001-A2），2 passed / 0 failed、退出码 0 */
+  const REAL_TAP_P3 = [
+    "TAP version 13",
+    "# Subtest: 冻结契约只要求字符串 id 和 name",
+    "ok 1 - 冻结契约只要求字符串 id 和 name",
+    "  ---",
+    "  duration_ms: 1.0889",
+    "  type: 'test'",
+    "  ...",
+    "# Subtest: getUser returns the frozen UserProfile shape",
+    "ok 2 - getUser returns the frozen UserProfile shape",
+    "  ---",
+    "  duration_ms: 0.7298",
+    "  type: 'test'",
+    "  ...",
+    "1..2",
+    "# tests 2",
+    "# suites 0",
+    "# pass 2",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 161.1573",
+    "",
+  ].join("\n");
+
+  /** 真实失败样本：1 passed / 1 failed */
+  const REAL_TAP_WITH_FAILURE = [
+    "TAP version 13",
+    "# Subtest: alpha",
+    "ok 1 - alpha",
+    "# Subtest: beta",
+    "not ok 2 - beta",
+    "  ---",
+    "  failureType: 'testCodeFailure'",
+    "  code: 'ERR_ASSERTION'",
+    "  ...",
+    "1..2",
+    "# tests 2",
+    "# suites 0",
+    "# pass 1",
+    "# fail 1",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 271.8326",
+    "",
+  ].join("\n");
+
+  /** 真实 skip + todo 样本（注意 `# pass` 不含被跳过的用例） */
+  const REAL_TAP_WITH_SKIP_TODO = [
+    "TAP version 13",
+    "# Subtest: alpha",
+    "ok 1 - alpha",
+    "# Subtest: beta",
+    "ok 2 - beta # SKIP",
+    "# Subtest: gamma",
+    "ok 3 - gamma # TODO",
+    "1..3",
+    "# tests 3",
+    "# suites 0",
+    "# pass 1",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 1",
+    "# todo 1",
+    "# duration_ms 233.1165",
+    "",
+  ].join("\n");
+
+  /** 真实嵌套 describe 样本：`# tests` 含子测试（3），`# suites` 单列 */
+  const REAL_TAP_NESTED = [
+    "TAP version 13",
+    "# Subtest: outer",
+    "    # Subtest: inner-a",
+    "    ok 1 - inner-a",
+    "    1..2",
+    "ok 1 - outer",
+    "  ---",
+    "  type: 'suite'",
+    "  ...",
+    "# Subtest: sibling",
+    "ok 2 - sibling",
+    "1..2",
+    "# tests 3",
+    "# suites 1",
+    "# pass 3",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 262.3032",
+    "",
+  ].join("\n");
+
+  /** 真实「无任何测试文件」样本：tests 为 0 —— 没有测试结果，不能算通过 */
+  const REAL_TAP_NO_TESTS = [
+    "TAP version 13",
+    "1..0",
+    "# tests 0",
+    "# suites 0",
+    "# pass 0",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 11.7005",
+    "",
+  ].join("\n");
+
+  /** 真实「用例被取消」样本：pass 0 / fail 0 / cancelled 1 */
+  const REAL_TAP_CANCELLED = [
+    "TAP version 13",
+    "# Subtest: slow.test.mjs",
+    "not ok 1 - slow.test.mjs",
+    "  ---",
+    "  failureType: 'cancelledByParent'",
+    "  ...",
+    "1..1",
+    "# tests 1",
+    "# suites 0",
+    "# pass 0",
+    "# fail 0",
+    "# cancelled 1",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 216.8423",
+    "",
+  ].join("\n");
+
+  /**
+   * 真实「测试文件顶层抛异常（加载失败）」样本。
+   *
+   * 之所以要留这份：汇总块之前有一大段 `# ...` **注释行**（堆栈、`# Node.js v22.22.2`），
+   * 是「正文污染汇总解析」最像真的反例 —— 解析器必须只认
+   * `# <字段> <数字>` 这种整行形态，不能被这些注释行带偏。
+   */
+  const REAL_TAP_LOAD_FAILURE = [
+    "TAP version 13",
+    "# file:///C:/Users/lenovo/AppData/Local/Temp/b13tap-O9SV9t/case-eg38m4/boom.test.mjs:1",
+    "# throw new Error(\"boom at load time\");",
+    "#       ^",
+    "# Error: boom at load time",
+    "#     at file:///C:/Users/lenovo/AppData/Local/Temp/b13tap-O9SV9t/case-eg38m4/boom.test.mjs:1:7",
+    "#     at ModuleJob.run (node:internal/modules/esm/module_job:343:25)",
+    "# Node.js v22.22.2",
+    "# Subtest: boom.test.mjs",
+    "not ok 1 - boom.test.mjs",
+    "  ---",
+    "  duration_ms: 207.6076",
+    "  type: 'test'",
+    "  failureType: 'testCodeFailure'",
+    "  code: 'ERR_TEST_FAILURE'",
+    "  ...",
+    "1..1",
+    "# tests 1",
+    "# suites 0",
+    "# pass 0",
+    "# fail 1",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 220.3114",
+    "",
+  ].join("\n");
+
+  it("解析 P3 真实 TAP 输出：2 passed / 0 failed（本次 422 的修复点）", () => {
+    expect(parseTestSummary(REAL_TAP_P3)).toEqual({ passed: 2, failed: 0, skipped: 0 });
+  });
+
+  it("解析真实 TAP 失败输出：failed 非零", () => {
+    const summary = parseTestSummary(REAL_TAP_WITH_FAILURE);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(1);
+    expect(summary!.failed).toBe(1);
+    expect(summary!.skipped).toBe(0);
+  });
+
+  it("解析真实 TAP skip + todo：skipped 单独计数，不计入 passed", () => {
+    const summary = parseTestSummary(REAL_TAP_WITH_SKIP_TODO);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(1);
+    expect(summary!.failed).toBe(0);
+    expect(summary!.skipped).toBe(1);
+  });
+
+  it("嵌套 describe：tests 含子测试，suites 不参与用例数", () => {
+    expect(parseTestSummary(REAL_TAP_NESTED)).toEqual({ passed: 3, failed: 0, skipped: 0 });
+  });
+
+  it("cancelled 计入 failed：不制造 passed>0 且 failed=0 的假绿", () => {
+    const summary = parseTestSummary(REAL_TAP_CANCELLED);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(0);
+    expect(summary!.failed).toBe(1);
+  });
+
+  it("CRLF 换行同样可解析（Windows 真实输出）", () => {
+    expect(parseTestSummary(REAL_TAP_P3.replace(/\n/g, "\r\n"))).toEqual({
+      passed: 2,
+      failed: 0,
+      skipped: 0,
+    });
+  });
+
+  it("tests 为 0 = 没有测试结果，fail closed", () => {
+    expect(parseTestSummary(REAL_TAP_NO_TESTS)).toBeNull();
+  });
+
+  it("缺必需字段（无 # fail）时 fail closed，不按 0 猜", () => {
+    // B16 起用「完整块抽掉一行」构造：唯一差异就是缺了那个字段，
+    // 否则用例会因为「缺版本头」而通过，测不到本来要测的规则。
+    expect(parseTestSummary(withoutLine("# fail 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# pass 1"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# tests 1"))).toBeNull();
+  });
+
+  it("汇总互相矛盾（重复字段取不同值）时 fail closed", () => {
+    const contradictory = [
+      "TAP version 13",
+      "1..2",
+      "# tests 2",
+      "# suites 0",
+      "# pass 2",
+      "# fail 0",
+      "# tests 5", // ← 同一字段再次出现且数值不同
+      "# cancelled 0",
+      "# skipped 0",
+      "# todo 0",
+      "# duration_ms 12.5",
+      "",
+    ].join("\n");
+    expect(parseTestSummary(contradictory)).toBeNull();
+  });
+
+  it("汇总不自洽（各项之和 ≠ tests）时 fail closed", () => {
+    const inconsistent = [
+      "TAP version 13",
+      "1..10",
+      "# tests 10",
+      "# suites 0",
+      "# pass 2",
+      "# fail 0",
+      "# cancelled 0",
+      "# skipped 0",
+      "# todo 0",
+      "# duration_ms 12.5",
+      "",
+    ].join("\n");
+    expect(parseTestSummary(inconsistent)).toBeNull();
+  });
+
+  it("输出被截断（只有测试行、没有汇总块）时 fail closed", () => {
+    const truncated = [
+      "TAP version 13",
+      "# Subtest: alpha",
+      "ok 1 - alpha",
+      "",
+    ].join("\n");
+    expect(parseTestSummary(truncated)).toBeNull();
+  });
+
+  it("只有零星字段、凑不成完整汇总时 fail closed", () => {
+    expect(parseTestSummary("# pass 3")).toBeNull();
+    expect(parseTestSummary("all 3 tests passed")).toBeNull();
+    expect(parseTestSummary("")).toBeNull();
+  });
+
+  /* ------------------------------------------------------------------ *
+   * B16：只认「结构完整」的 TAP v13 输出（A 端 B15 复核）
+   *
+   * A 在 B15 候选上实跑，指出 B13 只要凑齐 `tests/pass/fail` 就出摘要，
+   * 缺字段按 0 补 —— 于是**不完整/被截断**的片段也会报出通过数。
+   * 下面用「抽掉某一行」的方式逐项证明每个必需成分都真的被强制。
+   * ------------------------------------------------------------------ */
+
+  /** 一份结构完整的汇总块；每个必需成分都能被单独抽掉做拒绝用例。 */
+  const COMPLETE_SUMMARY_LINES = [
+    "TAP version 13",
+    "# Subtest: alpha",
+    "ok 1 - alpha",
+    "1..1",
+    "# tests 1",
+    "# suites 0",
+    "# pass 1",
+    "# fail 0",
+    "# cancelled 0",
+    "# skipped 0",
+    "# todo 0",
+    "# duration_ms 12.5",
+  ];
+  const completeSummary = (): string => [...COMPLETE_SUMMARY_LINES, ""].join("\n");
+  const withoutLine = (needle: string): string =>
+    [...COMPLETE_SUMMARY_LINES.filter((line) => line !== needle), ""].join("\n");
+
+  it("B16 正对照：结构完整的汇总块仍能解析（证明拒绝用例不是假阴性）", () => {
+    expect(parseTestSummary(completeSummary())).toEqual({ passed: 1, failed: 0, skipped: 0 });
+  });
+
+  it("B16：A 给出的两份不完整输入必须拒绝（B13 曾分别报出 1 / 2 个通过）", () => {
+    // A 端原文：`parseTestSummary("# tests 1\n# pass 1\n# fail 0")` → { passed: 1, … }
+    expect(parseTestSummary("# tests 1\n# pass 1\n# fail 0")).toBeNull();
+    // A 端原文：`parseTestSummary("TAP version 13\n# tests 2\n# pass 2\n# fail 0")` → { passed: 2, … }
+    expect(parseTestSummary("TAP version 13\n# tests 2\n# pass 2\n# fail 0")).toBeNull();
+  });
+
+  it("B16：有完整汇总字段但缺版本头 `TAP version 13` → 拒绝", () => {
+    expect(parseTestSummary(withoutLine("TAP version 13"))).toBeNull();
+  });
+
+  it("B16：版本头不必是第一行（经 `npm test` 包装仍有 npm 横幅）→ 仍能解析", () => {
+    // 为什么要有这一条：执行器的测试命令直接拉起 `node --test` 时 stdout
+    // 第一行就是版本头，但若将来经 `npm test` 之类包装，前面会多出 npm 的
+    // `> pkg@x.y.z test` 两行横幅 —— 这种输出**真实且完整**，不能判成「无法判定」。
+    const wrapped = ["> demo@1.0.0 test", "> node --test", "", ...COMPLETE_SUMMARY_LINES, ""].join("\n");
+    expect(parseTestSummary(wrapped)).toEqual({ passed: 1, failed: 0, skipped: 0 });
+  });
+
+  it("B16：版本头出现两次（两段输出被拼接）→ 拒绝", () => {
+    const twoHeaders = [...COMPLETE_SUMMARY_LINES.slice(0, 1), ...COMPLETE_SUMMARY_LINES, ""].join("\n");
+    expect(parseTestSummary(twoHeaders)).toBeNull();
+  });
+
+  it("B16：汇总块出现在版本头之前（顺序被改写）→ 拒绝", () => {
+    const summaryFirst = [...COMPLETE_SUMMARY_LINES.slice(1), COMPLETE_SUMMARY_LINES[0]!, ""].join("\n");
+    expect(parseTestSummary(summaryFirst)).toBeNull();
+  });
+
+  it("B16：缺终止标记 `# duration_ms`（输出被截断）→ 拒绝", () => {
+    expect(parseTestSummary(withoutLine("# duration_ms 12.5"))).toBeNull();
+  });
+
+  it("B16：缺 suites / cancelled / skipped / todo 任一 → 拒绝（不再按 0 补）", () => {
+    expect(parseTestSummary(withoutLine("# suites 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# cancelled 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# skipped 0"))).toBeNull();
+    expect(parseTestSummary(withoutLine("# todo 0"))).toBeNull();
+  });
+
+  it("B16：终止标记不在末尾（其后仍有计数字段）→ 拒绝", () => {
+    const movedUp = [
+      "TAP version 13",
+      "1..1",
+      "# tests 1",
+      "# suites 0",
+      "# pass 1",
+      "# fail 0",
+      "# cancelled 0",
+      "# skipped 0",
+      "# duration_ms 12.5", // ← 提前出现，不再是「终止」标记
+      "# todo 0", // ← 终止标记之后又冒出计数字段
+      "",
+    ].join("\n");
+    expect(parseTestSummary(movedUp)).toBeNull();
+  });
+
+  it("B16：计数字段不是整数（畸形汇总）→ 拒绝", () => {
+    const fractional = COMPLETE_SUMMARY_LINES.map((line) =>
+      line === "# tests 1" ? "# tests 1.5" : line,
+    )
+      .concat("")
+      .join("\n");
+    expect(parseTestSummary(fractional)).toBeNull();
+  });
+
+  it("B16：正文含 `# ` 注释行（真实加载失败样本）仍能正确解析", () => {
+    const summary = parseTestSummary(REAL_TAP_LOAD_FAILURE);
+    expect(summary).not.toBeNull();
+    expect(summary!.passed).toBe(0);
+    expect(summary!.failed).toBe(1);
+    expect(summary!.skipped).toBe(0);
+  });
+
+  it("B16：汇总块重复（即使数值完全一致）不再接受", () => {
+    // 真实 node --test 只输出一个汇总块；出现两次说明输出被拼接/污染，
+    // 「取其中一个」没有依据 → 判不了。
+    expect(parseTestSummary(completeSummary() + completeSummary())).toBeNull();
+
+    // 单个计数字段重复出现同理（B13 曾把「重复但一致」当无害）。
+    const duplicatedField = COMPLETE_SUMMARY_LINES.concat(["# pass 1", ""]).join("\n");
+    expect(parseTestSummary(duplicatedField)).toBeNull();
+  });
+
+  it("既有 vitest/jest 解析不受影响（回归）", () => {
+    expect(parseTestSummary("      Tests  16 passed (16)")).toEqual({ passed: 16, failed: 0, skipped: 0 });
+    expect(parseTestSummary("Tests:       1 failed, 79 passed, 2 skipped, 82 total")).toEqual({
+      passed: 79,
+      failed: 1,
+      skipped: 2,
+    });
+  });
 });
 
 /* ------------------------------------------------------------------ *

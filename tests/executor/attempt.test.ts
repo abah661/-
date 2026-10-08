@@ -13,7 +13,17 @@
 import { describe, expect, it } from "vitest";
 import { ResultReportSchema } from "@dac/protocol";
 import type { Lease } from "@dac/protocol";
-import { runAttempt } from "../../apps/executor/src/core/attempt.js";
+import {
+  AttemptOrchestrationError,
+  combineProcessStates,
+  describeProcessState,
+  haltSignalOf,
+  haltStopReasonFor,
+  haltedStateFor,
+  isUnsafeProcessState,
+  mapAdapterProcessState,
+  runAttempt,
+} from "../../apps/executor/src/core/attempt.js";
 import type { AttemptInput } from "../../apps/executor/src/core/attempt.js";
 import type { LeaseTransport, RenewOutcome } from "../../apps/executor/src/core/lease.js";
 import type { HeartbeatRequest, HeartbeatTransport } from "../../apps/executor/src/core/heartbeat.js";
@@ -234,9 +244,12 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
     ok?: boolean;
     evidence?: null | {
       evidence_id: string;
-      command: readonly string[];
+      // 与 `TestEvidence` 对齐：`command` 是可变数组、`log_artifact` 必填
+      // （缺字段会被 fail-closed 的判定当成「证据不完整」）。
+      command: string[];
       exit_code: number;
       summary: { passed: number; failed: number; skipped: number };
+      log_artifact?: string | null;
       output_sha256: string;
     };
   }) {
@@ -257,6 +270,10 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
         stderr_sha256: "0".repeat(64),
         invalid_json_lines: 0,
         request_url: null,
+        launch_source: "path_exe",
+        launch_detail: "夹具：不涉及启动方式",
+        // B11：进程生命周期事实。夹具是「进程已观察到关闭」。
+        process_state: "stopped",
       },
       diff: {
         changed_files: overrides.changed_files ?? ["apps/executor/src/x.ts"],
@@ -264,8 +281,15 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
         // 归一化层判定用的是 `ok`（有 violations 即为 false）
         ok: overrides.ok ?? true,
         has_uncommitted: false,
+        // B8（B7-2）：核对成功的夹具必须显式写 null —— 缺字段会被
+        // fail-closed 的判定当成「无法核对」，从而盖过越界结论。
+        error: null,
       },
-      evidence: overrides.evidence === undefined ? null : overrides.evidence,
+      // `log_artifact` 缺省补 null：夹具只关心「有没有证据」，不关心证据落盘位置
+      evidence:
+        overrides.evidence === undefined || overrides.evidence === null
+          ? null
+          : { log_artifact: null, ...overrides.evidence },
       base_sha: "a577d66",
       head_sha: "b123456",
       sensitive_touches: [],
@@ -310,8 +334,18 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
         stderr_sha256: "0".repeat(64),
         invalid_json_lines: 0,
         request_url: null,
+        launch_source: "path_exe",
+        launch_detail: "夹具：不涉及启动方式",
+        // B11：进程生命周期事实。夹具是「进程已观察到关闭」。
+        process_state: "stopped",
       },
-      diff: { changed_files: [".github/workflows/ci.yml"], violations: [], ok: true, has_uncommitted: false },
+      diff: {
+        changed_files: [".github/workflows/ci.yml"],
+        violations: [],
+        ok: true,
+        has_uncommitted: false,
+        error: null,
+      },
       evidence: null,
       base_sha: "a577d66",
       head_sha: "b123456",
@@ -348,5 +382,145 @@ describe("降级优先级（前一级命中即不再往下判）", () => {
       },
     });
     expect(report.error_code).toBe("TESTS_FAILED");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * B10 § 编排异常后的进程状态分类（A 端 B9 复验 §4）
+ *
+ * A 端原话：「异常不能默认映射为『已停止』」「只有可证明异常发生在进程启动
+ * 之前，或已有可靠终止证据时，才允许按安全结束处理」。
+ *
+ * 因此 `runAttempt` 不再原样抛出内部异常，而是抛**带进程状态**的类型化异常，
+ * 由常驻入口据此决定「继续领任务」还是「停机并保留标记」。
+ * 本组锁定「抛出的类型」与「状态口径」两件事；各状态在入口处如何分流由
+ * `daemon.test.ts` 的故障注入用例覆盖，「进程已启动但拿不到退出码 → unknown」
+ * 这条真实路径由 `real-chain.test.ts` 用真实仓库覆盖（它必须真有 worktree
+ * 才能走到 agent 阶段，而本文件刻意不碰真实 Git 仓库）。
+ * ------------------------------------------------------------------ */
+
+describe("B10 § 编排异常的进程状态分类", () => {
+  it("四种状态的说明互不相同，且不把「未知」冒称为「已确认残留」", () => {
+    const texts = [
+      describeProcessState("not_started"),
+      describeProcessState("stopped"),
+      describeProcessState("residual"),
+      describeProcessState("unknown"),
+    ];
+
+    // 措辞一旦合并，排障就分不清「已确认有残留」和「不知道有没有残留」
+    expect(new Set(texts).size).toBe(4);
+    expect(describeProcessState("not_started")).toContain("启动之前");
+    expect(describeProcessState("stopped")).toContain("已确认");
+    expect(describeProcessState("residual")).toContain("已确认");
+    expect(describeProcessState("unknown")).toContain("无法证明");
+    // 「未知」不得冒称「已确认」
+    expect(describeProcessState("unknown")).not.toContain("已确认");
+  });
+
+  it("异常可证明发生在进程启动之前（worktree 都没建起来）→ 类型化异常 + not_started", async () => {
+    const probe = new OrderProbe();
+    const runner = new FakeAgentRunner(probe);
+
+    const thrown = await runAttempt(makeInput({ repo_root: "C:/definitely/not/a/repo" }), {
+      lease_transport: new RecordingLeaseTransport(probe),
+      heartbeat_transport: new RecordingHeartbeatTransport(),
+      agent_runner: runner,
+      clock: new FastClock(),
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    // 类型化异常：入口**无需猜测**就能分流（旧实现抛的是不带状态的裸异常）
+    expect(thrown).toBeInstanceOf(AttemptOrchestrationError);
+    const typed = thrown as AttemptOrchestrationError;
+    expect(typed.process_state).toBe("not_started");
+    expect(typed.message).toContain("进程启动之前");
+    // 原始异常留在 cause：错误码分类（errorCodeOf）仍要看原始异常
+    expect(typed.cause).toBeInstanceOf(Error);
+    expect((typed.cause as Error).message).toMatch(/不存在|worktree|无法/i);
+
+    // 确实一次都没有启动过 agent
+    expect(probe.events).not.toContain("agent");
+    expect(runner.lastCwd).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 进程状态映射（B11，A 端 B10 复验 §a）
+ *
+ * 适配器给的是**进程生命周期事实**（spawn_failed / stopped / unknown /
+ * residual），编排层用的是**能不能继续开工**（not_started / stopped /
+ * residual / unknown）。这一层只做一一对应的翻译：任何「看起来差不多」的
+ * 合并，都会把「没起来」与「去向不明」混成一件事 ——
+ * 而这两者对执行器的处置**完全相反**（前者可安全继续，后者必须停机）。
+ * ------------------------------------------------------------------ */
+
+describe("B11 §B10复验 适配器进程状态 → 编排层进程状态", () => {
+  it("spawn_failed 映射为 not_started（进程从未存在）", () => {
+    expect(mapAdapterProcessState("spawn_failed")).toBe("not_started");
+    expect(isUnsafeProcessState(mapAdapterProcessState("spawn_failed"))).toBe(false);
+  });
+
+  it("stopped 映射为 stopped（可安全继续）", () => {
+    expect(mapAdapterProcessState("stopped")).toBe("stopped");
+    expect(isUnsafeProcessState("stopped")).toBe(false);
+  });
+
+  it("unknown 与 residual 原样保留，且都判为不安全；not_started 不算不安全", () => {
+    expect(mapAdapterProcessState("unknown")).toBe("unknown");
+    expect(mapAdapterProcessState("residual")).toBe("residual");
+    expect(isUnsafeProcessState("unknown")).toBe(true);
+    expect(isUnsafeProcessState("residual")).toBe(true);
+    expect(isUnsafeProcessState("not_started")).toBe(false);
+  });
+
+  it("停机标记与停机原因一一对应，且两种状态**命名分立**", () => {
+    expect(haltedStateFor("residual")).toBe("halted_residual_process");
+    expect(haltedStateFor("unknown")).toBe("halted_process_unknown");
+    expect(haltStopReasonFor("residual")).toBe("halt_residual_process");
+    expect(haltStopReasonFor("unknown")).toBe("halt_process_unknown");
+    // 「不知道」不得被写成「已确认」——那会把排查引向错误方向
+    expect(haltedStateFor("unknown")).not.toBe(haltedStateFor("residual"));
+    expect(haltStopReasonFor("unknown")).not.toBe(haltStopReasonFor("residual"));
+  });
+
+  it("haltSignalOf 取两信号中更严的一档，且 kill_failed **不冒称**「已确认残留」", () => {
+    expect(haltSignalOf({ kill_failed: false, process_state: "stopped" })).toEqual({
+      unsafe: false,
+      state: "stopped",
+    });
+    expect(haltSignalOf({ kill_failed: false, process_state: "unknown" })).toEqual({
+      unsafe: true,
+      state: "unknown",
+    });
+    expect(haltSignalOf({ kill_failed: false, process_state: "not_started" }).unsafe).toBe(false);
+    expect(haltSignalOf({ kill_failed: false, process_state: "residual" })).toEqual({
+      unsafe: true,
+      state: "residual",
+    });
+    // B12（A 端 B11 复验 P2）：旧信号说「杀不掉」、新状态却说「已退出」时，
+    // 仍然要停机（宁可多停一次），但**不得**把状态写成 `residual` ——
+    // `kill_failed` 只说明「没等到退出」，不说明「确认还活着」。
+    // 用「不知道」冒充「已确认残留」会把排查引向错误方向。
+    const inconsistent = haltSignalOf({ kill_failed: true, process_state: "stopped" });
+    expect(inconsistent.unsafe).toBe(true);
+    expect(inconsistent.state).toBe("unknown");
+    expect(inconsistent.state).not.toBe("residual");
+  });
+
+  it("combineProcessStates 取更严的一档：not_started < stopped < unknown < residual", () => {
+    // 两个环节都安全 → 仍是安全，且不出现 `not_started` 冒充结论
+    expect(combineProcessStates("not_started", "stopped")).toBe("stopped");
+    expect(combineProcessStates("stopped", "not_started")).toBe("stopped");
+    expect(combineProcessStates("stopped", "stopped")).toBe("stopped");
+    // 任一环节不安全 → 整体不安全（不允许被干净的一方洗白）
+    expect(combineProcessStates("stopped", "unknown")).toBe("unknown");
+    expect(combineProcessStates("not_started", "unknown")).toBe("unknown");
+    expect(combineProcessStates("stopped", "residual")).toBe("residual");
+    // 证据强的一方不被降级：已确认存活胜过「不知道」
+    expect(combineProcessStates("residual", "unknown")).toBe("residual");
+    expect(combineProcessStates("unknown", "residual")).toBe("residual");
   });
 });

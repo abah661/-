@@ -259,6 +259,20 @@ export interface HttpRequestSpec {
   idempotency_key?: string;
   /** 是否允许重试。默认 true */
   retry?: boolean;
+  /**
+   * 只读观察者（P1，B18）：**每次**拿到响应后回调一次，**含失败响应**
+   * （这样重试链里的 503 也看得到，最终状态码才不会被误记成首次的值）。
+   *
+   * 只承载可公开字段，绝不含请求头 / 响应体 / 凭据。
+   * 观察者抛错不影响请求结果 —— 它只观察，不具备改变请求结果的能力。
+   */
+  on_response?: (info: {
+    method: "GET" | "POST";
+    path: string;
+    status: number;
+    /** 从 0 起，重试时递增 */
+    attempt: number;
+  }) => void;
 }
 
 export interface HttpClientDeps {
@@ -315,7 +329,27 @@ export class CoordinatorClient {
     const allowRetry = spec.retry !== false;
     const maxAttempts = allowRetry ? this.policy.max_retries + 1 : 1;
 
-    const body = spec.body === undefined ? undefined : JSON.stringify(spec.body);
+    // 幂等键**必须进请求体**：协调器的各写端点都从 body 读 `idempotency_key`
+    // （`apps/coordinator/src/project-do.ts` 的 `requireIdempotencyScope`）。
+    // 本模块文件头也早已写明「写请求的 idempotency_key 放在 JSON 体内」，
+    // 但此前只在重试循环里使用了该字段、并未发送，导致续租/心跳/领取
+    // 因缺少必填字段被服务端判为 400 RESULT_SCHEMA_INVALID。
+    // 合并放在重试循环**之前**，因此整个重试过程复用同一个键 ——
+    // 这正是幂等保护生效的前提。
+    // 合并放在重试循环**之前**，因此整个重试过程复用同一个键 ——
+    // 这正是幂等保护生效的前提。
+    const canMerge =
+      spec.body !== null &&
+      typeof spec.body === "object" &&
+      !Array.isArray(spec.body) &&
+      spec.idempotency_key !== undefined;
+    const payload =
+      spec.body === undefined
+        ? undefined
+        : canMerge
+          ? { ...(spec.body as Record<string, unknown>), idempotency_key: spec.idempotency_key }
+          : spec.body;
+    const body = payload === undefined ? undefined : JSON.stringify(payload);
     const headers: Record<string, string> = {
       // 凭据只在此处进入请求头，不落日志
       Authorization: `Bearer ${this.config.token}`,
@@ -344,6 +378,14 @@ export class CoordinatorClient {
           clearTimeout(timer);
         }
         status = response.status;
+        // 只读观察者：拿到状态码即回调，**先于**读取/解析响应体 ——
+        // 即使响应体处理随后失败，状态码也已被如实观察到。
+        // 观察者异常不得影响请求（它只观察，不做决定）。
+        try {
+          spec.on_response?.({ method: spec.method, path: spec.path, status, attempt });
+        } catch {
+          /* 观察者抛错：忽略，请求结果不受影响 */
+        }
         retryAfterMs = parseRetryAfter(response.headers.get("retry-after"), this.deps.now());
 
         const text = await response.text();

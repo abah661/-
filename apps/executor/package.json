@@ -10,11 +10,14 @@
     ".": "./src/index.ts",
     "./core": "./src/core/index.ts",
     "./adapters": "./src/adapters/index.ts",
-    "./result": "./src/result/index.ts"
+    "./result": "./src/result/index.ts",
+    "./daemon": "./src/daemon.ts"
   },
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "start": "tsx src/daemon.ts",
+    "start:json": "tsx src/daemon.ts --json"
   },
   "dependencies": {
     "@dac/protocol": "1.0.0"

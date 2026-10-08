@@ -126,16 +126,17 @@ A 端确认后只换解析器，校验逻辑不动。
 **仍未做的**：真实调用 OpenCode（`DAC_RUN_OPENCODE=1` 显式开启，默认跳过以不烧配额）。
 Codex 适配器侧由 A 端负责。
 
-### 3.3 ⛔ 常驻进程入口（`src/index.ts` 的常驻循环）—— 仍被阻塞
+### 3.3 ✅ 常驻进程入口（已完成于 B4）
 
-当前 `apps/executor/src/index.ts` 导出的是**可组合模块**，
-`core/attempt.ts` 是**单次尝试的编排**，但**常驻循环**（领取 → 执行 → 上报 → 循环）
-未接。
+`apps/executor/src/daemon.ts` 已实现可常驻运行的入口，落实交接单 §4 的 14 项要求。
+`index.ts` 保持「纯导出、无副作用」，与运行入口**刻意分离**（避免 import 即启动常驻进程）。
 
-**阻塞原因（未变）**：缺少「领取任务」的 HTTP 端点契约。A 端答复 v1 覆盖了
-续租/心跳/归属/上报，但**没有描述「领取任务」的请求与应答形状**。
+启动方式：`apps/executor/package.json` 的 `start` / `start:json`。
 
-**这是 B 端唯一真正做不下去的一项**，详见 §四.1。
+证据：`docs/reports/B4-B-executor-daemon.md`；新增 `tests/executor/daemon.test.ts`（37 例全通过）。
+
+> 历史备注：本项曾因缺「领取任务」端点契约而阻塞（原 §四.1）。
+> 该阻塞已解除——B 端直接从 A 端已部署的协调器源码读取到完整契约，见 §6.5。
 
 ### 3.4 开机自启
 
@@ -148,17 +149,20 @@ Codex 适配器侧由 A 端负责。
 
 按重要性排序。**第 1、2 条是硬阻塞**。
 
-### 4.1 ⛔ 领取任务的端点契约（硬阻塞 3.3）
+### 4.1 ✅ 领取任务的端点契约（已解除，曾硬阻塞 3.3）
 
-A 端答复 v1 未包含此项。B 端需要知道：
+已从 A 端协调器源码核实，**无需再答**：
 
-| 问题 | 具体内容 |
+| 问题 | 已核实答案 |
 | --- | --- |
-| 路径与方法 | `POST /v1/projects/<project_id>/tasks/lease`？还是别的形状 |
-| 请求体 | 是否带 `executor_id`、能力声明（支持的 `agent_kind`）、`write_scope`？ |
-| 应答体 | 是否 `{task, lease}` 与续租同形？无任务可领时返回什么（`204`？`200 {task: null}`？） |
-| 幂等键 | scope 名是什么？重试时同一键是否保证**不产生两个租约**（验收 V02） |
-| 竞争语义 | 两个执行器同时领取时，服务端如何保证只产生一个有效领取 |
+| 路径与方法 | `POST /v1/projects/<project_id>/tasks/lease` |
+| 请求体 | `protocol_version`、`executor_id`、`agent_kind`、`capabilities`(≥1)、`idempotency_key` |
+| 应答体 | 有任务 ⇒ `{task, lease}`；**无任务 ⇒ HTTP 200 + `{task:null, lease:null, status:"empty"}`** |
+| 幂等键 | scope 名 `lease_task`，服务端按 `lease_task:<key>` 自算 |
+| 竞争语义 | 服务端在 `project-do.ts` 内串行选取 `ready` + 依赖就绪 + 能力匹配的任务 |
+
+关键点：**空队列是正常路径而不是错误**——B 端据此按交接单 §4 第 5 项
+实现「有上限的空闲轮询」，不抛错、不计故障。
 
 ### 4.2 ⛔ CP-0001 的两点履约说明（硬阻塞联调）
 
@@ -204,23 +208,19 @@ B 端按以下路径实现，若与 A 端实际部署不一致请指出：
 - 每个条目是否含 `sha256` 与 `size`？
 - 校验失败时的期望行为（B 端倾向：拒绝将该包作为任务输入并报 `needs_input`）
 
-### 4.5 ⛔ 协调器分支基线分叉（已核实，硬阻塞联调）
+### 4.5 ✅ 协调器分支基线分叉（已由 A 端解决）
 
-网络恢复后 B 端已完成核实，**结论比原先严重**。详见
-`docs/handoff/B-to-A-remote-integration-check.md`。摘要：
+原核实结论（A 分支 = `67e72da`，与 main 已分叉、且跑在协议冻结**之前**）**现已失效**。
+B4 开工时复核：
 
 | 事实 | 值 |
 | --- | --- |
-| A 分支 | `refs/heads/task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` = `67e72da` |
-| 该分支独有提交 | 4 个（`fb9202f` / `88ff82d` / `2f1e4d5` / `67e72da`） |
-| 与 main 的共同祖先 | `a577d66`（= **冻结锚点**，status 当时仍为 `draft`） |
-| main 是它的祖先吗 | ❌ NO |
-| 它是 main 的祖先吗 | ❌ NO → **两侧已分叉** |
-| 它对 `packages/protocol` 的改动 | 空（未主动改，只是**沿用了冻结点前的旧快照**） |
-| 它上面的 `version.ts` | `status: "draft"`、`frozenAt: null`、**无 `frozenTreeSha`** |
+| A 分支 | `task/TASK-A-COORDINATOR/TASK-A-COORDINATOR-A1` = `2f1d914` |
+| main 是它的祖先吗 | ✅ **YES**（`git merge-base --is-ancestor ae659a9 2f1d914` 退出码 `0`） |
+| 它对 `packages/protocol` 的改动 | 已带上冻结：`version.ts` 为 `status: "frozen"`、`frozenTreeSha: "f9644c44628d5fe8445bcbbb54ad336d7fbe0abc"` |
 
-也就是说 A 的协调器代码**跑在协议冻结之前的世界里**。冻结动作（`00a1acf` 写入
-`frozenTreeSha`）与冻结守卫修复（`bbd57fd`）都只在 main 上。
+即 A 端已把 main 合入自己的分支，协议冻结随之进入 A 侧。**该项不再是阻塞**。
+B4 的工作基线（`d493bd2`）也是该分支的祖先，故 B4 与 A 端处在同一基线上。
 
 好消息是**没有文件级冲突**（A 动 `apps/coordinator` / `packages/codex-adapter` /
 `packages/integration` / `tools/cli`，B 动 `apps/executor` / `tests/executor` /
@@ -307,11 +307,14 @@ vs `双端连接2`）、中文+空格嵌套、中文路径下的敏感文件识�
 （只回 `EXIT=128`，无任何 stdout/stderr），且 `cmd /c` 被工具安全策略拦截。
 **改用 Bash 工具执行 push** 即可拿到完整输出。
 
-### 6.2 ⛔ A 端未把协调器合入 main，且基线分叉
+### 6.2 ✅ A 端已将协调器合入 main 基线（原阻塞已解除）
 
-原文已由 §4.5 取代 —— 核实结果比"未合入"更严重：A 的任务分支基线是
-冻结锚点 `a577d66`（冻结点**之前**），与 main 已分叉。详见 §4.5 与
-`docs/handoff/B-to-A-remote-integration-check.md`。
+原记录：A 的任务分支基线是冻结锚点 `a577d66`（在冻结点**之前**），与 main 分叉。
+
+B4 复核：A1 顶端 `2f1d914` 已**包含** main 顶端 `ae659a9`
+（`git merge-base --is-ancestor` 退出码 `0`），且 `packages/protocol/src/version.ts`
+为 `status: "frozen"` 并带 `frozenTreeSha`。原 §4.5 的分叉结论已失效。
+`a577d66` 仍在该分支历史中，说明是**合并**而非改写历史。
 
 **影响**：B 端的 `CoordinatorClient` 需要真实且与 main 同源的 `apps/coordinator`
 才能端到端验证；A 端 rebase/merge 到位前，P3 无法开始。
@@ -342,6 +345,30 @@ Test Files  1 failed (1)
 
 > 教训：这条缺陷是**模拟测试抓不到的**——模拟测试里我自己拼的输出恰好是旧正则
 > 能解析的格式。这正是 P3 要求真实 CLI 验证的原因。
+
+### 6.5 ✅ B4 又发现 5 处真实契约不符（同类问题的复发与治理）
+
+B4 开工时先读 A 端**已部署**的协调器源码，发现执行器传输层有 5 处与真实服务端不符。
+它们**在既有测试下全绿**——因为假体恰好也错成了同样形状：
+
+| # | 缺陷 | 真实后果 |
+| --- | --- | --- |
+| 1 | `http.ts` 从未把 `idempotency_key` 放进请求体 | 续租/心跳/领取全部 `400` |
+| 2 | `renew` 只认 `{lease:{…}}` 信封，而服务端返回**裸租约** | 真实续租必被拒 → 租约必然中途过期 |
+| 3 | 归属查询读 `response.lease.*`，而字段**平铺在顶层** | 归属永远 `unreachable`，恢复永久 `halt_offline` |
+| 4 | 上报发自定义信封，而服务端按**扁平** `ResultReportSchema` 解析 | 结果永远无法上报 |
+| 5 | 只读端点发送了多余的 `idempotency_key` | schema 不接受 |
+
+已全部按真实契约修正，并**为这些真实形状补了回归测试**（`http-transport.test.ts` 48 例）。
+另有 3 个既有测试**编码了错误契约**，已一并纠正——不是「改测试迁就实现」，
+而是测试原本断言的就是不存在的形状。
+
+> 教训（与 §6.4 同源）：**假体与真实服务端形状不一致**是一类会反复出现的风险。
+> 治理方式是「先读对端源码对齐契约，再写实现与测试」，而不是先写双方都自洽的假体。
+> 已把这条写进 `docs/reports/B4-B-executor-daemon.md` 第二节，供 A 端审查时复核。
+
+> 已同步一处自查：本文件原 §3.3 曾据 `index.ts` 的导出面推断「常驻入口未接」，
+> 结论正确但阻塞原因（缺 `lease_task` 契约）在 A 端落地后已失效，故改为 §3.3/§4.1 的现状写法。
 
 ---
 

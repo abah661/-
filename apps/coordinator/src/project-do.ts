@@ -131,6 +131,20 @@ function reapExpiredLeases(state: ProjectState): void {
   }
 }
 
+/** 兼容部署前已持久化的 repair_pending：仅有真实可返修报告时才回流。 */
+function requeueRecordedRepairs(state: ProjectState): void {
+  for (const task of state.graph?.tasks ?? []) {
+    if (task.status !== "repair_pending" || task.attempts_used > DEFAULT_LIMITS.maxRepairAttempts ||
+        state.leases[task.task_id]) continue;
+    const report = state.reports[task.task_id];
+    if (!report || report.task_id !== task.task_id || report.error_code === null ||
+        ERROR_POLICY[report.error_code].disposition !== "repairable") continue;
+    assertTransition(task.status, "ready");
+    task.status = "ready";
+    task.assigned_executor = null;
+  }
+}
+
 function leaseExpired(lease: Lease): boolean {
   return Date.parse(lease.expires_at) <= Date.now();
 }
@@ -255,6 +269,7 @@ export class ProjectDurableObject {
     const request = parsed.data as LeaseRequest;
     return this.withTransaction(async (_storage, state) => {
       reapExpiredLeases(state);
+      requeueRecordedRepairs(state);
       const key = requireIdempotencyScope(request, `lease_task:${request.executor_id}`);
       const replay = responseForIdempotency(state, key, request);
       if (replay) {

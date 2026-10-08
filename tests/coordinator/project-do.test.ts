@@ -536,6 +536,31 @@ describe("A 审计：调度、恢复和验收边界", () => {
     expect(empty).toMatchObject({ task: null, lease: null, status: "empty" });
   });
 
+  it("部署前遗留的 repair_pending 仅在有可返修报告时于领取事务内恢复", async () => {
+    const storage = new MemoryStorage();
+    const project = new ProjectDurableObject(makeState(storage), {});
+    expect((await post(project, "register_executor", registration)).status).toBe(200);
+    expect((await post(project, "submit_requirement", graph)).status).toBe(201);
+    const { lease } = await json(await post(project, "lease_task", leaseRequest(registration, "old-a1")));
+    const failure = reportFor(lease, { status: "repair_pending", error_code: "TESTS_FAILED",
+      head_sha: lease.binding.base_sha, evidence_id: null, evidence: null, commit_shas: [], changed_files: [] });
+    expect((await post(project, "report_result", failure)).status).toBe(200);
+    const legacy = await storage.get<any>("project_state");
+    legacy.graph.tasks[0].status = "repair_pending";
+    await storage.put("project_state", legacy);
+    const next = await json(await post(project, "lease_task", leaseRequest(registration, "old-a2")));
+    expect(next.lease.attempt_id).toBe("TASK-0001-A2");
+    expect(next.task.attempts_used).toBe(2);
+
+    const blocked = await storage.get<any>("project_state");
+    blocked.graph.tasks[0].status = "repair_pending";
+    blocked.leases = {};
+    blocked.reports[lease.task_id].error_code = "AUTH_EXPIRED";
+    await storage.put("project_state", blocked);
+    const empty = await json(await post(project, "lease_task", leaseRequest(registration, "blocked-not-requeued")));
+    expect(empty.lease).toBeNull();
+  });
+
   it.each([
     { agent_kind: "opencode" }, { evidence_id: "OTHER" }, { commit_shas: [] },
     { error_code: "TESTS_FAILED" }, { changed_files: ["../secret"] }, { changed_files: ["src/.env"] },

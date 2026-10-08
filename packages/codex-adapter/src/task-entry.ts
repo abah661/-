@@ -198,8 +198,10 @@ export async function runSingleATask(options: ATaskOptions): Promise<ATaskOutcom
   if (!health.ok) throw new Error("测试 Worker health 不可达；未领取任务");
   const status = await client.request<{ graph?: unknown }>({ method: "GET", path: "/status" });
   const graph = TaskGraphSchema.parse(status.graph);
-  if (graph.project_id !== options.project_id || graph.binding.base_sha !== options.expected_base_sha ||
-      graph.tasks.find((task) => task.task_id === options.task_id)?.status !== "ready") {
+  const expectedTask = graph.tasks.find((task) => task.task_id === options.task_id);
+  const available = expectedTask?.status === "ready" ||
+    (expectedTask?.status === "repair_pending" && expectedTask.attempts_used <= 2);
+  if (graph.project_id !== options.project_id || graph.binding.base_sha !== options.expected_base_sha || !available) {
     throw new Error("Worker 任务图或 TASK-1002 状态不符合预检；未领取任务");
   }
   // 模型探针在领租约之前进行，避免旧 CLI/网络故障白白消耗 attempt。

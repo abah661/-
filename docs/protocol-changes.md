@@ -64,10 +64,14 @@
 ## 处理流程
 
 1. **提案** — 任一方向仓库提交提案文件，**不直接改代码**。
-2. **列出影响** — 运行 `npm run validate:protocol`，协调器自动列出受影响任务与批次。
+2. **列出影响** — 运行 `npm run validate:protocol` 校验本地协议和样例；
+   该命令当前**不会**查询在线任务或批次。须另从项目状态接口只读列出
+   受影响任务与批次，写入提案后人工核对。
 3. **双方确认** — A 与 B 都需在提案文件上签字（PR review）。
-4. **落地** — 更新 `packages/protocol/`、更新 `PROTOCOL_VERSION` 的次版本号、
-   在 `PROTOCOL_META.changeProposals` 追加提案 ID。
+4. **落地** — 按提案更新协议及实现；对兼容性修订保持线格式
+   `protocol_version` 的主版本字面量不变，只在非线格式元数据与文档中
+   记录修订号。提案**实际落地后**在 `PROTOCOL_META.changeProposals`
+   追加其 ID；破坏性线格式变更按下文提升主版本并处置在途批次。
 5. **重建批次** — 受影响的任务与批次全部作废，按新契约重新规划。
 6. **记录** — 提案文件留在 `docs/proposals/`，不删除。
 
@@ -103,8 +107,10 @@
 > `CP-0001` 详见 `docs/proposals/CP-0001-executor-http-transport.md`。
 > 它定义执行器与协调器之间的 HTTP 传输约定（端点、认证、幂等键、重试分类），
 > **不修改 `packages/protocol/` 任何已有字段**。
-> B 端已确认并完成实现；落地（提升 `PROTOCOL_VERSION` 至 v1.1、
-> 追加 `PROTOCOL_META.changeProposals`）由 A 端执行。
+> B 端已确认并完成实现；A 端仍须核对完整落地范围，随后保持
+> `PROTOCOL_VERSION = "1"` 并在实际落地时追加
+> `PROTOCOL_META.changeProposals`。不能把修订号 `v1.1` 写成线格式字面量
+> `"1.1"`，否则现有 B 执行器请求会被拒绝。
 
 > `CP-0002` 详见 `docs/proposals/CP-0002-integration-conclusion-and-repair.md`。
 > 它涉及新增管理端结论入口及状态转移；在 A、B 双方确认前，不得修改冻结的
@@ -131,4 +137,4 @@
 1. 提 CP 提案（不直接改代码）
 2. 运行 `npm run validate:protocol` 列出受影响任务与批次
 3. 双方 PR review 签字
-4. 落地后提升 `PROTOCOL_VERSION` 并更新 `PROTOCOL_META.changeProposals`
+4. 落地后按兼容性规则处理线格式主版本，并更新 `PROTOCOL_META.changeProposals`

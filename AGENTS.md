@@ -23,6 +23,7 @@
 | 路径 | 内容 | 维护者 |
 | --- | --- | --- |
 | `packages/protocol/` | 协议 v1：schema、状态机、错误分类、样例 | **A（Codex）** |
+| `packages/codex-adapter/src/` | Codex 启动适配与 A 端任务入口；不得改写 B 的公共内核 | **A（Codex）** |
 | `apps/coordinator/` | Worker API 与 Durable Object | **A（Codex）** |
 | `apps/executor/` | Windows 执行器公共内核与适配器 | **B（OpenCode）** |
 | `tools/` | 管理 CLI、校验工具 | 按文件归属，见下 |
@@ -37,6 +38,7 @@
 | `packages/protocol/**` | A | 协议冻结的唯一来源；B 通过变更提案参与 |
 | `apps/coordinator/**` | A | B 不得直接修改 |
 | `apps/executor/**` | B | A 不得覆盖 |
+| `tests/adapters/**` | A | Codex 适配与 A 端入口的独立测试 |
 | `tools/validate-protocol/**` | A | 双方都依赖，改动视为协议改动 |
 | `.github/workflows/**` | A | 属第 11 节"CI/CD 配置"，需审核批准 |
 | `AGENTS.md` | 双方 | 改动需在 PR 中说明理由 |

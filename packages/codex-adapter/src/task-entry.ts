@@ -55,6 +55,11 @@ function requireValue(value: string | undefined, name: string): string {
   return value.trim();
 }
 
+/** HTTP 客户端保留内存中的 token；Git/测试子进程不应再从进程环境继承它。 */
+export function detachCoordinatorToken(env: NodeJS.ProcessEnv): void {
+  delete env.COORDINATOR_API_TOKEN;
+}
+
 export function loadATaskOptions(env: NodeJS.ProcessEnv, argv: readonly string[]): ATaskOptions {
   const missing = ["COORDINATOR_BASE_URL", "COORDINATOR_API_TOKEN", "PROJECT_ID", "EXECUTOR_ID",
     "TARGET_REPO_ROOT", "TARGET_REPO_URL", "EXPECTED_BASE_SHA", "NODE22_PATH", "TASK_ID"]
@@ -156,6 +161,15 @@ function assertNoUnresolvedAttempt(repo: string): void {
   }
 }
 
+/** 不能只信 Codex 说“完成”；探针文件必须真的由受限 CLI 写出。 */
+export function verifyCodexWriteProbe(result: Pick<CodexAdapterResult, "status" | "kill_failed" | "aborted">,
+  file: string, expected: string): void {
+  if (result.status !== "completed" || result.kill_failed || result.aborted ||
+      !existsSync(file) || readFileSync(file, "utf8") !== expected) {
+    throw new Error("Codex 受限写入探针未通过；未领取任务");
+  }
+}
+
 function writeMarker(path: string, state: "in_flight" | "halted" | "reported", lease: Lease, first = false): void {
   writeFileSync(path, JSON.stringify({ task_id: lease.task_id, attempt_id: lease.attempt_id,
     lease_epoch: lease.lease_epoch, state, updated_at: new Date().toISOString() }) + "\n",
@@ -189,6 +203,7 @@ export function buildAReport(input: {
 
 /** 单次领取，不轮询，不自动清理。网络、杀进程或归属不明时保留现场。 */
 export async function runSingleATask(options: ATaskOptions): Promise<ATaskOutcome | null> {
+  detachCoordinatorToken(process.env);
   localPreflight(options);
   assertNoUnresolvedAttempt(options.target_repo);
   const config: ExecutorConfig = { base_url: options.coordinator_url.replace(/\/$/, ""),
@@ -208,6 +223,17 @@ export async function runSingleATask(options: ATaskOptions): Promise<ATaskOutcom
   const probe = await runCodexTask({ prompt: "Reply with OK only.", cwd: options.target_repo,
     sandbox: "read-only", timeout_ms: 90_000 }, options.codex);
   if (probe.status !== "completed" || probe.kill_failed) throw new Error("Codex 只读探针未完成；未领取任务");
+  // 只读模型探针不能证明 Windows 沙箱的写入工具可用。诊断文件留在忽略的 .local，
+  // 不自动清理；写入失败就停在注册/领租约之前，避免白白消耗返修次数。
+  const probeDir = join(options.target_repo, ".local", "codex-write-probes");
+  mkdirSync(probeDir, { recursive: true });
+  const probeName = `probe-${randomUUID()}.txt`;
+  const probeText = `codex-write-${randomUUID()}\n`;
+  const writeProbe = await runCodexTask({
+    prompt: `只做写入能力检查：在当前目录使用 apply_patch 新建 ${probeName}，内容必须恰好是 ${probeText.trim()} 加一个换行。不要读其他目录、运行命令或修改别的文件。`,
+    cwd: probeDir, sandbox: "workspace-write", timeout_ms: 90_000,
+  }, options.codex);
+  verifyCodexWriteProbe(writeProbe, join(probeDir, probeName), probeText);
   const registration = new HttpRegistrationTransport(client);
   const ack = await registration.register({ protocol_version: "1", executor_id: options.executor_id,
     host_label: hostname().slice(0, 64), agent_kind: "codex", capabilities: ["code", "test", "git_push"],

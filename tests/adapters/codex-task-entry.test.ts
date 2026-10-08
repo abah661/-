@@ -1,8 +1,11 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { Lease, TaskNode } from "@dac/protocol";
 import { buildCodexExecArgs, runCodexTask } from "../../packages/codex-adapter/src/index.js";
 import {
-  buildAReport, loadATaskOptions, localPreflight, taskPrompt, validateLeasedTask,
+  buildAReport, detachCoordinatorToken, loadATaskOptions, localPreflight,
+  taskPrompt, validateLeasedTask, verifyCodexWriteProbe,
 } from "../../packages/codex-adapter/src/task-entry.js";
 
 const base = "a9434a87f6f2513e7c32185a8f9a6e365162e253";
@@ -30,6 +33,19 @@ describe("A 端 Codex 单任务门禁", () => {
   it("缺配置一次列全，且未显式准许 push 时不领取", () => {
     expect(() => loadATaskOptions({}, [])).toThrow("COORDINATOR_BASE_URL");
     expect(() => loadATaskOptions(env, [])).toThrow("--push");
+  });
+  it("HTTP token 载入后从子进程环境移除，受限写入探针必须有真实文件", () => {
+    const runtime = { ...env };
+    const options = loadATaskOptions(runtime, ["--push"]);
+    detachCoordinatorToken(runtime);
+    expect(runtime.COORDINATOR_API_TOKEN).toBeUndefined();
+    expect(options.coordinator_token).toBe("fixture-only");
+    const completed = { status: "completed", kill_failed: false, aborted: false } as const;
+    expect(() => verifyCodexWriteProbe(completed,
+      "Z:/codex-probe-definitely-not-created.txt", "expected\n")).toThrow("未领取任务");
+    const knownFile = fileURLToPath(new URL("../../AGENTS.md", import.meta.url));
+    expect(() => verifyCodexWriteProbe(completed, knownFile, "incorrect\n")).toThrow("未领取任务");
+    expect(() => verifyCodexWriteProbe(completed, knownFile, readFileSync(knownFile, "utf8"))).not.toThrow();
   });
   it("授权表不会被参数扩展到别的任务或仓库", () => {
     expect(() => loadATaskOptions({ ...env, TASK_ID: "TASK-1001" }, ["--push"])).toThrow("AUTH-0007");

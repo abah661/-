@@ -42,6 +42,9 @@ describe("CP-0002 批次结论请求边界", () => {
     expect(BatchConclusionRequestSchema.safeParse({ ...request, github_run_id: null }).success).toBe(false);
     expect(BatchConclusionRequestSchema.safeParse({ ...request, conclusion: "superseded", github_run_id: null }).success).toBe(false);
     expect(BatchConclusionRequestSchema.safeParse({ ...request, conclusion: "superseded", github_run_id: null, error_code: null, affected_task_ids: [] }).success).toBe(true);
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, conclusion: "passed" }).success).toBe(false);
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, conclusion: "passed", error_code: null, affected_task_ids: [] }).success).toBe(true);
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, conclusion: "failed", error_code: null }).success).toBe(false);
   });
 });
 

@@ -1,4 +1,6 @@
-import { errorResponse, jsonResponse } from "./api.js";
+import { BatchConclusionRequestSchema, IntegrationBatchSchema } from "@dac/protocol";
+import { ApiError, errorResponse, jsonResponse, parseJson } from "./api.js";
+import { GitHubProjectBindingSchema, verifyGitHubBatchObservation } from "./github-batch-verifier.js";
 import { ProjectDurableObject } from "./project-do.js";
 import type { DurableObjectIdLike } from "./storage.js";
 
@@ -17,6 +19,10 @@ export interface CoordinatorEnv {
   COORDINATOR_API_TOKEN?: string;
   /** Cloudflare secret：JSON 对象，键为 executor_id，值为对应 Bearer token。 */
   COORDINATOR_EXECUTOR_TOKENS_JSON?: string;
+  /** 由 A 配置的非敏感 project_id → GitHub 仓库/工作流固定允许列表。 */
+  COORDINATOR_GITHUB_PROJECT_BINDINGS_JSON?: string;
+  /** 可选的只读 GitHub 凭据；不得从管理请求或执行器读取。 */
+  COORDINATOR_GITHUB_READ_TOKEN?: string;
 }
 
 type Principal = { kind: "admin" } | { kind: "executor"; executorId: string };
@@ -43,6 +49,30 @@ function authorize(request: Request, env: CoordinatorEnv): Principal | null {
     return null;
   }
   return null;
+}
+
+function adminTokenCollision(env: CoordinatorEnv): boolean {
+  if (!env.COORDINATOR_API_TOKEN || !env.COORDINATOR_EXECUTOR_TOKENS_JSON) return false;
+  try {
+    const tokens: unknown = JSON.parse(env.COORDINATOR_EXECUTOR_TOKENS_JSON);
+    if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) return true;
+    return Object.values(tokens).some((value) => value === env.COORDINATOR_API_TOKEN);
+  } catch { return true; }
+}
+
+function githubBinding(env: CoordinatorEnv, projectId: string): unknown {
+  if (!env.COORDINATOR_GITHUB_PROJECT_BINDINGS_JSON) {
+    throw new ApiError(503, "GITHUB_BINDING_UNAVAILABLE", "项目未配置可信 GitHub 绑定");
+  }
+  let config: unknown;
+  try { config = JSON.parse(env.COORDINATOR_GITHUB_PROJECT_BINDINGS_JSON); }
+  catch { throw new ApiError(503, "GITHUB_BINDING_UNAVAILABLE", "可信 GitHub 绑定配置无效"); }
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new ApiError(503, "GITHUB_BINDING_UNAVAILABLE", "可信 GitHub 绑定配置无效");
+  }
+  const parsed = GitHubProjectBindingSchema.safeParse((config as Record<string, unknown>)[projectId]);
+  if (!parsed.success) throw new ApiError(503, "GITHUB_BINDING_UNAVAILABLE", "项目未配置可信 GitHub 绑定");
+  return parsed.data;
 }
 
 async function claimedExecutorId(request: Request, target: RouteTarget): Promise<string | null> {
@@ -122,10 +152,14 @@ function route(pathname: string): RouteTarget | null {
       pathClaims: { task_id: decodeURIComponent(report[1]), attempt_id: decodeURIComponent(report[2]) },
     };
   }
+  const conclusion = routeName.match(/^batches\/([^/]+)\/conclusion$/);
+  if (conclusion?.[1]) {
+    return { projectId, action: "integration_conclusion", pathClaims: { batch_id: decodeURIComponent(conclusion[1]) } };
+  }
   return null;
 }
 
-export function createCoordinatorWorker() {
+export function createCoordinatorWorker(options: { githubFetch?: typeof fetch } = {}) {
   return {
     async fetch(request: Request, env: CoordinatorEnv): Promise<Response> {
       const url = new URL(request.url);
@@ -144,8 +178,11 @@ export function createCoordinatorWorker() {
       }
       const principal = authorize(request, env);
       if (!principal) return errorResponse(401, "AUTH_REQUIRED", "需要有效的 Bearer 认证");
-      if (principal.kind === "executor" && ["submit_requirement", "github_event", "integration_batch"].includes(target.action)) {
+      if (principal.kind === "executor" && ["submit_requirement", "github_event", "integration_batch", "integration_conclusion"].includes(target.action)) {
         return errorResponse(403, "UNAUTHORIZED_OPERATION", "此操作需要管理身份");
+      }
+      if (target.action === "integration_conclusion" && adminTokenCollision(env)) {
+        return errorResponse(503, "AUTH_CONFIGURATION_CONFLICT", "管理与执行器认证配置冲突");
       }
       if (!(await pathClaimsMatch(request, target))) {
         return errorResponse(409, "CONTRACT_MISMATCH", "路径标识与请求体不一致");
@@ -158,6 +195,38 @@ export function createCoordinatorWorker() {
       }
       const id = env.PROJECTS.idFromName(target.projectId);
       const stub = env.PROJECTS.get(id);
+      if (target.action === "integration_conclusion") {
+        if (request.method !== "POST") return errorResponse(404, "NOT_FOUND", "未知协调器操作");
+        try {
+          const parsed = BatchConclusionRequestSchema.safeParse(await parseJson(request));
+          if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "批次结论请求无效", parsed.error.issues);
+          const conclusion = parsed.data;
+          if (conclusion.project_id !== target.projectId) {
+            throw new ApiError(409, "PROJECT_MISMATCH", "批次结论项目与路径不一致");
+          }
+          let observation = null;
+          if (conclusion.conclusion !== "superseded") {
+            const status = await stub.fetch(new Request(new URL("/internal/status", request.url)));
+            if (!status.ok) throw new ApiError(503, "PROJECT_STATUS_UNAVAILABLE", "无法独立读取项目当前批次");
+            const project: unknown = await status.json();
+            const batches = project && typeof project === "object" ? (project as Record<string, unknown>).batches : null;
+            const current = batches && typeof batches === "object" && !Array.isArray(batches)
+              ? (batches as Record<string, unknown>)[conclusion.batch_id] : null;
+            const batch = IntegrationBatchSchema.safeParse(current);
+            if (!batch.success || batch.data.project_id !== target.projectId) {
+              throw new ApiError(404, "BATCH_NOT_FOUND", "当前项目没有该批次");
+            }
+            observation = await verifyGitHubBatchObservation(batch.data, conclusion,
+              githubBinding(env, target.projectId), options.githubFetch ?? fetch, env.COORDINATOR_GITHUB_READ_TOKEN);
+          }
+          const internalUrl = new URL("/internal/integration_conclusion_verified", request.url);
+          return await stub.fetch(new Request(internalUrl, { method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ request: conclusion, observation }) }));
+        } catch (error) {
+          if (error instanceof ApiError) return errorResponse(error.status, error.code, error.message, error.details);
+          return errorResponse(503, "GITHUB_EVIDENCE_UNAVAILABLE", "独立取证失败");
+        }
+      }
       const internalUrl = new URL(`/internal/${target.action}`, request.url);
       internalUrl.search = url.search;
       const internalRequest = new Request(internalUrl, request);

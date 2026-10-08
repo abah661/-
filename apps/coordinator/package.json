@@ -12,6 +12,7 @@
   "dependencies": {
     "@dac/integration": "*",
     "@dac/protocol": "*",
+    "fflate": "0.8.3",
     "zod": "4.1.13"
   }
 }

@@ -98,12 +98,17 @@
 | 编号 | 标题 | 状态 |
 | --- | --- | --- |
 | CP-0001 | 执行器与协调器的 HTTP 传输契约 | **双方已确认，待落地**（目标 v1.1） |
+| CP-0002 | 可信整合结论与失败返修 | **proposed，待 B 审核；未落地**（目标 v1.1） |
 
 > `CP-0001` 详见 `docs/proposals/CP-0001-executor-http-transport.md`。
 > 它定义执行器与协调器之间的 HTTP 传输约定（端点、认证、幂等键、重试分类），
 > **不修改 `packages/protocol/` 任何已有字段**。
 > B 端已确认并完成实现；落地（提升 `PROTOCOL_VERSION` 至 v1.1、
 > 追加 `PROTOCOL_META.changeProposals`）由 A 端执行。
+
+> `CP-0002` 详见 `docs/proposals/CP-0002-integration-conclusion-and-repair.md`。
+> 它涉及新增管理端结论入口及状态转移；在 A、B 双方确认前，不得修改冻结的
+> `packages/protocol/` 或部署该变更。
 
 ---
 

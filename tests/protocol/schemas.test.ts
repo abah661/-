@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  BatchConclusionRequestSchema,
   ResultReportSchema,
   TaskGraphSchema,
   ExecutorRegistrationSchema,
@@ -17,6 +18,32 @@ import {
   validateTimingConfig,
   PROTOCOL_VERSION,
 } from "@dac/protocol";
+
+describe("CP-0002 批次结论请求边界", () => {
+  const request = {
+    protocol_version: "1",
+    project_id: "PROJECT-TEST",
+    batch_id: "BATCH-0001",
+    candidate_heads: ["a".repeat(40)],
+    conclusion: "failed",
+    error_code: "TESTS_FAILED",
+    affected_task_ids: ["TASK-0001"],
+    github_run_id: "12345",
+    idempotency_key: "conclude-1",
+  };
+
+  it("接受定位符，不接受调用方自带的伪造观察", () => {
+    expect(BatchConclusionRequestSchema.safeParse(request).success).toBe(true);
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, observation: { conclusion: "success" } }).success).toBe(false);
+  });
+
+  it("拒绝重复候选、缺失 CI 以及 superseded 夹带返修归因", () => {
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, candidate_heads: [request.candidate_heads[0], request.candidate_heads[0]] }).success).toBe(false);
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, github_run_id: null }).success).toBe(false);
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, conclusion: "superseded", github_run_id: null }).success).toBe(false);
+    expect(BatchConclusionRequestSchema.safeParse({ ...request, conclusion: "superseded", github_run_id: null, error_code: null, affected_task_ids: [] }).success).toBe(true);
+  });
+});
 
 const baseResult = {
   protocol_version: PROTOCOL_VERSION,

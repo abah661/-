@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  BatchConclusionRequestSchema,
   EventEnvelopeSchema,
   ExecutorRegistrationSchema,
   IntegrationBatchSchema,
@@ -80,6 +81,7 @@ export const RequestSchemas = {
   ownershipQuery: OwnershipQuerySchema,
   resultReport: ResultReportSchema,
   integrationBatch: IntegrationBatchSchema,
+  batchConclusion: BatchConclusionRequestSchema,
   eventEnvelope: EventEnvelopeSchema,
   contractProposal: ContractProposalSchema,
 } as const;

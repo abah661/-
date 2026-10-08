@@ -42,6 +42,12 @@ describe("状态机完整性", () => {
 });
 
 describe("正常路径可达性", () => {
+  it("CP-0002 仅允许整合中安全回退，不允许跳过整合直接通过", () => {
+    expect(canTransition("integrating", "ready_for_integration")).toBe(true);
+    expect(canTransition("integrating", "needs_input")).toBe(true);
+    expect(canTransition("ready_for_integration", "passed")).toBe(false);
+    expect(canTransition("needs_input", "passed")).toBe(false);
+  });
   it("draft 到 merged 的完整链路逐跳合法", () => {
     const happyPath = [
       "draft",

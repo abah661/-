@@ -429,3 +429,37 @@ export const IntegrationBatchSchema = z.object({
   tree_sha: ShaSchema.nullable().default(null),
 });
 export type IntegrationBatch = z.infer<typeof IntegrationBatchSchema>;
+
+/** CP-0002：结论请求只携带定位符和断言；可信 CI/Git 观察由服务端重新获取。 */
+export const BatchConclusionRequestSchema = z.object({
+  protocol_version: ProtocolVersionSchema,
+  project_id: z.string().min(1).max(64),
+  batch_id: BatchIdSchema,
+  candidate_heads: z.array(z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)).min(1),
+  conclusion: z.enum(["passed", "failed", "superseded"]),
+  error_code: ErrorCodeSchema.nullable(),
+  affected_task_ids: z.array(TaskIdSchema),
+  github_run_id: z.string().regex(/^[1-9][0-9]*$/).nullable(),
+  idempotency_key: z.string().min(1).max(200),
+}).strict().superRefine((request, ctx) => {
+  if (new Set(request.candidate_heads).size !== request.candidate_heads.length) {
+    ctx.addIssue({ code: "custom", path: ["candidate_heads"], message: "候选提交不得重复" });
+  }
+  if (new Set(request.affected_task_ids).size !== request.affected_task_ids.length) {
+    ctx.addIssue({ code: "custom", path: ["affected_task_ids"], message: "受影响任务不得重复" });
+  }
+  if (request.conclusion === "superseded") {
+    if (request.github_run_id !== null || request.error_code !== null || request.affected_task_ids.length !== 0) {
+      ctx.addIssue({ code: "custom", path: ["conclusion"], message: "superseded 不接受 CI、代码错误或自动返修归因" });
+    }
+  } else if (request.github_run_id === null) {
+    ctx.addIssue({ code: "custom", path: ["github_run_id"], message: "通过或失败结论必须有 GitHub run ID" });
+  }
+  if (request.conclusion === "passed" && (request.error_code !== null || request.affected_task_ids.length !== 0)) {
+    ctx.addIssue({ code: "custom", path: ["conclusion"], message: "通过结论不得夹带错误或返修任务" });
+  }
+  if (request.conclusion === "failed" && request.error_code === null) {
+    ctx.addIssue({ code: "custom", path: ["error_code"], message: "失败结论必须明确错误分类" });
+  }
+});
+export type BatchConclusionRequest = z.infer<typeof BatchConclusionRequestSchema>;

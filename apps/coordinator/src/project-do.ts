@@ -1,6 +1,7 @@
 import {
   assertTransition,
   analyzeGraph,
+  BatchConclusionRequestSchema,
   DEFAULT_LIMITS,
   DEFAULT_TIMING,
   ERROR_POLICY,
@@ -43,11 +44,24 @@ import {
 } from "./storage.js";
 import { safelyParallel, validatePlannedTask, validateReadyReport } from "./policy.js";
 import { parsePendingIntegrationBatch } from "@dac/integration";
+import { applyVerifiedBatchConclusion, type ServerVerifiedBatchObservation } from "./batch-conclusion.js";
 
 const INTERNAL_PREFIX = "/internal/";
 
 function fingerprint(value: unknown): string {
   return JSON.stringify(value);
+}
+
+/** CP-0002：同一固定组合不能换个 batch_id 无限重跑。顺序是契约的一部分。 */
+function batchSignature(batch: IntegrationBatch): string {
+  return fingerprint({
+    base_sha: batch.base_sha,
+    rules_sha: batch.rules_sha,
+    contract_sha: batch.contract_sha,
+    acceptance_sha: batch.acceptance_sha,
+    candidate_heads: batch.candidate_heads,
+    trusted_workflow: batch.trusted_workflow,
+  });
 }
 
 function publicTask(task: TaskNode): TaskNode {
@@ -211,6 +225,9 @@ export class ProjectDurableObject {
         return this.receiveGithubEvent(await parseJson(request));
       case "POST integration_batch":
         return this.createIntegrationBatch(await parseJson(request));
+      // 仅内部调用；公网 Worker 尚未暴露结论路由，必须先完成服务端 GitHub 取证。
+      case "POST integration_conclusion_verified":
+        return this.concludeVerifiedIntegrationBatch(await parseJson(request));
       case "GET status":
         return this.status();
       case "GET context":
@@ -291,6 +308,10 @@ export class ProjectDurableObject {
       }
       const task = graph.tasks.find(
         (candidate) => candidate.status === "ready" && dependencyReady(state, candidate) && hasCapabilities(candidate, registration) &&
+          // CP-0002：整合失败后的返修只归原执行器，不能被另一台同能力机器误领。
+          (state.reports[candidate.task_id]?.status !== "ready_for_integration" ||
+            (state.reports[candidate.task_id]?.executor_id === registration.executor_id &&
+             state.reports[candidate.task_id]?.agent_kind === registration.agent_kind)) &&
           candidate.requires.every((capability) => request.capabilities.includes(capability)) &&
           graph.tasks.every((other) => !["leased", "running", "validating", "ready_for_integration", "integrating"].includes(other.status) || safelyParallel(candidate, other)),
       );
@@ -527,6 +548,9 @@ export class ProjectDurableObject {
       if (Object.values(state.batches).some((current) => current.conclusion === "pending")) {
         throw new ApiError(409, "BATCH_BUSY", "每个项目只允许一个活动整合批次");
       }
+      if (Object.values(state.batches).some((current) => batchSignature(current) === batchSignature(batch))) {
+        throw new ApiError(409, "BATCH_REPEATED", "固定候选与版本组合已建批；必须有新候选或新绑定，不能只换 batch_id");
+      }
       for (const field of ["base_sha", "rules_sha", "contract_sha", "acceptance_sha"] as const) {
         if (batch[field] !== graph.binding[field]) throw new ApiError(409, "VERSION_BINDING_MISMATCH", "批次版本与任务图不一致");
       }
@@ -542,6 +566,26 @@ export class ProjectDurableObject {
       const body = { accepted: true, batch_id: batch.batch_id, conclusion: batch.conclusion };
       saveIdempotent(state, key, batch, body, 201);
       return jsonResponse(body, 201);
+    });
+  }
+
+  private async concludeVerifiedIntegrationBatch(input: unknown): Promise<Response> {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new ApiError(400, "RESULT_SCHEMA_INVALID", "批次结论载荷无效");
+    }
+    const payload = input as Record<string, unknown>;
+    const parsed = BatchConclusionRequestSchema.safeParse(payload.request);
+    if (!parsed.success) throw new ApiError(400, "RESULT_SCHEMA_INVALID", "批次结论请求无效", parsed.error.issues);
+    const request = parsed.data;
+    if (request.project_id !== this.projectId) throw new ApiError(409, "PROJECT_MISMATCH", "批次结论项目与实例不一致");
+    const observation = payload.observation as ServerVerifiedBatchObservation | null;
+    return this.withTransaction(async (_storage, state) => {
+      const key = `batch_conclusion:${request.batch_id}:${request.idempotency_key}`;
+      const replay = responseForIdempotency(state, key, request);
+      if (replay) return replay;
+      const receipt = applyVerifiedBatchConclusion(state, request, observation);
+      saveIdempotent(state, key, request, receipt, 200);
+      return jsonResponse(receipt);
     });
   }
 

@@ -21,7 +21,8 @@
  * 1. `frozenTreeSha` 是**冻结点自身子树**的哈希——这是一个可复核的历史事实，
  *    断言它等于 `git rev-parse <frozenAt>:packages/protocol` 即可。
  * 2. "冻结后有没有人偷偷改协议"则改用**逐文件 blob 比对**，把
- *    `version.ts`（冻结记录载体）排除在外，其余每个文件都必须与冻结点逐字节相同。
+ *    `version.ts`（冻结记录载体）排除在外。经双方确认的提案只放行
+ *    明确列出的文件与精确 blob；其余文件仍与 v1 冻结点逐字节相同。
  *
  * 这样既保住了冻结的真实保障，又不会因为记录冻结这个动作本身而自我否定。
  */
@@ -53,6 +54,16 @@ let gitBin: string | null = null;
  * "冻结后内容未变"的比对。仓库内以 `packages/protocol/` 为前缀的相对路径。
  */
 const FREEZE_RECORD_PATH = "packages/protocol/src/version.ts";
+
+/**
+ * 验收基线变更（CP-0002）：只允许双方确认的两处协议文件达到指定内容。
+ * 这里记录 Git blob 哈希，而非通配路径或“改了就放行”的逻辑；v1 冻结锚点不变。
+ * CP-0002 尚在任务分支落地，PROTOCOL_META.changeProposals 不提前宣称完成。
+ */
+const APPROVED_REVISION_BLOBS = new Map<string, { proposal: string; blob: string }>([
+  ["packages/protocol/src/status.ts", { proposal: "CP-0002", blob: "a8a01bae3f3c12bda4b9ae4768b3bd8b9001bdad" }],
+  ["packages/protocol/src/schemas.ts", { proposal: "CP-0002", blob: "932a6c77af953c1c614ea2886e67025ba89cafba" }],
+]);
 
 function resolveGit(): string | null {
   for (const candidate of GIT_CANDIDATES) {
@@ -167,9 +178,8 @@ describe("冻结记录与实际仓库的一致性", () => {
     expect(PROTOCOL_META.frozenTreeSha).not.toBe(rootTree);
   }, GIT_TEST_TIMEOUT);
 
-  it("冻结之后协议包内容未发生改动（逐文件比对，排除冻结记录载体）", () => {
-    // 这是冻结的核心保证：从冻结提交到现在，协议包的实质内容应保持不变。
-    // 若此断言失败，说明有人改了协议却没走变更提案流程。
+  it("冻结后协议文件只允许已批准提案的精确 blob（逐文件比对）", () => {
+    // 若此断言失败，说明有人改了协议却没走变更提案流程，或批准后的内容被改写。
     //
     // 为什么不直接比子树哈希？因为冻结记录就在 packages/protocol/src/version.ts 里，
     // 记录冻结这个动作本身就会改变子树哈希，自引用会导致断言永远无法成立。
@@ -181,14 +191,21 @@ describe("冻结记录与实际仓库的一致性", () => {
     for (const [path, sha] of frozenSnapshot) {
       if (path === FREEZE_RECORD_PATH) continue;
       const now = headSnapshot.get(path);
-      if (now !== sha) {
-        changed.push(`${path}  (${sha.slice(0, 12)} → ${now ? now.slice(0, 12) : "已删除"})`);
+      const approved = APPROVED_REVISION_BLOBS.get(path);
+      const expected = approved?.blob ?? sha;
+      if (now !== expected) {
+        changed.push(`${path}  (期望 ${expected.slice(0, 12)} → ${now ? now.slice(0, 12) : "已删除"})`);
       }
     }
     expect(
       changed,
       `以下协议文件在冻结后被改动（应走变更提案流程）：\n${changed.join("\n")}`,
     ).toEqual([]);
+    for (const [path, revision] of APPROVED_REVISION_BLOBS) {
+      expect(frozenSnapshot.has(path), `${revision.proposal} 不得用新增文件绕过 v1 冻结点`).toBe(true);
+      expect(revision.blob, `${revision.proposal} 必须确有变更`).not.toBe(frozenSnapshot.get(path));
+      expect(headSnapshot.get(path), `${revision.proposal} 精确 blob 尚未提交`).toBe(revision.blob);
+    }
   });
 
   it("协议包内没有新增文件（排除冻结记录载体）", () => {

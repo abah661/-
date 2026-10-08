@@ -583,6 +583,60 @@ describe("A 审计：调度、恢复和验收边界", () => {
     expect((await post(project, "integration_batch", { ...batch, batch_id: "BATCH-0002" })).status).toBe(409);
   });
 
+  it("CP-0002 已终结批次不可只换 ID 重跑同一固定组合", async () => {
+    const storage = new MemoryStorage();
+    const project = new ProjectDurableObject(makeState(storage), { PROJECTS: { idFromName: () => ({}) } });
+    expect((await post(project, "register_executor", registration)).status).toBe(200);
+    expect((await post(project, "submit_requirement", graph)).status).toBe(201);
+    const { lease } = await json(await post(project, "lease_task", leaseRequest()));
+    expect((await post(project, "report_result", reportFor(lease))).status).toBe(200);
+    const batch = { batch_id: "BATCH-0001", project_id: graph.project_id, ...binding,
+      candidate_heads: ["5".repeat(40)], trusted_workflow: `.github/workflows/integration.yml@${"a".repeat(40)}`,
+      created_at: new Date().toISOString(), conclusion: "pending" };
+    expect((await post(project, "integration_batch", batch)).status).toBe(201);
+    const state = await storage.get<any>("project_state");
+    state.batches[batch.batch_id].conclusion = "failed";
+    state.graph.tasks[0].status = "ready_for_integration";
+    await storage.put("project_state", state);
+    const repeated = await post(project, "integration_batch", { ...batch, batch_id: "BATCH-0002" });
+    expect(repeated.status).toBe(409);
+    expect(await json(repeated)).toMatchObject({ error: { code: "BATCH_REPEATED" } });
+    const after = await storage.get<any>("project_state");
+    expect(after.graph.tasks[0].status).toBe("ready_for_integration");
+    expect(after.batches["BATCH-0002"]).toBeUndefined();
+  });
+
+  it("CP-0002 独立失败结论幂等，并仅允许原执行器领取 A2", async () => {
+    const project = await prepared();
+    const { lease } = await json(await post(project, "lease_task", leaseRequest()));
+    expect((await post(project, "report_result", reportFor(lease))).status).toBe(200);
+    const batch = { batch_id: "BATCH-0001", project_id: graph.project_id, ...binding,
+      candidate_heads: ["5".repeat(40)], trusted_workflow: `.github/workflows/integration.yml@${"a".repeat(40)}`,
+      created_at: new Date().toISOString(), conclusion: "pending" };
+    expect((await post(project, "integration_batch", batch)).status).toBe(201);
+    const request = { protocol_version: "1", project_id: graph.project_id, batch_id: batch.batch_id,
+      candidate_heads: batch.candidate_heads, conclusion: "failed", error_code: "TESTS_FAILED",
+      affected_task_ids: ["TASK-0001"], github_run_id: "42", idempotency_key: "batch-conclusion-1" };
+    const observation = { batch_id: batch.batch_id, project_id: graph.project_id, ...binding,
+      candidate_heads: batch.candidate_heads, trusted_workflow: batch.trusted_workflow,
+      ci_run_id: "42", conclusion: "failure", merged_sha: "c".repeat(40), tree_sha: "d".repeat(40),
+      affected_task_ids: ["TASK-0001"], evidence: null };
+    const payload = { request, observation };
+    const first = await post(project, "integration_conclusion_verified", payload);
+    expect(first.status).toBe(200);
+    expect(await json(first)).toMatchObject({ conclusion: "failed", task_statuses: { "TASK-0001": "ready" } });
+    const replay = await post(project, "integration_conclusion_verified", payload);
+    expect(replay.headers.get("x-idempotent-replay")).toBe("true");
+    expect((await post(project, "integration_conclusion_verified", {
+      ...payload, request: { ...request, conclusion: "passed", error_code: null, affected_task_ids: [] },
+    })).status).toBe(409);
+    const wrong = await json(await post(project, "lease_task", leaseRequest(secondRegistration, "wrong-machine")));
+    expect(wrong.task).toBeNull();
+    const next = await json(await post(project, "lease_task", leaseRequest(registration, "repair-A2")));
+    expect(next.lease.attempt_id).toBe("TASK-0001-A2");
+    expect(next.lease.executor_id).toBe(registration.executor_id);
+  });
+
   it("GitHub 事件入口拒绝跨项目和非 GitHub 事件", async () => {
     const project = await prepared();
     const event = { event_id: "event", event_type: "batch.passed", protocol_version: "1", project_id: graph.project_id, occurred_at: new Date().toISOString() };

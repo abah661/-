@@ -90,7 +90,8 @@ export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]
   ready_for_integration: ["integrating", "repair_pending", "cancelled"],
 
   // 组合构建与测试进行中
-  integrating: ["passed", "repair_pending", "cancelled"],
+  // CP-0002：失败批次只返修有归因候选；其他候选回待整合，未知故障安全阻塞。
+  integrating: ["passed", "repair_pending", "ready_for_integration", "needs_input", "cancelled"],
 
   // 组合测试通过，等待授权合并
   passed: ["merged", "blocked_approval", "repair_pending", "cancelled"],

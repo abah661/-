@@ -31,7 +31,7 @@ const request = BatchConclusionRequestSchema.parse({
 function fixture() {
   const run: Record<string, unknown> = {
     id: 42, status: "completed", conclusion: "success", event: "push",
-    path: `${binding.workflow_path}@task/TASK-1003/TASK-1003-A2`,
+    path: binding.workflow_path,
     head_repository: { full_name: "example/project" }, head_sha: runHead,
     head_branch: "task/TASK-1003/TASK-1003-A2", run_attempt: 1,
   };
@@ -83,6 +83,10 @@ describe("CP-0002 GitHub 独立批次取证", () => {
     expect(result).toMatchObject({ batch_id: batch.batch_id, ci_run_id: "42", conclusion: "success",
       merged_sha: sha("f"), tree_sha: tree, affected_task_ids: [] });
     expect(result.evidence?.tests).toMatchObject({ passed: 3, failed: 0 });
+    mock.run.path = `${binding.workflow_path}@task/TASK-1003/TASK-1003-A2`;
+    await expect(verifyGitHubBatchObservation(batch, request, binding, mock.fetcher)).resolves.toMatchObject({
+      ci_run_id: "42", conclusion: "success",
+    });
   });
 
   it("固定项目绑定、run 身份或工作流 blob 不符时拒绝", async () => {
@@ -94,7 +98,7 @@ describe("CP-0002 GitHub 独立批次取证", () => {
     mock.run.id = 43;
     await expect(verifyGitHubBatchObservation(batch, request, binding, mock.fetcher)).rejects.toThrow(/首次完成运行/);
     mock.run.id = 42;
-    mock.run.path = binding.workflow_path;
+    mock.run.path = `${binding.workflow_path}@main`;
     await expect(verifyGitHubBatchObservation(batch, request, binding, mock.fetcher)).rejects.toThrow(/首次完成运行/);
     mock.run.path = `${binding.workflow_path}@task/TASK-1003/TASK-1003-A2`;
     mock.content.sha = sha("1");

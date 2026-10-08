@@ -119,9 +119,10 @@ export async function verifyGitHubBatchObservation(
   const run = await apiJson(fetcher, `${repo}/actions/runs/${request.github_run_id}`, token);
   const runRepo = record(run.head_repository);
   const runConclusion = request.conclusion === "passed" ? "success" : "failure";
-  const expectedRunPath = typeof run.head_branch === "string" ? `${binding.workflow_path}@${run.head_branch}` : "";
+  const runBranch = typeof run.head_branch === "string" ? run.head_branch : "";
+  const runPathMatches = run.path === binding.workflow_path || run.path === `${binding.workflow_path}@${runBranch}`;
   if (run.id !== Number(request.github_run_id) || run.status !== "completed" || run.conclusion !== runConclusion || run.event !== "push" ||
-      run.path !== expectedRunPath || runRepo.full_name !== `${binding.owner}/${binding.repo}` ||
+      !runPathMatches || runRepo.full_name !== `${binding.owner}/${binding.repo}` ||
       typeof run.head_sha !== "string" || !fullSha.safeParse(run.head_sha).success ||
       typeof run.head_branch !== "string" || !run.head_branch.startsWith(binding.branch_prefix) ||
       run.run_attempt !== 1) {

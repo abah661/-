@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Lease, TaskNode } from "@dac/protocol";
 import { buildCodexExecArgs, runCodexTask } from "../../packages/codex-adapter/src/index.js";
 import {
-  buildAReport, detachCoordinatorToken, loadATaskOptions, localPreflight,
+  buildAReport, detachCoordinatorToken, gateDisplayEntrypoint, loadATaskOptions, localPreflight,
   taskPrompt, validateLeasedTask, verifyCodexWriteProbe,
 } from "../../packages/codex-adapter/src/task-entry.js";
 
@@ -75,7 +75,15 @@ describe("A 端 Codex 单任务门禁", () => {
     const prompt = taskPrompt(task, lease);
     expect(prompt).toContain("不要自行 git commit/push/merge");
     expect(prompt).toContain("src/display/**");
+    expect(prompt).toContain("src/display/render-user.js");
     expect(prompt).not.toContain("fixture-only");
+  });
+  it("自测通过但缺少冻结组合验收入口时禁止提交并请求返修", () => {
+    const ready = { status: "ready_for_integration", code: null } as const;
+    expect(gateDisplayEntrypoint(ready, false)).toEqual({ status: "repair_pending", code: "AGENT_INVALID_OUTPUT" });
+    expect(gateDisplayEntrypoint(ready, true)).toEqual(ready);
+    const blocked = { status: "blocked_auth", code: "AUTH_EXPIRED" } as const;
+    expect(gateDisplayEntrypoint(blocked, false)).toEqual(blocked);
   });
   it("协议报告需要真实提交、绿测证据；失败不能伪装成功", () => {
     const evidence = { evidence_id: "EVID-TASK-1002-A1-1", command: ["node", "--test"],

@@ -147,6 +147,7 @@ export function taskPrompt(task: TaskNode, lease: Lease): string {
     "先阅读本 worktree 的 AGENTS.md、contracts/user-profile.v1.json、docs/acceptance-v1.md。",
     `冻结基线 ${lease.binding.base_sha}；不要修改契约、验收、CI、规则或 provider。`,
     "本仓库 package.json 声明 type=module；.js 文件必须使用 ESM import/export，不能用 require/exports。",
+    "冻结独立验收会直接导入 src/display/render-user.js 的具名导出 renderUser；必须创建此文件，不能只写 src/display/index.js。",
     `只准写 ${task.write_scope.allow.join("、")}；deny 优先。不要自行 git commit/push/merge，执行器负责测试、提交和推送。`,
     `验收条件：${task.acceptance_criteria.join("；")}`,
     "不得删除已有文件或 Git 历史，不得修改密钥、.env、CI/CD、数据库、系统配置，不得安装全局依赖或部署。",
@@ -193,6 +194,16 @@ function resultStatus(result: CodexAdapterResult): { status: ResultStatus; code:
   if (result.status === "retryable") return { status: "repair_pending", code: result.error_code ?? "RATE_LIMITED" };
   if (result.status === "failed") return { status: "repair_pending", code: result.error_code ?? "AGENT_NONZERO_EXIT" };
   return { status: "ready_for_integration", code: null };
+}
+
+/** 单任务自测不能替代固定组合验收；缺少其入口时直接进入返修，不提交或推送。 */
+export function gateDisplayEntrypoint(
+  result: { status: ResultStatus; code: ErrorCode | null }, entryPresent: boolean,
+): { status: ResultStatus; code: ErrorCode | null } {
+  if (result.status === "ready_for_integration" && !entryPresent) {
+    return { status: "repair_pending", code: "AGENT_INVALID_OUTPUT" };
+  }
+  return result;
 }
 
 export function buildAReport(input: {
@@ -300,7 +311,8 @@ export async function runSingleATask(options: ATaskOptions): Promise<ATaskOutcom
     const agent = await runCodexTask({ prompt: taskPrompt(task, lease), cwd: prepared.path,
       sandbox: "workspace-write", timeout_ms: 900_000, signal: abort.signal }, options.codex);
     if (leaseUnsafe || agent.aborted || agent.kill_failed) throw new Error("Agent 进程或租约状态不安全，保留现场不上报");
-    let { status: taskStatus, code } = resultStatus(agent);
+    let { status: taskStatus, code } = gateDisplayEntrypoint(resultStatus(agent),
+      existsSync(join(prepared.path, "src", "display", "render-user.js")));
     let evidence: TestEvidence | null = null;
     let changed: readonly string[] = [];
     const base = lease.binding.base_sha;

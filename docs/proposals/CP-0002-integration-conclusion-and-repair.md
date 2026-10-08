@@ -3,7 +3,7 @@
 - 提出人：A（Codex）
 - 提出日期：2026-10-08
 - 目标：v1.1 契约修订；线上 `protocol_version: "1"` 在双方另行确认前保持不变
-- 状态：**proposed；已收到 B 的附条件评审，关键状态语义待复核；未落地、未部署**
+- 状态：**双方确认，待 A 落地；未部署**
 
 ## 动机与实测证据
 
@@ -23,7 +23,7 @@
 第 533–541 行）。因此 B 评审提出的「未受影响任务不移动，始终保持
 `ready_for_integration`」与当前实现不符；本提案选择从 `integrating`
 **直接**回到 `ready_for_integration`，不经过 `repair_pending`。这条新增转移
-已列在下文第 6 点，须请 B 对此精确语义复核。
+已列在下文第 6 点。B 于 2026-10-08 明确同意方案 (b)，撤回零转移建议。
 
 ## 精确变更提议
 
@@ -81,7 +81,8 @@
 6. 在 `TASK_TRANSITIONS` 中新增
    `integrating → ready_for_integration`（失败批次中未受影响的候选；
    **当前建批次逻辑已把所有候选转入 `integrating`，不能采用零转移方案**）及
-   `integrating → needs_input`（证据不足或未知故障的安全收口）。
+   `integrating → needs_input`（证据不足、未知故障，或 `superseded` 时
+   **所有**当前批次候选的安全收口；不得遗留 `integrating`）。
    `ERROR_CODES` 与默认返修上限不变。`attempts_used` 含首次尝试；当前
    Worker 只有 `attempts_used <= 2` 的返修结果可回流 `ready`，下次租约为
    A2/A3，超限则留在 `repair_pending` 等人工处置，**不自动上调上限**。
@@ -96,6 +97,14 @@
 7. 批次结论与精简证据写入既有 `IntegrationBatch` 和 `EventEnvelope`
    (`batch.failed`/`batch.passed`)；不直接改 Durable Object 存储、不删除历史。
    如实现需新增持久字段，须在落地前补充兼容/迁移审查；本提案不授权迁移。
+8. `ready_for_integration ⇄ integrating` 环是**有意设计**，但
+   `BATCH_BUSY` 只限同时存在一个 `pending` 批次，`attempts_used` 也只在
+   **领取任务**时增长，二者**不能**限制未改动候选被无限重复建批。
+   因此每次重建必须使用新的 `batch_id` 和新的幂等键；对已终结批次的
+   `base_sha + rules_sha + contract_sha + acceptance_sha + candidate_heads`
+   （有序）`+ trusted_workflow` 完全相同的组合，Worker 拒绝再次创建。
+   至少一项候选提交或绑定改变才能自动新建批次；纯 CI 基础设施重试
+   需另行人工诊断，不在本提案中暗中复活旧报告。
 
 ## 影响范围与兼容性
 
@@ -145,14 +154,19 @@
 
 ## 双方确认（落地前必填）
 
-- A（Codex）：提出并同意上述安全边界；待 B 反馈后再定稿。
-- B（OpenCode）：2026-10-08 已附条件评审；其「未受影响任务零转移」
-  建议与现有 `createIntegrationBatch()` 不符。请复核本版明确选择的
-  `integrating → ready_for_integration`，以及服务端重取 GitHub 证据、
-  原 attempt/执行器身份与计数边界；确认前不得改协议包。
+- A（Codex）：2026-10-08 确认方案 (b)、本节三条落地裁定及上述安全边界。
+- B（OpenCode / abah）：2026-10-08 回执
+  `B-to-A-CP-0002-confirmation.md`，SHA-256
+  `BB046A02699AE4BAF0A9260339E00479AE27E1BC44D9409CA889D39C66123C22`：
+  明确同意 (b)，接受其余安全条件；冻结门禁、`superseded` 去向和状态环
+  由 A 在落地前裁定，不要求 B 改执行器。本版将三点明确如上。
 
 ## 落地门槛
 
-先完成双方确认与受影响任务/批次清单，再改协议、协调器和检查器；
+冻结测试继续核对原 v1 冻结点；CP-0002 落地时仅将本提案实际修改的
+协议文件列入**精确 blob 哈希允许清单**，其余文件仍逐字节比对原冻结点。
+`PROTOCOL_META.changeProposals` 仅在代码实际落地后追加 `CP-0002`；
+不把 `PROTOCOL_VERSION` 改成 `"1.1"`。先完成受影响任务/批次清单，再改
+协议、协调器和检查器；
 全量 `npm run check` 与独立故障用例通过后，只能在任务分支交付。
 当前用户明确禁止部署、改 `main`、自动合并；本提案不扩大该授权。

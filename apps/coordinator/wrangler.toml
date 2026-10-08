@@ -15,3 +15,4 @@ new_sqlite_classes = ["ProjectDurableObject"]
 # COORDINATOR_API_TOKEN is intentionally not stored here.
 # Set it only as a Wrangler secret in the test environment.
 # COORDINATOR_EXECUTOR_TOKENS_JSON must also be injected as a Wrangler secret.
+COORDINATOR_GITHUB_PROJECT_BINDINGS_JSON = "{\"demo-user-profile-p3\":{\"owner\":\"hdsakj-sudo\",\"repo\":\"first-one\",\"workflow_path\":\".github/workflows/p3-integration-evidence.yml\",\"workflow_blob_sha\":\"ea22e2953cf4b8ef63fe89b7a202cfe147ca8a8f\",\"branch_prefix\":\"task/TASK-1003/\",\"artifact_name\":\"p3-batch-evidence\"}}"

@@ -23,6 +23,12 @@ const SHA = /^[0-9a-f]{40}$/;
 const EXECUTOR = /^EXE-A-[0-9A-Z-]{2,32}$/;
 const TASK = /^TASK-[0-9]{4,}$/;
 const DEFAULT_TARGET = "https://github.com/hdsakj-sudo/first-one";
+const REGRESSION_PROJECT = "a-codex-regression-20261008";
+
+function authorizedTaskProject(taskId: string, projectId: string): boolean {
+  return (taskId === "TASK-1002" && projectId === "demo-user-profile-p3") ||
+    (taskId === "TASK-1004" && projectId === REGRESSION_PROJECT);
+}
 
 export interface ATaskOptions {
   coordinator_url: string;
@@ -35,7 +41,7 @@ export interface ATaskOptions {
   expected_base_sha: string;
   node22_path: string;
   codex: CodexAdapterConfig;
-  /** 必须由调用者显式置 true；入口只接受授权表里的目标与 TASK-1002 分支。 */
+  /** 必须由调用者显式置 true；入口只接受授权表里的目标、任务与隔离项目。 */
   push_authorized: boolean;
 }
 
@@ -85,8 +91,9 @@ export function loadATaskOptions(env: NodeJS.ProcessEnv, argv: readonly string[]
   if (!EXECUTOR.test(options.executor_id)) throw new Error("EXECUTOR_ID 必须是 EXE-A-... 格式");
   if (!TASK.test(options.task_id) || !SHA.test(options.expected_base_sha)) throw new Error("任务 ID 或固定基线 SHA 无效");
   if (!options.push_authorized) throw new Error("缺少 --push；未授权推送时不领取租约");
-  if (options.task_id !== "TASK-1002" || normalizeRemote(options.target_remote_url) !== DEFAULT_TARGET) {
-    throw new Error("此入口仅覆盖 AUTH-0007 的 first-one / TASK-1002，不自动扩展授权");
+  if (!authorizedTaskProject(options.task_id, options.project_id) ||
+      normalizeRemote(options.target_remote_url) !== DEFAULT_TARGET) {
+    throw new Error("此入口仅覆盖 AUTH-0007 和 TASK-1004 的已授权仓库/隔离项目，不自动扩展授权");
   }
   return options;
 }
@@ -103,7 +110,7 @@ function checkedGit(repo: string, args: readonly string[], label: string): strin
 
 /** 全部在领租约之前完成；任何一项不满足都不触发云端写入。 */
 export function localPreflight(options: ATaskOptions): void {
-  if (options.task_id !== "TASK-1002" || !options.push_authorized ||
+  if (!authorizedTaskProject(options.task_id, options.project_id) || !options.push_authorized ||
       normalizeRemote(options.target_remote_url) !== DEFAULT_TARGET) throw new Error("推送授权范围不匹配");
   if (!existsSync(options.target_repo)) throw new Error("目标业务仓库不存在");
   if (!existsSync(options.node22_path)) throw new Error("Node 22 可执行文件不存在");
@@ -139,7 +146,7 @@ export function taskPrompt(task: TaskNode, lease: Lease): string {
     `仅完成 ${task.task_id}：${task.title}。attempt=${lease.attempt_id}。`,
     "先阅读本 worktree 的 AGENTS.md、contracts/user-profile.v1.json、docs/acceptance-v1.md。",
     `冻结基线 ${lease.binding.base_sha}；不要修改契约、验收、CI、规则或 provider。`,
-    "本仓库 package.json 声明 type=module；.js 文件必须使用 ESM import/export，不能用 require/exports。上一尝试的测试正因此失败。",
+    "本仓库 package.json 声明 type=module；.js 文件必须使用 ESM import/export，不能用 require/exports。",
     `只准写 ${task.write_scope.allow.join("、")}；deny 优先。不要自行 git commit/push/merge，执行器负责测试、提交和推送。`,
     `验收条件：${task.acceptance_criteria.join("；")}`,
     "不得删除已有文件或 Git 历史，不得修改密钥、.env、CI/CD、数据库、系统配置，不得安装全局依赖或部署。",
@@ -221,7 +228,7 @@ export async function runSingleATask(options: ATaskOptions): Promise<ATaskOutcom
   const available = expectedTask?.status === "ready" ||
     (expectedTask?.status === "repair_pending" && expectedTask.attempts_used <= 2);
   if (graph.project_id !== options.project_id || graph.binding.base_sha !== options.expected_base_sha || !available) {
-    throw new Error("Worker 任务图或 TASK-1002 状态不符合预检；未领取任务");
+    throw new Error("Worker 任务图或目标任务状态不符合预检；未领取任务");
   }
   // 模型探针在领租约之前进行，避免旧 CLI/网络故障白白消耗 attempt。
   const probe = await runCodexTask({ prompt: "Reply with OK only.", cwd: options.target_repo,
@@ -250,7 +257,8 @@ export async function runSingleATask(options: ATaskOptions): Promise<ATaskOutcom
   const { task, lease } = acquired;
   validateLeasedTask(task, lease, options);
   const branch = `task/${lease.task_id}/${lease.attempt_id}`;
-  if (!/^task\/TASK-1002\/TASK-1002-A\d+$/.test(branch)) throw new Error("任务分支不在授权前缀内");
+  if (!/^task\/TASK-100(2|4)\/TASK-100\1-A\d+$/.test(branch) ||
+      lease.task_id !== options.task_id) throw new Error("任务分支不在授权前缀内");
   const dir = join(options.target_repo, ".local");
   mkdirSync(dir, { recursive: true });
   const marker = markerPath(options.target_repo, lease.attempt_id);

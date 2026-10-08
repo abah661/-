@@ -1,0 +1,43 @@
+{
+  "protocol_version": "1",
+  "project_id": "a-codex-regression-20261008",
+  "requirement_ref": "TASK-1004-A-regression@a9434a87f6f2513e7c32185a8f9a6e365162e253",
+  "binding": {
+    "base_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+    "rules_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+    "contract_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+    "acceptance_sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253"
+  },
+  "created_at": "2026-10-08T16:01:31+08:00",
+  "tasks": [
+    {
+      "task_id": "TASK-1004",
+      "kind": "implement",
+      "title": "A 端自动回归：实现展示模块 renderUser(profile)",
+      "acceptance_criteria": [
+        "renderUser({ id: 'u-1', name: 'Ada' }) 返回 'Ada (u-1)'",
+        "使用 ESM 导出 display.renderUser(profile)，display 自测通过",
+        "只修改 src/display/** 与 tests/display/**，由独立整合验收复核"
+      ],
+      "depends_on": [],
+      "write_scope": {
+        "allow": ["src/display/**", "tests/display/**"],
+        "deny": ["src/provider/**", "tests/provider/**", "tests/integration/**", "acceptance/**", "contracts/**", "docs/**", "AGENTS.md", "package.json", "package-lock.json", ".github/**"]
+      },
+      "contracts": [
+        {
+          "contract_id": "api.user-profile",
+          "version": "v1",
+          "path": "contracts/user-profile.v1.json",
+          "sha": "a9434a87f6f2513e7c32185a8f9a6e365162e253",
+          "role": "consumer"
+        }
+      ],
+      "requires": ["code", "test", "git_push"],
+      "expected_interfaces": ["display.renderUser(profile): string"],
+      "status": "ready",
+      "assigned_executor": null,
+      "attempts_used": 0
+    }
+  ]
+}

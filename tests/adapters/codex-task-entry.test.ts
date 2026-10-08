@@ -52,6 +52,14 @@ describe("A 端 Codex 单任务门禁", () => {
     expect(() => loadATaskOptions({ ...env, TARGET_REPO_URL: "https://github.com/other/repo" }, ["--push"])).toThrow("AUTH-0007");
     expect(() => localPreflight({ ...loadATaskOptions(env, ["--push"]), push_authorized: false })).toThrow("授权");
   });
+  it("TASK-1004 仅允许独立回归项目，不借用 P3 原项目或别的分支授权", () => {
+    const regression = { ...env, TASK_ID: "TASK-1004", PROJECT_ID: "a-codex-regression-20261008" };
+    expect(loadATaskOptions(regression, ["--push"]).task_id).toBe("TASK-1004");
+    expect(() => loadATaskOptions({ ...regression, PROJECT_ID: env.PROJECT_ID }, ["--push"])).toThrow("隔离项目");
+    expect(() => loadATaskOptions({ ...env, PROJECT_ID: regression.PROJECT_ID }, ["--push"])).toThrow("隔离项目");
+    expect(() => loadATaskOptions({ ...regression, TARGET_REPO_URL: "https://github.com/other/repo" }, ["--push"])).toThrow("隔离项目");
+    expect(() => localPreflight({ ...loadATaskOptions(regression, ["--push"]), push_authorized: false })).toThrow("授权");
+  });
   it("可显式选择本机已安装的独立 Codex JS 入口，不修改全局配置", () => {
     const options = loadATaskOptions({ ...env, CODEX_EXECUTABLE: "E:/tools/codex.js" }, ["--push"]);
     expect(options.codex.executable).toMatch(/codex\.js$/);

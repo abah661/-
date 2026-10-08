@@ -11,14 +11,18 @@ export interface CodexTaskInput {
   cwd: string;
   sandbox?: CodexSandbox;
   timeout_ms?: number;
+  signal?: AbortSignal;
 }
 
 export interface CodexAdapterConfig {
   executable?: string;
+  model?: "gpt-5.5";
   default_sandbox?: CodexSandbox;
   default_timeout_ms?: number;
   ephemeral?: boolean;
   termination_grace_ms?: number;
+  /** 兼容本机 Codex CLI：只允许已知枚举，不拼接任意配置文本。 */
+  reasoning_effort?: "low" | "medium" | "high" | "xhigh";
 }
 
 export interface CodexProcess {
@@ -40,6 +44,7 @@ export interface CodexAdapterResult {
   error_code: ErrorCode | null;
   exit_code: number | null;
   timed_out: boolean;
+  aborted: boolean;
   kill_failed: boolean;
   thread_id: string | null;
   final_message: string | null;
@@ -51,7 +56,10 @@ export interface CodexAdapterResult {
 
 export function buildCodexExecArgs(input: CodexTaskInput, config: CodexAdapterConfig = {}): string[] {
   const sandbox = input.sandbox ?? config.default_sandbox ?? "read-only";
-  const args = ["exec", "--json"];
+  const args: string[] = [];
+  if (config.reasoning_effort) args.push("-c", `model_reasoning_effort=${config.reasoning_effort}`);
+  if (config.model) args.push("-m", config.model);
+  args.push("exec", "--json");
   if (config.ephemeral ?? true) args.push("--ephemeral");
   args.push("--sandbox", sandbox, "--", input.prompt);
   return args;
@@ -220,6 +228,7 @@ export async function runCodexTask(
       error_code: classified?.error_code ?? "INTERNAL_ERROR",
       exit_code: null,
       timed_out: false,
+      aborted: false,
       kill_failed: false,
       thread_id: null,
       final_message: null,
@@ -239,16 +248,28 @@ export async function runCodexTask(
     () => "done" as const,
     () => "error" as const,
   );
-  async function wait(ms: number): Promise<"done" | "error" | "timeout"> {
+  async function wait(ms: number, watchAbort = false): Promise<"done" | "error" | "timeout" | "aborted"> {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
     try {
-      return await Promise.race([completion, new Promise<"timeout">((resolve) => {
-        timer = setTimeout(() => resolve("timeout"), ms);
-      })]);
-    } finally { if (timer) clearTimeout(timer); }
+      return await Promise.race([
+        completion,
+        new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), ms); }),
+        new Promise<"aborted">((resolve) => {
+          if (!watchAbort) return;
+          onAbort = () => resolve("aborted");
+          if (input.signal?.aborted) onAbort();
+          else input.signal?.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort) input.signal?.removeEventListener("abort", onAbort);
+    }
   }
-  const outcome = await wait(timeout);
+  const outcome = await wait(timeout, true);
   const timed_out = outcome === "timeout";
+  const aborted = outcome === "aborted";
   if (outcome !== "done") {
     try { processHandle.kill("SIGTERM"); } catch { /* 强杀和失败分类仍须执行 */ }
     // error 已经 settled；不因流提前失败而认为子进程已结束。
@@ -268,7 +289,7 @@ export async function runCodexTask(
   const classified = classifyText(`${stderr}\n${failureEvents.map((event) => JSON.stringify(event)).join("\n")}`);
   let status: CodexAdapterStatus = "completed";
   let error_code: ErrorCode | null = null;
-  if (timed_out) {
+  if (timed_out || aborted) {
     status = "failed";
     error_code = "AGENT_TIMEOUT";
   } else if (outcome === "error") {
@@ -292,6 +313,7 @@ export async function runCodexTask(
     error_code,
     exit_code,
     timed_out,
+    aborted,
     kill_failed,
     thread_id: parsed.thread_id,
     final_message: parsed.final_message,

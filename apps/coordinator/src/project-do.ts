@@ -1,6 +1,7 @@
 import {
   assertTransition,
   analyzeGraph,
+  DEFAULT_LIMITS,
   DEFAULT_TIMING,
   ERROR_POLICY,
   EventEnvelopeSchema,
@@ -445,7 +446,17 @@ export class ProjectDurableObject {
       task.assigned_executor = null;
       state.reports[report.task_id] = report;
       delete state.leases[report.task_id];
-      const body = { accepted: true, task_id: task.task_id, status: task.status };
+      // 失败报告先被如实接受为 repair_pending，再按冻结状态机回流 ready。
+      // attempts_used 包含首次尝试；最多允许 1 次初始执行 + 2 次返修。
+      // 超限后留在 repair_pending，不能无限无人值守地重复领任务。
+      const reportedStatus = task.status;
+      const requeued = reportedStatus === "repair_pending" &&
+        task.attempts_used <= DEFAULT_LIMITS.maxRepairAttempts;
+      if (requeued) {
+        assertTransition(task.status, "ready");
+        task.status = "ready";
+      }
+      const body = { accepted: true, task_id: task.task_id, status: reportedStatus, requeued };
       saveIdempotent(state, key, report, body, 200);
       return jsonResponse(body);
     });

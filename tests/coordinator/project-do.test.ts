@@ -516,6 +516,26 @@ describe("A 审计：调度、恢复和验收边界", () => {
     expect(await json(response)).toMatchObject({ status });
   });
 
+  it("TESTS_FAILED 先记录失败再回流新 attempt；两次返修后停止自动重派", async () => {
+    const project = await prepared();
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const { lease } = await json(await post(project, "lease_task", leaseRequest(registration, `repair-${attempt}`)));
+      expect(lease.attempt_id).toBe(`TASK-0001-A${attempt}`);
+      const result = await post(project, "report_result", reportFor(lease, {
+        status: "repair_pending", error_code: "TESTS_FAILED", head_sha: lease.binding.base_sha,
+        evidence_id: null, evidence: null, commit_shas: [], changed_files: [],
+      }));
+      expect(result.status).toBe(200);
+      expect(await json(result)).toMatchObject({ status: "repair_pending", requeued: attempt < 3 });
+      const state = await json(await project.fetch(new Request("https://internal/internal/status")));
+      expect(state.graph.tasks[0].status).toBe(attempt < 3 ? "ready" : "repair_pending");
+      expect(state.graph.tasks[0].attempts_used).toBe(attempt);
+      expect(Object.keys(state.leases)).toHaveLength(0);
+    }
+    const empty = await json(await post(project, "lease_task", leaseRequest(registration, "after-limit")));
+    expect(empty).toMatchObject({ task: null, lease: null, status: "empty" });
+  });
+
   it.each([
     { agent_kind: "opencode" }, { evidence_id: "OTHER" }, { commit_shas: [] },
     { error_code: "TESTS_FAILED" }, { changed_files: ["../secret"] }, { changed_files: ["src/.env"] },

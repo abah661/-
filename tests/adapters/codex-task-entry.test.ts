@@ -52,6 +52,10 @@ describe("A 端 Codex 单任务门禁", () => {
     expect(() => loadATaskOptions({ ...env, TARGET_REPO_URL: "https://github.com/other/repo" }, ["--push"])).toThrow("AUTH-0007");
     expect(() => localPreflight({ ...loadATaskOptions(env, ["--push"]), push_authorized: false })).toThrow("授权");
   });
+  it("可显式选择本机已安装的独立 Codex JS 入口，不修改全局配置", () => {
+    const options = loadATaskOptions({ ...env, CODEX_EXECUTABLE: "E:/tools/codex.js" }, ["--push"]);
+    expect(options.codex.executable).toMatch(/codex\.js$/);
+  });
   it("任务和冻结版本必须与 A 身份及 display 写入范围一致", () => {
     const options = { task_id: "TASK-1002", executor_id: "EXE-A-TEST", expected_base_sha: base };
     expect(() => validateLeasedTask(task, lease, options)).not.toThrow();

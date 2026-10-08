@@ -75,7 +75,11 @@ export function loadATaskOptions(env: NodeJS.ProcessEnv, argv: readonly string[]
     target_remote_url: requireValue(env.TARGET_REPO_URL, "TARGET_REPO_URL"),
     expected_base_sha: requireValue(env.EXPECTED_BASE_SHA, "EXPECTED_BASE_SHA"),
     node22_path: resolve(requireValue(env.NODE22_PATH, "NODE22_PATH")),
-    codex: { model: "gpt-5.5", reasoning_effort: "high", default_sandbox: "workspace-write", default_timeout_ms: 900_000 },
+    codex: {
+      ...(env.CODEX_EXECUTABLE?.trim() ? { executable: resolve(env.CODEX_EXECUTABLE.trim()) } : {}),
+      model: "gpt-5.5", reasoning_effort: "high", default_sandbox: "workspace-write",
+      default_timeout_ms: 900_000,
+    },
     push_authorized: argv.includes("--push"),
   };
   if (!EXECUTOR.test(options.executor_id)) throw new Error("EXECUTOR_ID 必须是 EXE-A-... 格式");
